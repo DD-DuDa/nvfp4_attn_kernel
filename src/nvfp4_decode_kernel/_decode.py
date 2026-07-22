@@ -253,6 +253,7 @@ def _compile_decode(
     residual_value_pages_bf16: torch.Tensor | None,
     residual_page_ids: torch.Tensor | None,
     seqused_residual: torch.Tensor | None,
+    out_indices: torch.Tensor | None,
 ) -> Any:
     heads_q = query_fp4.shape[2]
     heads_kv = key_pages_fp4.shape[2]
@@ -263,6 +264,7 @@ def _compile_decode(
         heads_q,
         heads_kv,
         has_residual,
+        out_indices is not None,
     )
     compiled = _decode_compile_cache.get(cache_key)
     if compiled is not None:
@@ -289,8 +291,8 @@ def _compile_decode(
         bf16_q_input=False,
         fused_residual_first_block=has_residual,
         residual_source="paged_bf16",
-        use_out_indices=False,
-        seqlen_q_static_one=True,
+        use_out_indices=out_indices is not None,
+        seqlen_q_static_one=False,
     )
     fake_stream = cute.runtime.make_fake_stream()
     q_pointer = make_ptr(
@@ -363,7 +365,17 @@ def _compile_decode(
         symbolic_k_shape,
         symbolic_v_shape,
     )
-    compile_kwargs: dict[str, Any] = {"mOutIndices": None}
+    compile_kwargs: dict[str, Any] = {
+        "mOutIndices": (
+            _to_cute_tensor(
+                out_indices,
+                assumed_align=4,
+                leading_dim=0,
+            )
+            if out_indices is not None
+            else None
+        )
+    }
     if has_residual:
         assert residual_key_pages_bf16 is not None
         assert residual_value_pages_bf16 is not None
@@ -422,7 +434,10 @@ def decode_fp4(
     residual_value_pages_bf16: torch.Tensor | None = None,
     residual_page_ids: torch.Tensor | None = None,
     seqused_residual: torch.Tensor | None = None,
+    has_bf16: torch.Tensor | None = None,
     softmax_scale: float,
+    out: torch.Tensor | None = None,
+    out_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Validate, compile/cache, and launch FP4 paged decode on SM100."""
     if not torch.cuda.is_available():
@@ -545,16 +560,15 @@ def decode_fp4(
             "seqused_fp4 must be contiguous INT32 with shape [rows]"
         )
     max_fp4_tokens = fp4_page_table.shape[1] * PAGE_SIZE
+    # The tagged-metadata producer owns consumed-prefix ID validation. Do not
+    # scan unused columns here: persistent vLLM scratch may retain poison or
+    # stale IDs beyond the prefix selected by seqused_fp4.
     _check_device_values(
-        (fp4_page_table < 0) | (fp4_page_table >= page_count),
-        "fp4_page_table contains an out-of-range physical page ID",
-    )
-    _check_device_values(
-        (seqused_fp4 < PAGE_SIZE)
+        (seqused_fp4 < 0)
         | (seqused_fp4 > max_fp4_tokens)
         | (seqused_fp4 % PAGE_SIZE != 0),
         "seqused_fp4 values must be page-aligned and in "
-        f"[{PAGE_SIZE}, {max_fp4_tokens}]",
+        f"[0, {max_fp4_tokens}]",
     )
 
     residual_values = (
@@ -640,18 +654,66 @@ def decode_fp4(
             | (seqused_residual > PAGE_SIZE),
             "seqused_residual values must be in [0, 128]",
         )
+        if has_bf16 is not None:
+            _require_cuda_tensor(has_bf16, "has_bf16", device=device)
+            if (
+                has_bf16.dtype is not torch.bool
+                or tuple(has_bf16.shape) != (rows,)
+                or not has_bf16.is_contiguous()
+            ):
+                raise ValueError(
+                    "has_bf16 must be contiguous BOOL with shape [rows]"
+                )
+            _check_device_values(
+                has_bf16 != (seqused_residual > 0),
+                "has_bf16 must agree with seqused_residual > 0",
+            )
+    elif has_bf16 is not None:
+        raise ValueError(
+            "has_bf16 requires the BF16 residual cache arguments"
+        )
 
     packed_query_scales = _pack_sfq_for_gqa(
         query_scales, qhead_per_kvhead
     )
-    output_4d = torch.empty(
-        rows,
-        1,
-        heads_q,
-        HEAD_DIM,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    use_out_indices = out is not None or out_indices is not None
+    if use_out_indices and (out is None or out_indices is None):
+        raise ValueError("out and out_indices must be provided together")
+    if out is not None and out_indices is not None:
+        _require_cuda_tensor(out, "out", device=device)
+        _require_cuda_tensor(out_indices, "out_indices", device=device)
+        if (
+            out.dtype is not torch.bfloat16
+            or out.ndim != 3
+            or tuple(out.shape[1:]) != (heads_q, HEAD_DIM)
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be contiguous BF16 with shape "
+                "[output_rows, heads_q, 128]"
+            )
+        if (
+            out_indices.dtype is not torch.int32
+            or tuple(out_indices.shape) != (rows,)
+            or not out_indices.is_contiguous()
+        ):
+            raise ValueError(
+                "out_indices must be contiguous INT32 with shape [rows]"
+            )
+        _check_device_values(
+            (out_indices < 0) | (out_indices >= out.shape[0]),
+            "out_indices contains an out-of-range output row",
+        )
+        output_4d = out.unsqueeze(1)
+    else:
+        output_4d = torch.empty(
+            rows,
+            PAGE_SIZE,
+            heads_q,
+            HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
     with torch.cuda.device(device):
         compiled = _compile_decode(
             query_fp4=query_fp4,
@@ -669,6 +731,7 @@ def decode_fp4(
             residual_value_pages_bf16=residual_value_pages_bf16,
             residual_page_ids=residual_page_ids,
             seqused_residual=seqused_residual,
+            out_indices=out_indices,
         )
         stream = cuda.CUstream(
             torch.cuda.current_stream(device).cuda_stream
@@ -731,7 +794,7 @@ def decode_fp4(
                 HEAD_DIM,
             ),
         )
-        call_kwargs: dict[str, Any] = {"mOutIndices": None}
+        call_kwargs: dict[str, Any] = {"mOutIndices": out_indices}
         if has_residual:
             call_kwargs.update(
                 mResidualQ=query_padded_bf16,
@@ -743,4 +806,6 @@ def decode_fp4(
                 mResidualBlockIds=residual_page_ids,
             )
         compiled(*call_args, **call_kwargs)
+    if out is not None:
+        return out
     return output_4d[:, 0]

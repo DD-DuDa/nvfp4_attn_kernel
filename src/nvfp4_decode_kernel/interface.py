@@ -22,8 +22,11 @@ def fp4_decode(
     residual_value_pages_bf16: torch.Tensor | None = None,
     residual_page_ids: torch.Tensor | None = None,
     seqused_residual: torch.Tensor | None = None,
+    has_bf16: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     query_row_indices: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    out_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run paged NVFP4 decode attention.
 
@@ -43,13 +46,21 @@ def fp4_decode(
         residual_value_pages_bf16: Optional physical BF16 V-page cache.
         residual_page_ids: Optional INT32 physical BF16 page ID per row.
         seqused_residual: Optional INT32 valid BF16 token count per row.
+        has_bf16: Optional BOOL indicator of whether each row owns an active
+            BF16 residual page. It must agree with ``seqused_residual > 0``.
         softmax_scale: Score scale. The implementation uses
             ``head_dim**-0.5`` when omitted.
         query_row_indices: Optional INT32 mapping from compact decode rows to
             rows in a full 3-D query tensor.
+        out: Optional full BF16 output tensor in ``[rows, heads_q, head_dim]``
+            layout. It must be supplied together with ``out_indices``.
+        out_indices: Optional INT32 mapping from compact decode rows to rows
+            in ``out``. When supplied, the kernel scatters directly into
+            ``out``.
 
     Returns:
-        BF16 attention output corresponding to the selected query rows.
+        The supplied ``out`` tensor when direct scatter is enabled; otherwise
+        a compact BF16 output corresponding to the selected query rows.
     """
     try:
         from ._kernel import fp4_decode_impl
@@ -72,6 +83,9 @@ def fp4_decode(
         residual_value_pages_bf16=residual_value_pages_bf16,
         residual_page_ids=residual_page_ids,
         seqused_residual=seqused_residual,
+        has_bf16=has_bf16,
         softmax_scale=softmax_scale,
         query_row_indices=query_row_indices,
+        out=out,
+        out_indices=out_indices,
     )

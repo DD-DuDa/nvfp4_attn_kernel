@@ -18,9 +18,9 @@ from nvfp4_decode_kernel import _quantize
 from nvfp4_decode_kernel import fp4_decode
 
 
-BF16_MAX_COSINE_ERROR = 0.10
 FP4_MIN_COSINE = 0.99
 FP4_MAX_ABS_ERROR = 5e-2
+QUALITY_COSINE_TOLERANCE = 1e-2
 
 
 @dataclass(frozen=True)
@@ -36,10 +36,14 @@ CASES = [
     pytest.param(AttentionCase(1, 2, (256,), 32, 8), id="gqa-two-pages"),
     pytest.param(AttentionCase(1, 1, (128,), 32, 8), id="gqa-one-page"),
     pytest.param(AttentionCase(1, 2, (200,), 32, 8), id="gqa-partial-page"),
-    pytest.param(AttentionCase(1, 8, (8192,), 32, 8), id="gqa-long-context"),
+    pytest.param(AttentionCase(1, 64, (8192,), 32, 8), id="gqa-long-context"),
     pytest.param(
         AttentionCase(4, 2, (256, 200, 128, 255), 32, 8),
         id="gqa-multi-batch",
+    ),
+    pytest.param(
+        AttentionCase(7, 3, (1, 127, 128, 129, 255, 256, 257), 32, 8),
+        id="gqa-vllm-boundaries",
     ),
     pytest.param(AttentionCase(1, 2, (256,), 16, 16), id="mha"),
     pytest.param(AttentionCase(1, 2, (256,), 16, 1), id="mqa"),
@@ -253,8 +257,8 @@ def outputs(request):
         dtype=torch.int32,
         device="cuda",
     )
-    seqused_fp4 = (seqused_k // page_size) * page_size
-    seqused_residual = seqused_k - seqused_fp4
+    seqused_fp4 = ((seqused_k - 1) // page_size) * page_size
+    seqused_residual = ((seqused_k - 1) % page_size) + 1
     residual_columns = (seqused_fp4 // page_size).clamp(
         max=case.pages_per_row - 1
     )
@@ -295,6 +299,9 @@ def outputs(request):
                 residual_value_pages_bf16=v_pages,
                 residual_page_ids=residual_page_ids,
                 seqused_residual=seqused_residual,
+                has_bf16=torch.ones_like(
+                    seqused_residual, dtype=torch.bool
+                ),
                 softmax_scale=softmax_scale,
             )
         ).unsqueeze(1)
@@ -336,25 +343,32 @@ def outputs(request):
 
 
 def test_fp4_decode_quality_against_bf16_fa4(outputs):
-    fp4_output, bf16_output, _, _ = outputs
+    fp4_output, bf16_output, _, torch_fp4_output = outputs
 
     assert torch.isfinite(fp4_output).all()
 
-    cosine = _cosine(fp4_output, bf16_output)
-    cosine_error = 1.0 - cosine
+    # BF16 attention is a quality baseline, not an exact oracle: the kernel
+    # quantizes Q/K/V and the unnormalized softmax probabilities P. Match the
+    # independent FP4 simulation's quality, rather than requiring FP4 output
+    # to equal BF16 output.
+    kernel_cosine = _cosine(fp4_output, bf16_output)
+    oracle_cosine = _cosine(torch_fp4_output, bf16_output)
 
-    assert cosine_error <= BF16_MAX_COSINE_ERROR, (
-        f"FP4 vs BF16 FA4 cosine={cosine:.6f}, "
-        f"error={cosine_error:.6f}"
+    assert kernel_cosine >= oracle_cosine - QUALITY_COSINE_TOLERANCE, (
+        f"kernel vs BF16 FlashAttention cosine={kernel_cosine:.6f}, "
+        f"PyTorch FP4 oracle cosine={oracle_cosine:.6f}"
     )
 
 
 def test_fp4_decode_matches_flash_attention_on_hybrid_qkv(outputs):
-    fp4_output, _, flash_fp4_output, _ = outputs
-    cosine = _cosine(fp4_output, flash_fp4_output)
+    fp4_output, _, flash_fp4_output, torch_fp4_output = outputs
+    kernel_cosine = _cosine(fp4_output, flash_fp4_output)
+    oracle_cosine = _cosine(torch_fp4_output, flash_fp4_output)
 
-    assert cosine >= FP4_MIN_COSINE, (
-        f"kernel vs FlashAttention(hybrid FP4/BF16 KV) cosine={cosine:.6f}"
+    assert kernel_cosine >= oracle_cosine - QUALITY_COSINE_TOLERANCE, (
+        "kernel adds more quality loss than its FP4 arithmetic permits: "
+        f"kernel vs FlashAttention cosine={kernel_cosine:.6f}, "
+        f"PyTorch FP4 oracle cosine={oracle_cosine:.6f}"
     )
 
 
@@ -362,12 +376,21 @@ def test_fp4_decode_matches_torch_hybrid_semantics(outputs):
     fp4_output, _, _, torch_fp4_output = outputs
 
     cosine = _cosine(fp4_output, torch_fp4_output)
+    row_cosines = [
+        _cosine(actual, expected)
+        for actual, expected in zip(fp4_output, torch_fp4_output)
+    ]
     max_abs = (
         fp4_output.float() - torch_fp4_output.float()
     ).abs().max().item()
 
     assert cosine >= FP4_MIN_COSINE, (
-        f"kernel vs PyTorch hybrid FP4/BF16 cosine={cosine:.6f}"
+        f"kernel vs PyTorch hybrid FP4/BF16 cosine={cosine:.6f}, "
+        f"row_cosines={row_cosines}"
+    )
+    assert min(row_cosines) >= FP4_MIN_COSINE, (
+        "kernel vs PyTorch hybrid FP4/BF16 per-row cosine below threshold: "
+        f"{row_cosines}"
     )
     assert max_abs <= FP4_MAX_ABS_ERROR, (
         f"kernel vs PyTorch hybrid FP4/BF16 max_abs={max_abs:.6f}"
@@ -476,6 +499,7 @@ def _run_contract_decode(
             "residual_value_pages_bf16": inputs.value_pages_bf16,
             "residual_page_ids": inputs.residual_page_ids[:rows],
             "seqused_residual": inputs.seqused_residual[:rows],
+            "has_bf16": inputs.seqused_residual[:rows] > 0,
         }
     return fp4_decode(
         query,
@@ -543,3 +567,78 @@ def test_query_row_indices_match_compact_query(
     torch.cuda.synchronize()
 
     assert torch.equal(indexed, compact)
+
+
+def test_unused_fp4_page_table_tail_may_be_poisoned(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    valid_table = inputs.page_table[:1].clone()
+    poisoned_table = valid_table.clone()
+    poisoned_table[:, 1:] = -1
+    seqused_fp4 = inputs.seqused_fp4[:1]
+
+    with torch.no_grad():
+        expected = _run_contract_decode(
+            inputs,
+            inputs.query[:1],
+            valid_table,
+            seqused_fp4,
+            with_residual=False,
+        )
+        actual = _run_contract_decode(
+            inputs,
+            inputs.query[:1],
+            poisoned_table,
+            seqused_fp4,
+            with_residual=False,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+
+
+def test_out_indices_scatter_into_vllm_output(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    out_indices = torch.tensor(
+        [3, 0, 4], dtype=torch.int32, device=inputs.query.device
+    )
+    sentinel = torch.tensor(
+        17.0, dtype=torch.bfloat16, device=inputs.query.device
+    )
+    output = torch.full_like(inputs.query, sentinel)
+
+    with torch.no_grad():
+        compact = _run_contract_decode(
+            inputs,
+            inputs.query,
+            inputs.page_table,
+            inputs.seqused_fp4,
+            query_row_indices=inputs.query_row_indices,
+            with_residual=True,
+        )
+        returned = fp4_decode(
+            inputs.query,
+            inputs.key_pages_fp4,
+            inputs.key_scales,
+            inputs.value_pages_fp4,
+            inputs.value_scales,
+            inputs.page_table,
+            inputs.seqused_fp4,
+            residual_key_pages_bf16=inputs.key_pages_bf16,
+            residual_value_pages_bf16=inputs.value_pages_bf16,
+            residual_page_ids=inputs.residual_page_ids,
+            seqused_residual=inputs.seqused_residual,
+            has_bf16=inputs.seqused_residual > 0,
+            query_row_indices=inputs.query_row_indices,
+            out=output,
+            out_indices=out_indices,
+        )
+    torch.cuda.synchronize()
+
+    assert returned is output
+    assert torch.equal(output.index_select(0, out_indices.long()), compact)
+    assert torch.equal(output[1], torch.full_like(output[1], sentinel))
+    assert torch.equal(output[2], torch.full_like(output[2], sentinel))

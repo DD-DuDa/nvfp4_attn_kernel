@@ -18,8 +18,11 @@ def fp4_decode_impl(
     residual_value_pages_bf16: torch.Tensor | None = None,
     residual_page_ids: torch.Tensor | None = None,
     seqused_residual: torch.Tensor | None = None,
+    has_bf16: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     query_row_indices: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    out_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Quantize the current query and run the paged NVFP4 decode kernel."""
     from ._decode import decode_fp4
@@ -61,5 +64,8 @@ def fp4_decode_impl(
         residual_value_pages_bf16=residual_value_pages_bf16,
         residual_page_ids=residual_page_ids,
         seqused_residual=seqused_residual,
+        has_bf16=has_bf16,
         softmax_scale=softmax_scale,
+        out=out,
+        out_indices=out_indices,
     )
