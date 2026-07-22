@@ -1,0 +1,545 @@
+"""Numerical and execution contracts for the public FP4 decode API.
+
+The kernel accepts a BF16 query, prequantized full K/V pages, and an optional
+BF16 residual page per row. It quantizes Q/P internally and returns the
+logical decode output.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from flash_attn import flash_attn_func
+from nvfp4_decode_kernel import _quantize
+from nvfp4_decode_kernel import fp4_decode
+
+
+BF16_MAX_COSINE_ERROR = 0.10
+FP4_MIN_COSINE = 0.99
+FP4_MAX_ABS_ERROR = 5e-2
+
+
+@dataclass(frozen=True)
+class AttentionCase:
+    batch: int
+    pages_per_row: int
+    seqused_k: tuple[int, ...]
+    query_heads: int
+    kv_heads: int
+
+
+CASES = [
+    pytest.param(AttentionCase(1, 2, (256,), 32, 8), id="gqa-two-pages"),
+    pytest.param(AttentionCase(1, 1, (128,), 32, 8), id="gqa-one-page"),
+    pytest.param(AttentionCase(1, 2, (200,), 32, 8), id="gqa-partial-page"),
+    pytest.param(AttentionCase(1, 8, (8192,), 32, 8), id="gqa-long-context"),
+    pytest.param(
+        AttentionCase(4, 2, (256, 200, 128, 255), 32, 8),
+        id="gqa-multi-batch",
+    ),
+    pytest.param(AttentionCase(1, 2, (256,), 16, 16), id="mha"),
+    pytest.param(AttentionCase(1, 2, (256,), 16, 1), id="mqa"),
+]
+
+
+def _output(result):
+    return result[0] if isinstance(result, tuple) else result
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    return F.cosine_similarity(
+        a.float().flatten(),
+        b.float().flatten(),
+        dim=0,
+    ).item()
+
+
+def _round_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round FP32 values to the representable E2M1 values."""
+
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    absolute = x.abs()
+    indices = (absolute.unsqueeze(-1) - magnitudes).abs().argmin(dim=-1)
+    return torch.sign(x) * magnitudes[indices]
+
+
+def _nvfp4_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """Quantize and dequantize groups of 16 values with NVFP4."""
+    assert x.shape[-1] % 16 == 0
+    groups = x.float().reshape(*x.shape[:-1], -1, 16)
+    scale = groups.abs().amax(dim=-1, keepdim=True) / 6.0
+    scale = scale.to(torch.float8_e4m3fn).float()
+    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    quantized = _round_e2m1(groups / safe_scale) * scale
+    return quantized.reshape_as(x)
+
+
+def _fp4_qkv_pages_round_trip(
+    q: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dequantized NVFP4 Q/K/V in their original logical layouts."""
+    q_fp4 = _nvfp4_round_trip(q).to(q.dtype)
+    k_fp4 = _nvfp4_round_trip(k_pages).to(k_pages.dtype)
+    v_fp4 = _nvfp4_round_trip(
+        v_pages.permute(0, 2, 3, 1).contiguous()
+    ).permute(0, 3, 1, 2).to(v_pages.dtype)
+    return q_fp4, k_fp4, v_fp4
+
+
+def _hybrid_qkv_pages_round_trip(
+    q: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    residual_page_ids: torch.Tensor,
+    seqused_residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dequantized FP4 full pages with their BF16 residual pages restored."""
+    q_fp4, k_hybrid, v_hybrid = _fp4_qkv_pages_round_trip(
+        q, k_pages, v_pages
+    )
+    has_residual = seqused_residual > 0
+    residual_ids = residual_page_ids[has_residual].long()
+    if residual_ids.numel() > 0:
+        k_hybrid[residual_ids] = k_pages[residual_ids]
+        v_hybrid[residual_ids] = v_pages[residual_ids]
+    return q_fp4, k_hybrid, v_hybrid
+
+
+def _gather_pages(
+    pages: torch.Tensor,
+    page_table: torch.Tensor,
+) -> torch.Tensor:
+    """Gather logical pages into dense per-batch sequences for references."""
+    batch, pages_per_row = page_table.shape
+    page_size, heads, head_dim = pages.shape[1:]
+    gathered = pages.index_select(0, page_table.reshape(-1).long())
+    return gathered.reshape(
+        batch,
+        pages_per_row * page_size,
+        heads,
+        head_dim,
+    )
+
+
+def _flash_attention_reference(
+    q: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Run dense FlashAttention row-by-row for variable paged lengths."""
+    outputs = []
+    for row, length in enumerate(seqused_k.tolist()):
+        row_table = page_table[row : row + 1]
+        k = _gather_pages(k_pages, row_table)[:, :length]
+        v = _gather_pages(v_pages, row_table)[:, :length]
+        outputs.append(
+            _output(
+                flash_attn_func(
+                    q[row : row + 1],
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                )
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
+def _torch_fp4_decode(
+    q: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    residual_page_ids: torch.Tensor,
+    seqused_residual: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Independent PyTorch simulation of hybrid FP4/BF16 decode."""
+    q_fp4, k_fp4_pages, v_fp4_pages = _hybrid_qkv_pages_round_trip(
+        q,
+        k_pages,
+        v_pages,
+        residual_page_ids,
+        seqused_residual,
+    )
+    q_fp4 = q_fp4.float()
+    k_fp4 = _gather_pages(k_fp4_pages, page_table).float()
+    v_fp4 = _gather_pages(v_fp4_pages, page_table).float()
+
+    repeats = q.shape[2] // k_fp4.shape[2]
+    k_fp4 = k_fp4.repeat_interleave(repeats, dim=2)
+    v_fp4 = v_fp4.repeat_interleave(repeats, dim=2)
+
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk",
+        q_fp4,
+        k_fp4,
+    ) * softmax_scale
+
+    positions = torch.arange(scores.shape[-1], device=scores.device)
+    valid = positions.unsqueeze(0) < seqused_k.unsqueeze(1)
+    scores = scores.masked_fill(~valid[:, None, None, :], -torch.inf)
+    scores = scores - scores.amax(dim=-1, keepdim=True)
+    p_exp = torch.exp(scores)
+    denominator = p_exp.sum(dim=-1, keepdim=True)
+
+    p_fp4 = _nvfp4_round_trip(p_exp)
+
+    output = torch.einsum(
+        "bhqk,bkhd->bqhd",
+        p_fp4 / denominator,
+        v_fp4,
+    )
+    return output
+
+
+@pytest.fixture(scope="module", params=CASES)
+def outputs(request):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    capability = torch.cuda.get_device_capability()
+    if capability[0] != 10:
+        pytest.skip(f"SM100 is required, found compute capability {capability}")
+
+    case: AttentionCase = request.param
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    query_length = 1
+    page_size = 128
+    head_dim = 128
+    softmax_scale = head_dim**-0.5
+    num_pages = case.batch * case.pages_per_row
+
+    q = torch.randn(
+        case.batch,
+        query_length,
+        case.query_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    k_pages = torch.randn(
+        num_pages,
+        page_size,
+        case.kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    page_table = torch.arange(
+        num_pages, device="cuda", dtype=torch.int32
+    ).reshape(case.batch, case.pages_per_row)
+    seqused_k = torch.tensor(
+        case.seqused_k,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seqused_fp4 = (seqused_k // page_size) * page_size
+    seqused_residual = seqused_k - seqused_fp4
+    residual_columns = (seqused_fp4 // page_size).clamp(
+        max=case.pages_per_row - 1
+    )
+    residual_page_ids = page_table.gather(
+        1, residual_columns.long().unsqueeze(1)
+    ).squeeze(1)
+    residual_page_ids = torch.where(
+        seqused_residual > 0,
+        residual_page_ids,
+        torch.zeros_like(residual_page_ids),
+    )
+
+    with torch.no_grad():
+        q_fp4, k_hybrid_pages, v_hybrid_pages = (
+            _hybrid_qkv_pages_round_trip(
+                q,
+                k_pages,
+                v_pages,
+                residual_page_ids,
+                seqused_residual,
+            )
+        )
+        key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+        value_pages_fp4, value_scales = _quantize.quantize_value_pages(
+            v_pages
+        )
+
+        fp4_output = _output(
+            fp4_decode(
+                query=q[:, 0],
+                key_pages_fp4=key_pages_fp4,
+                key_scales=key_scales,
+                value_pages_fp4=value_pages_fp4,
+                value_scales=value_scales,
+                fp4_page_table=page_table,
+                seqused_fp4=seqused_fp4,
+                residual_key_pages_bf16=k_pages,
+                residual_value_pages_bf16=v_pages,
+                residual_page_ids=residual_page_ids,
+                seqused_residual=seqused_residual,
+                softmax_scale=softmax_scale,
+            )
+        ).unsqueeze(1)
+
+        bf16_output = _flash_attention_reference(
+            q,
+            k_pages,
+            v_pages,
+            page_table,
+            seqused_k,
+            softmax_scale,
+            False,
+        )
+
+        flash_fp4_output = _flash_attention_reference(
+            q_fp4,
+            k_hybrid_pages,
+            v_hybrid_pages,
+            page_table,
+            seqused_k,
+            softmax_scale,
+            False,
+        )
+
+        torch_fp4_output = _torch_fp4_decode(
+            q,
+            k_pages,
+            v_pages,
+            page_table,
+            seqused_k,
+            residual_page_ids,
+            seqused_residual,
+            softmax_scale,
+        )
+
+    torch.cuda.synchronize()
+
+    return fp4_output, bf16_output, flash_fp4_output, torch_fp4_output
+
+
+def test_fp4_decode_quality_against_bf16_fa4(outputs):
+    fp4_output, bf16_output, _, _ = outputs
+
+    assert torch.isfinite(fp4_output).all()
+
+    cosine = _cosine(fp4_output, bf16_output)
+    cosine_error = 1.0 - cosine
+
+    assert cosine_error <= BF16_MAX_COSINE_ERROR, (
+        f"FP4 vs BF16 FA4 cosine={cosine:.6f}, "
+        f"error={cosine_error:.6f}"
+    )
+
+
+def test_fp4_decode_matches_flash_attention_on_hybrid_qkv(outputs):
+    fp4_output, _, flash_fp4_output, _ = outputs
+    cosine = _cosine(fp4_output, flash_fp4_output)
+
+    assert cosine >= FP4_MIN_COSINE, (
+        f"kernel vs FlashAttention(hybrid FP4/BF16 KV) cosine={cosine:.6f}"
+    )
+
+
+def test_fp4_decode_matches_torch_hybrid_semantics(outputs):
+    fp4_output, _, _, torch_fp4_output = outputs
+
+    cosine = _cosine(fp4_output, torch_fp4_output)
+    max_abs = (
+        fp4_output.float() - torch_fp4_output.float()
+    ).abs().max().item()
+
+    assert cosine >= FP4_MIN_COSINE, (
+        f"kernel vs PyTorch hybrid FP4/BF16 cosine={cosine:.6f}"
+    )
+    assert max_abs <= FP4_MAX_ABS_ERROR, (
+        f"kernel vs PyTorch hybrid FP4/BF16 max_abs={max_abs:.6f}"
+    )
+
+
+@dataclass(frozen=True)
+class ContractDecodeInputs:
+    query: torch.Tensor
+    key_pages_bf16: torch.Tensor
+    value_pages_bf16: torch.Tensor
+    key_pages_fp4: torch.Tensor
+    key_scales: torch.Tensor
+    value_pages_fp4: torch.Tensor
+    value_scales: torch.Tensor
+    page_table: torch.Tensor
+    seqused_fp4: torch.Tensor
+    residual_page_ids: torch.Tensor
+    seqused_residual: torch.Tensor
+    query_row_indices: torch.Tensor
+
+
+@pytest.fixture(scope="module")
+def contract_decode_inputs() -> ContractDecodeInputs:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    capability = torch.cuda.get_device_capability()
+    if capability != (10, 0):
+        pytest.skip(f"SM100 is required, found compute capability {capability}")
+
+    pytest.importorskip("cutlass")
+
+    torch.manual_seed(0xDEC0DE)
+    query = torch.randn(
+        5,
+        32,
+        128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ) * 0.3
+    key_pages_bf16 = torch.randn(
+        6,
+        128,
+        8,
+        128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ) * 0.3
+    value_pages_bf16 = torch.randn_like(key_pages_bf16) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(key_pages_bf16)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(
+        value_pages_bf16
+    )
+
+    return ContractDecodeInputs(
+        query=query,
+        key_pages_bf16=key_pages_bf16,
+        value_pages_bf16=value_pages_bf16,
+        key_pages_fp4=key_pages_fp4,
+        key_scales=key_scales,
+        value_pages_fp4=value_pages_fp4,
+        value_scales=value_scales,
+        page_table=torch.tensor(
+            [[0, 1], [2, 3], [4, 5]],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        seqused_fp4=torch.full(
+            (3,),
+            128,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        residual_page_ids=torch.tensor(
+            [0, 3, 5],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        seqused_residual=torch.tensor(
+            [0, 72, 127],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        query_row_indices=torch.tensor(
+            [4, 1, 3],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+    )
+
+
+def _run_contract_decode(
+    inputs: ContractDecodeInputs,
+    query: torch.Tensor,
+    page_table: torch.Tensor,
+    seqused_fp4: torch.Tensor,
+    *,
+    query_row_indices: torch.Tensor | None = None,
+    with_residual: bool,
+) -> torch.Tensor:
+    residual = {}
+    if with_residual:
+        rows = page_table.shape[0]
+        residual = {
+            "residual_key_pages_bf16": inputs.key_pages_bf16,
+            "residual_value_pages_bf16": inputs.value_pages_bf16,
+            "residual_page_ids": inputs.residual_page_ids[:rows],
+            "seqused_residual": inputs.seqused_residual[:rows],
+        }
+    return fp4_decode(
+        query,
+        inputs.key_pages_fp4,
+        inputs.key_scales,
+        inputs.value_pages_fp4,
+        inputs.value_scales,
+        page_table,
+        seqused_fp4,
+        query_row_indices=query_row_indices,
+        **residual,
+    )
+
+
+def test_mixed_residual_batch_keeps_zero_length_row_exact(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    with torch.no_grad():
+        hybrid = _run_contract_decode(
+            inputs,
+            inputs.query,
+            inputs.page_table,
+            inputs.seqused_fp4,
+            query_row_indices=inputs.query_row_indices,
+            with_residual=True,
+        )
+        pure_first_row = _run_contract_decode(
+            inputs,
+            inputs.query[4:5],
+            inputs.page_table[:1],
+            inputs.seqused_fp4[:1],
+            with_residual=False,
+        )
+    torch.cuda.synchronize()
+
+    assert hybrid.shape == (3, 32, 128)
+    assert torch.isfinite(hybrid).all()
+    assert torch.equal(hybrid[:1], pure_first_row)
+
+
+def test_query_row_indices_match_compact_query(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    compact_query = inputs.query.index_select(
+        0, inputs.query_row_indices.long()
+    )
+    with torch.no_grad():
+        indexed = _run_contract_decode(
+            inputs,
+            inputs.query,
+            inputs.page_table,
+            inputs.seqused_fp4,
+            query_row_indices=inputs.query_row_indices,
+            with_residual=False,
+        )
+        compact = _run_contract_decode(
+            inputs,
+            compact_query,
+            inputs.page_table,
+            inputs.seqused_fp4,
+            with_residual=False,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(indexed, compact)
