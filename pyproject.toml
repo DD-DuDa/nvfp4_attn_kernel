@@ -21,6 +21,7 @@ test = [
     "pytest",
     "flash-attn",
     "flashinfer-python",
+    "datasets",
 ]
 
 [tool.setuptools.packages.find]
