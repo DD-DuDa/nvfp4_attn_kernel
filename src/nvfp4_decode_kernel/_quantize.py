@@ -16,6 +16,7 @@ def quantize_query(
     *,
     row_indices: torch.Tensor | None = None,
     query_padded_out: torch.Tensor | None = None,
+    heads_kv: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize BF16 decode rows with the CuTeDSL query kernel."""
     if query.dtype is not torch.bfloat16 or not query.is_cuda:
@@ -33,6 +34,9 @@ def quantize_query(
         )
 
     _, heads, head_dim = query.shape
+    heads_kv = heads if heads_kv is None else heads_kv
+    if heads_kv < 1 or heads % heads_kv:
+        raise ValueError("query heads must be divisible by heads_kv")
     rows = query.shape[0] if row_indices is None else row_indices.shape[0]
     if head_dim % 64 != 0:
         raise ValueError("query head_dim must be divisible by 64")
@@ -47,7 +51,7 @@ def quantize_query(
     ).view(torch.float4_e2m1fn_x2)
 
     rest_k = head_dim // 64
-    scales = torch.zeros(
+    scale_storage = torch.zeros(
         rows,
         1,
         heads,
@@ -58,10 +62,22 @@ def quantize_query(
         dtype=torch.uint8,
         device=query.device,
     )
-    query_scales = scales.permute(
+    native_scales = scale_storage.permute(
         0, 2, 1, 3, 4, 5, 6
     ).permute(
         4, 5, 2, 6, 3, 1, 0
+    )
+    query_scales = native_scales.as_strided(
+        (
+            32,
+            4,
+            1,
+            4,
+            rest_k,
+            heads_kv,
+            rows,
+        ),
+        native_scales.stride(),
     )
 
     quantize_decode_q_to_padded_fp4(
@@ -70,6 +86,7 @@ def quantize_query(
         query_scales,
         query_padded_out,
         row_indices=row_indices,
+        heads_kv=heads_kv,
     )
 
     return query_fp4, query_scales

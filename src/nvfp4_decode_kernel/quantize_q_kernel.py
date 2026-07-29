@@ -106,6 +106,7 @@ def _quantize_query_kernel(
     rest_k: cutlass.Constexpr[int],
     use_row_indices: cutlass.Constexpr[bool],
     write_padded: cutlass.Constexpr[bool],
+    qhead_per_kvhead: cutlass.Constexpr[int],
 ):
     row, head, _ = cute.arch.block_idx()
     source_row = (
@@ -159,8 +160,12 @@ def _quantize_query_kernel(
             scales_f32[2],
             scales_f32[3],
         )
+        packed_row = head % qhead_per_kvhead
+        scale_m1 = packed_row % 32
+        scale_m2 = packed_row // 32
+        scale_head = head // qhead_per_kvhead
         scale_tile = query_scales[
-            0, 0, 0, None, k_atom, head, row
+            scale_m1, scale_m2, 0, None, k_atom, scale_head, row
         ]
         scale_word = cute.make_tensor(
             cute.recast_ptr(scale_tile.iterator, dtype=cutlass.Int32),
@@ -245,6 +250,7 @@ def _launch_quantize_query(
     rest_k: cutlass.Constexpr[int],
     use_row_indices: cutlass.Constexpr[bool],
     write_padded: cutlass.Constexpr[bool],
+    qhead_per_kvhead: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     query = cute.make_tensor(
@@ -284,6 +290,7 @@ def _launch_quantize_query(
         const_expr(rest_k),
         const_expr(use_row_indices),
         const_expr(write_padded),
+        const_expr(qhead_per_kvhead),
     ).launch(
         grid=(rows, heads, 1),
         block=(1, 1, 1),
@@ -301,6 +308,7 @@ def quantize_decode_q_to_padded_fp4(
     query_padded_out: Optional[torch.Tensor] = None,
     *,
     row_indices: Optional[torch.Tensor] = None,
+    heads_kv: Optional[int] = None,
 ) -> None:
     """Quantize selected BF16 query rows into preallocated outputs."""
     if query.dtype is not torch.bfloat16 or not query.is_cuda:
@@ -309,6 +317,10 @@ def quantize_decode_q_to_padded_fp4(
         raise ValueError("query must have shape [rows, heads, head_dim]")
 
     source_rows, heads, head_dim = query.shape
+    heads_kv = heads if heads_kv is None else heads_kv
+    if heads_kv < 1 or heads % heads_kv:
+        raise ValueError("query heads must be divisible by heads_kv")
+    qhead_per_kvhead = heads // heads_kv
     rows = query_fp4_out.shape[0]
     if head_dim % 64 != 0:
         raise ValueError("query head_dim must be divisible by 64")
@@ -338,7 +350,7 @@ def quantize_decode_q_to_padded_fp4(
         1,
         4,
         head_dim // 64,
-        heads,
+        heads_kv,
         rows,
     )
     if (
@@ -459,6 +471,7 @@ def quantize_decode_q_to_padded_fp4(
         rest_k,
         use_row_indices,
         write_padded,
+        qhead_per_kvhead,
         stream,
     )
     compile_key = (
@@ -467,6 +480,7 @@ def quantize_decode_q_to_padded_fp4(
         rest_k,
         use_row_indices,
         write_padded,
+        qhead_per_kvhead,
     )
     compiled = _launch_quantize_query.compile_cache.get(compile_key)
     if compiled is None:

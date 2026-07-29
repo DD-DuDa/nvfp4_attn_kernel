@@ -729,7 +729,9 @@ def test_prequantized_query_matches_bf16_query_exactly(
     v_pages = torch.randn_like(k_pages) * 0.3
     key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
     value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
-    query_fp4, query_scales = _quantize.quantize_query(query)
+    query_fp4, query_scales = _quantize.quantize_query(
+        query, heads_kv=heads_kv
+    )
     page_table = torch.tensor(
         [[0, 1], [2, 3]], device="cuda", dtype=torch.int32
     )
@@ -765,7 +767,9 @@ def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
     contract_decode_inputs: ContractDecodeInputs,
 ) -> None:
     inputs = contract_decode_inputs
-    query_fp4, query_scales = _quantize.quantize_query(inputs.query[:3])
+    query_fp4, query_scales = _quantize.quantize_query(
+        inputs.query[:3], heads_kv=8
+    )
     common = (
         inputs.key_pages_fp4,
         inputs.key_scales,
@@ -800,4 +804,45 @@ def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
             *common,
             query_fp4=query_fp4,
             query_scales=query_scales.contiguous(),
+        )
+
+
+def test_prequantized_query_contract_rejects_bad_tensor_metadata(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    query_fp4, query_scales = _quantize.quantize_query(
+        inputs.query[:3], heads_kv=8
+    )
+    common = {
+        "key_pages_fp4": inputs.key_pages_fp4,
+        "key_scales": inputs.key_scales,
+        "value_pages_fp4": inputs.value_pages_fp4,
+        "value_scales": inputs.value_scales,
+        "fp4_page_table": inputs.page_table,
+        "seqused_fp4": inputs.seqused_fp4,
+    }
+    with pytest.raises(ValueError, match="packed E2M1"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4.view(torch.uint8),
+            query_scales=query_scales,
+        )
+    with pytest.raises(ValueError, match="shape"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4[:2],
+            query_scales=query_scales,
+        )
+    with pytest.raises(ValueError, match="shape"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4,
+            query_scales=query_scales[..., :2],
+        )
+    with pytest.raises(ValueError, match="contiguous packed|heads_q"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4[:, :, :31],
+            query_scales=query_scales,
         )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import math
 from typing import Any
 
@@ -20,7 +19,6 @@ from .fp4_decode_kernel import FP4DecodeKernel
 PAGE_SIZE = 128
 HEAD_DIM = 128
 _decode_compile_cache: dict[tuple[Any, ...], Any] = {}
-_sfq_pack_cache: dict[tuple[Any, ...], tuple[torch.Tensor, ...]] = {}
 
 
 def _to_cute_tensor(
@@ -144,135 +142,6 @@ def _page_scales_for_kernel(
 def _check_device_values(condition: torch.Tensor, message: str) -> None:
     if bool(torch.any(condition).item()):
         raise ValueError(message)
-
-
-def _pack_sfq_for_gqa(
-    query_scales: torch.Tensor,
-    qhead_per_kvhead: int,
-) -> torch.Tensor:
-    """Pack per-query-head SFQ bytes into the kernel's GQA M-axis order."""
-    m1, m2, rest_m, k2, kg, heads_q, rows = query_scales.shape
-    heads_kv = heads_q // qhead_per_kvhead
-    strides = query_scales.stride()
-    key = (
-        qhead_per_kvhead,
-        tuple(query_scales.shape),
-        tuple(strides),
-        query_scales.device,
-    )
-    cached = _sfq_pack_cache.get(key)
-    if cached is None:
-        m1_s, m2_s, rm_s, k2_s, kg_s, head_s, row_s = strides
-        max_offset = (
-            m1_s * (m1 - 1)
-            + m2_s * (m2 - 1)
-            + rm_s * (rest_m - 1)
-            + k2_s * (k2 - 1)
-            + kg_s * (kg - 1)
-            + head_s * (heads_kv - 1)
-            + row_s * (rows - 1)
-        )
-        storage = torch.empty(
-            max_offset + 1,
-            dtype=torch.uint8,
-            device=query_scales.device,
-        )
-        packed_bytes = torch.as_strided(
-            storage,
-            (m1, m2, rest_m, k2, kg, heads_kv, rows),
-            strides,
-        )
-
-        element_count = (
-            m1 * m2 * rest_m * k2 * kg * heads_kv * rows
-        )
-        source_offsets = torch.empty(
-            element_count, dtype=torch.int64, device="cpu"
-        )
-        destination_offsets = torch.empty_like(source_offsets)
-        index = 0
-        for i1, i2, irm, ik2, ikg, head_kv, row in itertools.product(
-            range(m1),
-            range(m2),
-            range(rest_m),
-            range(k2),
-            range(kg),
-            range(heads_kv),
-            range(rows),
-        ):
-            packed_row = m1 * i2 + i1
-            source_sequence = packed_row // qhead_per_kvhead
-            source_i1 = source_sequence % m1
-            source_i2 = source_sequence // m1
-            source_head = (
-                head_kv * qhead_per_kvhead
-                + packed_row % qhead_per_kvhead
-            )
-            source_offsets[index] = (
-                source_i1 * m1_s
-                + source_i2 * m2_s
-                + irm * rm_s
-                + ik2 * k2_s
-                + ikg * kg_s
-                + source_head * head_s
-                + row * row_s
-            )
-            destination_offsets[index] = (
-                i1 * m1_s
-                + i2 * m2_s
-                + irm * rm_s
-                + ik2 * k2_s
-                + ikg * kg_s
-                + head_kv * head_s
-                + row * row_s
-            )
-            index += 1
-
-        source_offsets = source_offsets.to(query_scales.device)
-        destination_offsets = destination_offsets.to(query_scales.device)
-        gathered = torch.empty(
-            element_count,
-            dtype=torch.uint8,
-            device=query_scales.device,
-        )
-        cached = (
-            storage,
-            packed_bytes,
-            source_offsets,
-            destination_offsets,
-            gathered,
-        )
-        _sfq_pack_cache[key] = cached
-
-    (
-        storage,
-        packed_bytes,
-        source_offsets,
-        destination_offsets,
-        gathered,
-    ) = cached
-    source_storage_size = (
-        query_scales.untyped_storage().nbytes()
-        // query_scales.element_size()
-    )
-    source_bytes = torch.as_strided(
-        query_scales,
-        (source_storage_size,),
-        (1,),
-        0,
-    ).view(torch.uint8)
-    torch.take(source_bytes, source_offsets, out=gathered)
-    packed_storage = torch.as_strided(
-        storage,
-        (
-            storage.untyped_storage().nbytes()
-            // storage.element_size(),
-        ),
-        (1,),
-        0,
-    )
-    packed_storage.index_copy_(0, destination_offsets, gathered)
-    return packed_bytes
 
 
 def _compile_decode(
@@ -554,7 +423,7 @@ def decode_fp4(
             "128 must be divisible by the query-heads-per-KV-head ratio"
         )
 
-    expected_query_sf = (32, 4, 1, 4, 2, heads_q, rows)
+    expected_query_sf = (32, 4, 1, 4, 2, heads_kv, rows)
     expected_page_sf = (page_count, 32, 4, 1, 4, 2, heads_kv)
     if tuple(query_scales.shape) != expected_query_sf:
         raise ValueError(
@@ -736,9 +605,7 @@ def decode_fp4(
             "has_bf16 requires the BF16 residual cache arguments"
         )
 
-    packed_query_scales = _pack_sfq_for_gqa(
-        query_scales, qhead_per_kvhead
-    )
+    packed_query_scales = query_scales
     use_out_indices = out is not None or out_indices is not None
     if use_out_indices and (out is None or out_indices is None):
         raise ValueError("out and out_indices must be provided together")

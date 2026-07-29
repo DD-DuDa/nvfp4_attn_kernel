@@ -66,6 +66,7 @@ def fp4_decode_impl(
             query,
             row_indices=query_row_indices,
             query_padded_out=query_padded_bf16,
+            heads_kv=key_pages_fp4.shape[2],
         )
     else:
         if query_fp4 is None or query_scales is None:

@@ -27,7 +27,7 @@ import torch
 from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.interface import num_splits_heuristic
 from nvfp4_decode_kernel import _quantize, fp4_decode
-from nvfp4_decode_kernel._decode import _decode_compile_cache, _sfq_pack_cache
+from nvfp4_decode_kernel._decode import _decode_compile_cache
 
 
 PAGE_SIZE = 128
@@ -125,7 +125,9 @@ def build_inputs(
     value_pages_fp4, value_scales = quantize_pages_chunked(
         v_pages, is_value=True, chunk_pages=quantize_chunk_pages
     )
-    query_fp4, query_scales = _quantize.quantize_query(query)
+    query_fp4, query_scales = _quantize.quantize_query(
+        query, heads_kv=case.heads_kv
+    )
 
     seqused_fp4_hybrid = seqused_k - PAGE_SIZE
     seqused_residual = torch.full(
@@ -286,7 +288,6 @@ def make_fp4(
 def clear_fp4_compile_caches() -> None:
     """Force the next FP4 call in this process to compile under IKET."""
     _decode_compile_cache.clear()
-    _sfq_pack_cache.clear()
 
 
 def kv_bytes(case: Case, variant: str) -> int:
@@ -463,9 +464,12 @@ def run_case(
         )
         quant_ms = query_quantization_ms(kernels)
         moved = kv_bytes(case, name)
-        input_contract = (
-            "bf16_q_bf16_kv" if name.startswith("fa4") else "bf16_q_fp4_kv"
-        )
+        if name.startswith("fa4"):
+            input_contract = "bf16_q_bf16_kv"
+        elif name.endswith("_fp4q"):
+            input_contract = "fp4_q_fp4_kv"
+        else:
+            input_contract = "bf16_q_fp4_kv"
         rows.append(
             {
                 **asdict(case),
