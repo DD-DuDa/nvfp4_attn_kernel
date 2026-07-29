@@ -63,6 +63,9 @@ a batch containing other rows with nonzero residual lengths.
 6. Keep `_fa4` private. Change it only when required by the decode kernel.
 7. Do not add experimental environment switches, diagnostic hardcodes,
    historical `Plan-*` comments, or debug dump paths.
+   Permanent IKET ranges inside the decode kernel are the sole exception:
+   they are stripped from normal builds and must remain covered by
+   `tests/kernel`.
 8. Comments should explain invariants, layouts, synchronization, or numerical
    behavior—not development history.
 9. Validate changes on an SM100 GPU. Import or syntax checks alone are not

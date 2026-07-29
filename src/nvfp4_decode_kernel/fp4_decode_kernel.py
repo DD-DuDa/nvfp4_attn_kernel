@@ -10,6 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr, Float8E4M3FN, Float4E2M1FN
+from cutlass.cute.experimental import iket
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -1939,7 +1940,9 @@ class FP4DecodeKernel:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
+            role_lifetime = iket.range_start("load_life")
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            iket.range_push("load_main")
             self.load(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -1985,11 +1988,14 @@ class FP4DecodeKernel:
                 tiled_mma_pv_bf16=tiled_mma_pv_bf16,
                 mResidualBlockIds=mResidualBlockIds,
             )
+            iket.range_pop()
+            iket.range_end(role_lifetime)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
+            role_lifetime = iket.range_start("mma_life")
             # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             # Alloc tmem buffer
@@ -2043,13 +2049,16 @@ class FP4DecodeKernel:
                 ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
             )
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+            iket.range_end(role_lifetime)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
+                role_lifetime = iket.range_start("epi_life")
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                iket.range_push("epi_main")
                 self.epilogue_s2g(
                     mO,
                     sO,
@@ -2062,11 +2071,14 @@ class FP4DecodeKernel:
                     TileSchedulerCls,
                     mOutIndices=mOutIndices,
                 )
+                iket.range_pop()
+                iket.range_end(role_lifetime)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.correction_warp_ids[0]:
+            role_lifetime = iket.range_start("softmax_life")
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
             softmax_loop = partial(
@@ -2123,12 +2135,15 @@ class FP4DecodeKernel:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
                     softmax_loop(stage=1, tStSi=tStSi, tCtSFP=tCtSFPs[1])
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+            iket.range_end(role_lifetime)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
+            role_lifetime = iket.range_start("corr_life")
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            iket.range_push("corr_main")
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -2149,7 +2164,9 @@ class FP4DecodeKernel:
                 TileSchedulerCls,
                 blocksparse_tensors,
             )
+            iket.range_pop()
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+            iket.range_end(role_lifetime)
 
         return
 
@@ -2816,6 +2833,7 @@ class FP4DecodeKernel:
                         )
                     residual_kv_full_phase ^= 1
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    iket.range_push("mma_wait_qk")
                     if const_expr(self.bf16_q_input):
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_q_fp4_ready_offset + stage,
@@ -2829,6 +2847,7 @@ class FP4DecodeKernel:
                     # 2. wait for K0
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    iket.range_pop()
                     tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
                     # We don't need to acquire empty S0 / S1.
                     # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
@@ -2839,7 +2858,9 @@ class FP4DecodeKernel:
                     # only tmem changes per q_stage.
                     if const_expr(self.quant_qk):
                         sm100_utils.tcgen05_after_thread_sync()
+                        iket.range_push("mma_wait_sf")
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                        iket.range_pop()
                         _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                         tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                         cute.copy(
@@ -2890,7 +2911,9 @@ class FP4DecodeKernel:
                 for i in cutlass.range(block_loop_count, unroll=1):
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
+                    iket.range_push("mma_wait_v")
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    iket.range_pop()
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
@@ -2899,10 +2922,12 @@ class FP4DecodeKernel:
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile has finished.
+                        iket.range_push("mma_wait_p")
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
+                        iket.range_pop()
                         # 3. gemm
                         # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
@@ -2947,7 +2972,9 @@ class FP4DecodeKernel:
                         # 1. wait for Ki
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
+                            iket.range_push("mma_wait_k")
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                            iket.range_pop()
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         # 2. gemm
                         # Don't need to wait for the softmax warp to have finished reading the previous
@@ -2959,7 +2986,9 @@ class FP4DecodeKernel:
                             _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                             tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                             sm100_utils.tcgen05_after_thread_sync()
+                            iket.range_push("mma_wait_sf")
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                            iket.range_pop()
                             cute.copy(
                                 tiled_copy_s2t_sfq,
                                 tCsSFQ_compact_s2t_staged,
@@ -3001,14 +3030,18 @@ class FP4DecodeKernel:
 
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
+                iket.range_push("mma_wait_v")
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                iket.range_pop()
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
+                    iket.range_push("mma_wait_p")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase
                     )
+                    iket.range_pop()
                     # 3. gemm
                     # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                     # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
@@ -3246,9 +3279,11 @@ class FP4DecodeKernel:
 
             if has_work:
                 # Softmax acts as the producer: wait until correction signals the stage is empty
+                iket.range_push("sm_wait_corr")
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
                 )
+                iket.range_pop()
                 si_corr_producer_phase ^= 1
 
             if const_expr(self.fused_residual_first_block) and stage == 0 and has_work:
@@ -3507,7 +3542,9 @@ class FP4DecodeKernel:
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
         # Wait for Si
+        iket.range_push("sm_wait_s")
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
+        iket.range_pop()
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         
@@ -3612,9 +3649,11 @@ class FP4DecodeKernel:
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        iket.range_push("sm_wait_corr")
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
+        iket.range_pop()
 
         if const_expr(not self.quant_pv):
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
@@ -3802,6 +3841,7 @@ class FP4DecodeKernel:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
+                iket.range_push("corr_wait_sm")
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + 0, softmax_corr_consumer_phase
                 )
@@ -3810,16 +3850,19 @@ class FP4DecodeKernel:
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_softmax_corr_full_offset + 1, softmax_corr_consumer_phase
                     )
+                iket.range_pop()
                 softmax_corr_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
+                        iket.range_push("corr_wait_sm")
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                             softmax_corr_consumer_phase,
                         )
+                        iket.range_pop()
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -3864,10 +3907,12 @@ class FP4DecodeKernel:
                             ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                             learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    iket.range_push("corr_wait_sm")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                         softmax_corr_consumer_phase,
                     )
+                    iket.range_pop()
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
@@ -3892,13 +3937,17 @@ class FP4DecodeKernel:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    iket.range_push("corr_wait_o")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )
+                    iket.range_pop()
                     if const_expr(not self.use_correction_warps_for_epi):
+                        iket.range_push("corr_wait_epi")
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_empty_offset + stage, corr_epi_producer_phase
                         )
+                        iket.range_pop()
                     self.correction_epilogue(
                         thr_mma_pv,
                         tOtOs[stage],
@@ -4285,9 +4334,11 @@ class FP4DecodeKernel:
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
+                        iket.range_push("epi_wait_corr")
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                        iket.range_pop()
                         # 2. copy O0 / O1 to gmem
                         store_O(src_idx=stage, dst_idx=self.q_stage * m_block + stage)
                         cute.arch.cp_async_bulk_commit_group()
@@ -4317,9 +4368,11 @@ class FP4DecodeKernel:
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
+                        iket.range_push("epi_wait_corr")
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                        iket.range_pop()
                         # 2. copy O0 / O1 to gmem
                         # load acc O from smem to rmem for wider vectorization
                         tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
@@ -4784,4 +4837,3 @@ class FP4DecodeKernel:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
-

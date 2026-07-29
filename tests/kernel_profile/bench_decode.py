@@ -46,6 +46,7 @@ from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.internal.interface import num_splits_heuristic
 from nvfp4_decode_kernel import _quantize
 from nvfp4_decode_kernel import fp4_decode
+from nvfp4_decode_kernel._decode import _decode_compile_cache, _sfq_pack_cache
 
 
 PAGE_SIZE = 128
@@ -235,6 +236,12 @@ def make_fp4(inputs: Inputs, hybrid: bool):
     return run_hybrid if hybrid else run_pure
 
 
+def clear_fp4_compile_caches() -> None:
+    """Force the next FP4 call in this process to compile under the profiler."""
+    _decode_compile_cache.clear()
+    _sfq_pack_cache.clear()
+
+
 def kv_bytes(case: Case, variant: str) -> int:
     """KV bytes a variant must read from the cache for one decode step."""
     tokens = case.batch * case.seqlen
@@ -420,6 +427,11 @@ def main() -> None:
     )
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
     parser.add_argument("--breakdown", action="store_true")
+    parser.add_argument(
+        "--clear-fp4-compile-cache",
+        action="store_true",
+        help="clear in-process FP4 caches before each case (required for IKET)",
+    )
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
 
@@ -444,6 +456,8 @@ def main() -> None:
                 continue
             case = Case(batch, seqlen, args.heads_q, args.heads_kv)
             print(f"running {case.label} ...", flush=True)
+            if args.clear_fp4_compile_cache:
+                clear_fp4_compile_caches()
             rows.extend(
                 run_case(
                     case,
