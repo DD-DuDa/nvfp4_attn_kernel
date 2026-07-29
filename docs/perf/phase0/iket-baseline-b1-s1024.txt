@@ -6,16 +6,16 @@ grid     (16, 1, 1)  ->  16 CTAs, 16 traced
 spread   16 SMs used, max 1 CTA/SM
 wall     20.80us (first warp start to last warp end)
 
-WARP LIFETIME BY ROLE  (longest = critical path)
-  role      warps  total     mean     max      vs critical
-  --------  -----  --------  -------  -------  --------------------
-  corr      64     1.261ms   19.70us  19.84us  100.0%  <== critical
-  softmax1  64     1.235ms   19.30us  19.46us  98.0%
-  softmax0  64     1.228ms   19.18us  20.77us  97.4%
-  epi       16     329.31us  20.58us  20.70us  26.1%
-  mma       16     319.07us  19.94us  20.06us  25.3%
-  load      16     87.33us   5.46us   5.60us   6.9%
-  empty     16     23.46us   1.47us   1.60us   1.9%
+WARP LIFETIME BY ROLE  (aggregate work, not critical path)
+  role      warps  total     mean     max      envelope  end timestamp
+  --------  -----  --------  -------  -------  --------  ------------------------
+  corr      64     1.261ms   19.70us  19.84us  19.84us   19.84us
+  softmax1  64     1.235ms   19.30us  19.46us  19.46us   19.46us
+  softmax0  64     1.228ms   19.18us  20.77us  20.80us   20.80us  <== launch tail
+  epi       16     329.31us  20.58us  20.70us  20.74us   20.74us
+  mma       16     319.07us  19.94us  20.06us  20.10us   20.10us
+  load      16     87.33us   5.46us   5.60us   5.60us    5.60us
+  empty     16     23.46us   1.47us   1.60us   1.60us    1.60us
 
 RANGE TIME  (pct is of that role's total warp lifetime)
   role      range          count  total     mean     pct
@@ -57,16 +57,16 @@ grid     (16, 1, 1)  ->  16 CTAs, 16 traced
 spread   16 SMs used, max 1 CTA/SM
 wall     20.77us (first warp start to last warp end)
 
-WARP LIFETIME BY ROLE  (longest = critical path)
-  role      warps  total     mean     max      vs critical
-  --------  -----  --------  -------  -------  --------------------
-  corr      64     1.244ms   19.45us  19.74us  100.0%  <== critical
-  softmax1  64     1.219ms   19.04us  19.39us  97.9%
-  softmax0  64     1.213ms   18.95us  20.70us  97.4%
-  epi       16     326.88us  20.43us  20.61us  26.3%
-  mma       16     314.85us  19.68us  19.97us  25.3%
-  load      16     82.72us   5.17us   5.34us   6.6%
-  empty     16     19.49us   1.22us   1.25us   1.6%
+WARP LIFETIME BY ROLE  (aggregate work, not critical path)
+  role      warps  total     mean     max      envelope  end timestamp
+  --------  -----  --------  -------  -------  --------  ------------------------
+  corr      64     1.244ms   19.45us  19.74us  19.74us   19.74us
+  softmax1  64     1.219ms   19.04us  19.39us  19.39us   19.39us
+  softmax0  64     1.213ms   18.95us  20.70us  20.77us   20.77us  <== launch tail
+  epi       16     326.88us  20.43us  20.61us  20.67us   20.67us
+  mma       16     314.85us  19.68us  19.97us  19.97us   19.97us
+  load      16     82.72us   5.17us   5.34us   5.41us    5.41us
+  empty     16     19.49us   1.22us   1.25us   1.41us    1.41us
 
 RANGE TIME  (pct is of that role's total warp lifetime)
   role      range          count  total     mean     pct
@@ -108,16 +108,16 @@ grid     (16, 1, 1)  ->  16 CTAs, 16 traced
 spread   16 SMs used, max 1 CTA/SM
 wall     20.70us (first warp start to last warp end)
 
-WARP LIFETIME BY ROLE  (longest = critical path)
-  role      warps  total     mean     max      vs critical
-  --------  -----  --------  -------  -------  --------------------
-  corr      64     1.245ms   19.45us  19.74us  100.0%  <== critical
-  softmax1  64     1.219ms   19.05us  19.36us  97.9%
-  softmax0  64     1.212ms   18.93us  20.67us  97.3%
-  epi       16     325.28us  20.33us  20.58us  26.1%
-  mma       16     315.07us  19.69us  19.97us  25.3%
-  load      16     82.62us   5.16us   5.41us   6.6%
-  empty     16     19.33us   1.21us   1.25us   1.6%
+WARP LIFETIME BY ROLE  (aggregate work, not critical path)
+  role      warps  total     mean     max      envelope  end timestamp
+  --------  -----  --------  -------  -------  --------  ------------------------
+  corr      64     1.245ms   19.45us  19.74us  19.78us   19.78us
+  softmax1  64     1.219ms   19.05us  19.36us  19.36us   19.39us
+  softmax0  64     1.212ms   18.93us  20.67us  20.67us   20.70us  <== launch tail
+  epi       16     325.28us  20.33us  20.58us  20.58us   20.61us
+  mma       16     315.07us  19.69us  19.97us  19.97us   20.00us
+  load      16     82.62us   5.16us   5.41us   5.41us    5.44us
+  empty     16     19.33us   1.21us   1.25us   1.47us    1.50us
 
 RANGE TIME  (pct is of that role's total warp lifetime)
   role      range          count  total     mean     pct

@@ -84,6 +84,22 @@ class LaunchReport:
     def role_life_total(self) -> dict[str, int]:
         return {r: sum(v) for r, v in self.lifetimes_by_role().items()}
 
+    def role_envelopes(self) -> dict[str, dict[str, int]]:
+        by_role: dict[str, list[dict]] = defaultdict(list)
+        for wl in self.launch.get("warpLifetimes", []):
+            by_role[self.role_of(wl["locIdx"])].append(wl)
+        return {
+            role: {
+                "start_ns": min(item["startTs"] for item in items),
+                "end_ns": max(item["endTs"] for item in items),
+                "span_ns": (
+                    max(item["endTs"] for item in items)
+                    - min(item["startTs"] for item in items)
+                ),
+            }
+            for role, items in by_role.items()
+        }
+
     def ranges_by_role(self) -> dict[tuple[str, str], list[int]]:
         acc: dict[tuple[str, str], list[int]] = defaultdict(list)
         for rng in self.launch.get("ranges", []):
@@ -141,7 +157,13 @@ class LaunchReport:
 
     def to_dict(self) -> dict[str, Any]:
         life = self.role_life_total()
-        longest = max(life.values(), default=0)
+        envelopes = self.role_envelopes()
+        launch_start = min(
+            (item["start_ns"] for item in envelopes.values()), default=0
+        )
+        launch_end = max(
+            (item["end_ns"] for item in envelopes.values()), default=0
+        )
         return {
             "kernel": self.launch.get("kernelName"),
             "wall_ns": self.wall(),
@@ -153,7 +175,13 @@ class LaunchReport:
                     "total_ns": total,
                     "mean_ns": statistics.mean(self.lifetimes_by_role()[role]),
                     "max_ns": max(self.lifetimes_by_role()[role]),
-                    "pct_of_critical": 100.0 * total / longest if longest else 0.0,
+                    "envelope_start_ns": envelopes[role]["start_ns"],
+                    "envelope_end_ns": envelopes[role]["end_ns"],
+                    "envelope_span_ns": envelopes[role]["span_ns"],
+                    "end_from_launch_start_ns": (
+                        envelopes[role]["end_ns"] - launch_start
+                    ),
+                    "ends_at_launch_tail": envelopes[role]["end_ns"] == launch_end,
                 }
                 for role, total in sorted(life.items(), key=lambda kv: -kv[1])
             },
@@ -188,16 +216,20 @@ class LaunchReport:
                 f"(negative duration or crossing warps) -- trace is suspect\n"
             )
 
-        out.append("WARP LIFETIME BY ROLE  (longest = critical path)")
+        out.append("WARP LIFETIME BY ROLE  (aggregate work, not critical path)")
         rows = []
         for role, r in d["roles"].items():
-            mark = "  <== critical" if abs(r["pct_of_critical"] - 100.0) < 1e-9 else ""
+            mark = "  <== launch tail" if r["ends_at_launch_tail"] else ""
             rows.append([
                 role, str(r["warps"]), fmt_ns(r["total_ns"]),
                 fmt_ns(r["mean_ns"]), fmt_ns(r["max_ns"]),
-                f"{r['pct_of_critical']:.1f}%" + mark,
+                fmt_ns(r["envelope_span_ns"]),
+                fmt_ns(r["end_from_launch_start_ns"]) + mark,
             ])
-        out.append(table(rows, ["role", "warps", "total", "mean", "max", "vs critical"]))
+        out.append(table(
+            rows,
+            ["role", "warps", "total", "mean", "max", "envelope", "end timestamp"],
+        ))
 
         out.append("RANGE TIME  (pct is of that role's total warp lifetime)")
         rows = []

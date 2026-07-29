@@ -1,61 +1,44 @@
-"""Decode throughput comparison: official FA4 BF16 paged decode vs NVFP4 decode.
+"""Benchmark FA4 and NVFP4 paged decode with reproducible result metadata.
 
-Both kernels attend to the same logical KV cache laid out in 128-token pages.
-The FA4 baseline reads BF16 pages; the NVFP4 kernel reads E2M1 pages with E4M3
-scale factors, optionally with the last page kept in BF16 (the "hybrid" tail
-that serving code produces before a page is sealed and quantized).
-
-Decode is bandwidth bound, so the report includes the KV bytes each variant has
-to move and the achieved bandwidth, which is a fairer cross-precision metric
-than raw latency.
-
-Timing uses two clocks:
-
-- ``gpu``: summed CUDA kernel time from the profiler, i.e. what the device
-  actually spends. This is the number to use when comparing kernels.
-- ``wall``: end-to-end Python latency of the public API. ``fp4_decode``
-  validates several arguments with ``.item()``, which forces a device sync per
-  call, so its wall time carries host overhead the FA4 path does not have.
-
-Full sweep::
-
-    PYTHONPATH=src python tests/kernel_profile/bench_decode.py --device 1
-
-Holding KV traffic fixed while varying only the GQA ratio isolates how each
-kernel spends its query axis, since the KV cache read is identical across the
-four runs::
-
-    for hq in 8 16 32 64; do
-      PYTHONPATH=src python tests/kernel_profile/bench_decode.py --device 1 \
-        --batches 16 --seqlens 16384 --heads-q $hq --heads-kv 8 \
-        --variants fa4_bf16 fp4_pure
-    done
+Clean performance gates use CUDA events. ``--breakdown`` is a separate
+Torch-Profiler pass for per-kernel attribution and must not run under IKET.
+FA4 always uses the varlen entry point so split-K keeps pack-GQA enabled.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import importlib.metadata
 import json
+import math
+import platform
+import statistics
+import subprocess
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 
 import torch
 
 from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.interface import num_splits_heuristic
-from nvfp4_decode_kernel import _quantize
-from nvfp4_decode_kernel import fp4_decode
+from nvfp4_decode_kernel import _quantize, fp4_decode
 from nvfp4_decode_kernel._decode import _decode_compile_cache, _sfq_pack_cache
 
 
 PAGE_SIZE = 128
 HEAD_DIM = 128
-
-# BF16 K plus BF16 V for one token of one KV head.
 BF16_BYTES_PER_TOKEN_HEAD = 2 * HEAD_DIM * 2
-# E2M1 payload plus one E4M3 scale per 16 elements, for K and V.
 FP4_BYTES_PER_TOKEN_HEAD = 2 * (HEAD_DIM // 2 + HEAD_DIM // 16)
+DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
+DEFAULT_SEQLENS = (1024, 4096, 16384, 65536)
+DEFAULT_HEAD_CONFIGS = ((8, 8), (32, 8), (32, 1))  # MHA, GQA-4, MQA
+DEFAULT_MAX_KV_TOKENS = 8_400_000
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -66,8 +49,19 @@ class Case:
     heads_kv: int
 
     @property
+    def attention_type(self) -> str:
+        if self.heads_q == self.heads_kv:
+            return "mha"
+        if self.heads_kv == 1:
+            return "mqa"
+        return f"gqa{self.heads_q // self.heads_kv}"
+
+    @property
     def label(self) -> str:
-        return f"b{self.batch}_s{self.seqlen}"
+        return (
+            f"{self.attention_type}_b{self.batch}_s{self.seqlen}"
+            f"_hq{self.heads_q}_hkv{self.heads_kv}"
+        )
 
 
 @dataclass
@@ -91,13 +85,16 @@ class Inputs:
     softmax_scale: float
 
 
-def build_inputs(case: Case, device: torch.device) -> Inputs:
+def build_inputs(
+    case: Case, device: torch.device, *, quantize_chunk_pages: int
+) -> Inputs:
     if case.seqlen % PAGE_SIZE:
         raise ValueError("seqlen must be a multiple of the 128-token page size")
+    if case.heads_q % case.heads_kv:
+        raise ValueError("heads_q must be divisible by heads_kv")
 
     pages_per_row = case.seqlen // PAGE_SIZE
     num_pages = case.batch * pages_per_row
-
     query = torch.randn(
         case.batch,
         case.heads_q,
@@ -114,25 +111,23 @@ def build_inputs(case: Case, device: torch.device) -> Inputs:
         dtype=torch.bfloat16,
     ) * 0.3
     v_pages = torch.randn_like(k_pages) * 0.3
-
     page_table = torch.arange(
         num_pages, device=device, dtype=torch.int32
     ).reshape(case.batch, pages_per_row)
     seqused_k = torch.full(
         (case.batch,), case.seqlen, device=device, dtype=torch.int32
     )
+    key_pages_fp4, key_scales = quantize_pages_chunked(
+        k_pages, is_value=False, chunk_pages=quantize_chunk_pages
+    )
+    value_pages_fp4, value_scales = quantize_pages_chunked(
+        v_pages, is_value=True, chunk_pages=quantize_chunk_pages
+    )
 
-    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
-    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
-
-    # Hybrid split: every row keeps its final page in BF16, matching the
-    # serving-time state where the newest page is not sealed yet.
     seqused_fp4_hybrid = seqused_k - PAGE_SIZE
     seqused_residual = torch.full(
         (case.batch,), PAGE_SIZE, device=device, dtype=torch.int32
     )
-    # A size-1 slice stays "contiguous" while keeping the parent row stride, so
-    # copy into a fresh buffer to guarantee the unit stride the kernel requires.
     residual_page_ids = torch.empty(
         case.batch, device=device, dtype=torch.int32
     )
@@ -161,28 +156,54 @@ def build_inputs(case: Case, device: torch.device) -> Inputs:
     )
 
 
-def fa4_auto_splits(case: Case, device: torch.device) -> int:
-    """FA4's own split heuristic for this decode shape.
+def quantize_pages_chunked(
+    pages: torch.Tensor, *, is_value: bool, chunk_pages: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    quantizer = (
+        _quantize.quantize_value_pages
+        if is_value
+        else _quantize.quantize_key_pages
+    )
+    page_count = pages.shape[0]
+    if page_count <= chunk_pages:
+        return quantizer(pages)
 
-    Mirrors the call inside ``_flash_attn_fwd``: one m-block per (row, kv head)
-    because pack-GQA folds the query heads into M. The heuristic can return 0
-    when the grid is already oversubscribed, which the kernel treats as "no
-    split", so clamp it to a valid split count.
-    """
+    fp4_output = None
+    scale_storage = None
+    scale_output = None
+    for start in range(0, page_count, chunk_pages):
+        stop = min(start + chunk_pages, page_count)
+        fp4_chunk, scale_chunk = quantizer(pages[start:stop])
+        if fp4_output is None:
+            fp4_output = torch.empty(
+                (page_count, *fp4_chunk.shape[1:]),
+                dtype=fp4_chunk.dtype,
+                device=fp4_chunk.device,
+            )
+            page_stride = scale_chunk.stride(0)
+            scale_storage = torch.empty(
+                page_count * page_stride,
+                dtype=torch.uint8,
+                device=scale_chunk.device,
+            )
+            scale_output = scale_storage.as_strided(
+                (page_count, *scale_chunk.shape[1:]),
+                scale_chunk.stride(),
+            ).view(scale_chunk.dtype)
+        fp4_output[start:stop].copy_(fp4_chunk)
+        scale_output[start:stop].copy_(scale_chunk)
+    assert fp4_output is not None and scale_output is not None
+    return fp4_output, scale_output
+
+
+def fa4_auto_splits(case: Case, device: torch.device) -> int:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     total_mblocks = case.batch * case.heads_kv
     num_n_blocks = case.seqlen // PAGE_SIZE
     return max(1, num_splits_heuristic(total_mblocks, sms, num_n_blocks, 128))
 
 
-def make_fa4(inputs: Inputs, num_splits: int):
-    """FA4 paged decode on the varlen path.
-
-    The varlen entry point matters: for non-varlen inputs FA4 0.4.4 silently
-    drops pack-GQA whenever ``num_splits != 1`` (see the "fix GQA + SplitKV +
-    non-varlen" TODO in its interface), which costs a factor of
-    qhead_per_kvhead and would make any split measurement meaningless.
-    """
+def make_fa4(inputs: Inputs, num_splits: int) -> Callable[[], object]:
     case = inputs.case
 
     def run():
@@ -203,7 +224,7 @@ def make_fa4(inputs: Inputs, num_splits: int):
     return run
 
 
-def make_fp4(inputs: Inputs, hybrid: bool):
+def make_fp4(inputs: Inputs, hybrid: bool) -> Callable[[], torch.Tensor]:
     def run_pure():
         return fp4_decode(
             query=inputs.query,
@@ -237,25 +258,23 @@ def make_fp4(inputs: Inputs, hybrid: bool):
 
 
 def clear_fp4_compile_caches() -> None:
-    """Force the next FP4 call in this process to compile under the profiler."""
+    """Force the next FP4 call in this process to compile under IKET."""
     _decode_compile_cache.clear()
     _sfq_pack_cache.clear()
 
 
 def kv_bytes(case: Case, variant: str) -> int:
-    """KV bytes a variant must read from the cache for one decode step."""
     tokens = case.batch * case.seqlen
-    per_head = case.heads_kv
     if variant.startswith("fa4"):
-        return tokens * per_head * BF16_BYTES_PER_TOKEN_HEAD
-    if variant == "fp4_hybrid":
+        return tokens * case.heads_kv * BF16_BYTES_PER_TOKEN_HEAD
+    if variant == "fp4_hybrid_bf16q":
         fp4_tokens = case.batch * (case.seqlen - PAGE_SIZE)
         bf16_tokens = case.batch * PAGE_SIZE
-        return per_head * (
+        return case.heads_kv * (
             fp4_tokens * FP4_BYTES_PER_TOKEN_HEAD
             + bf16_tokens * BF16_BYTES_PER_TOKEN_HEAD
         )
-    return tokens * per_head * FP4_BYTES_PER_TOKEN_HEAD
+    return tokens * case.heads_kv * FP4_BYTES_PER_TOKEN_HEAD
 
 
 def _output(result):
@@ -268,7 +287,7 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     ).item()
 
 
-def measure_wall_ms(run, iters: int, warmup: int) -> float:
+def measure_wall_ms(run: Callable[[], object], iters: int, warmup: int) -> float:
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
@@ -279,33 +298,9 @@ def measure_wall_ms(run, iters: int, warmup: int) -> float:
     return (time.perf_counter() - start) * 1e3 / iters
 
 
-def measure_gpu_ms(run, iters: int, warmup: int) -> tuple[float, dict[str, float]]:
-    """Sum CUDA kernel time per iteration, plus a per-kernel breakdown."""
-    from torch.autograd import DeviceType
-    from torch.profiler import ProfilerActivity, profile
-
-    for _ in range(warmup):
-        run()
-    torch.cuda.synchronize()
-
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        for _ in range(iters):
-            run()
-        torch.cuda.synchronize()
-
-    breakdown: dict[str, float] = {}
-    for event in prof.key_averages():
-        if event.device_type != DeviceType.CUDA:
-            continue
-        micros = event.self_device_time_total
-        if micros <= 0:
-            continue
-        breakdown[event.key] = breakdown.get(event.key, 0.0) + micros / 1e3 / iters
-    return sum(breakdown.values()), breakdown
-
-
-def measure_event_gpu_ms(run, iters: int, warmup: int) -> float:
-    """Clean CUDA-event timing that does not acquire CUPTI."""
+def measure_event_gpu_ms(
+    run: Callable[[], object], iters: int, warmup: int
+) -> float:
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
@@ -319,14 +314,63 @@ def measure_event_gpu_ms(run, iters: int, warmup: int) -> float:
     return start.elapsed_time(end) / iters
 
 
-VARIANTS = {
-    "fa4_bf16": lambda inputs: make_fa4(inputs, num_splits=1),
-    "fa4_bf16_split": lambda inputs: make_fa4(
-        inputs, num_splits=fa4_auto_splits(inputs.case, inputs.query.device)
-    ),
-    "fp4_pure": lambda inputs: make_fp4(inputs, hybrid=False),
-    "fp4_hybrid": lambda inputs: make_fp4(inputs, hybrid=True),
-}
+def measure_kernel_breakdown(
+    run: Callable[[], object], iters: int, warmup: int
+) -> dict[str, float]:
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            run()
+        torch.cuda.synchronize()
+
+    breakdown: dict[str, float] = {}
+    for event in prof.key_averages():
+        if event.device_type != DeviceType.CUDA:
+            continue
+        micros = event.self_device_time_total
+        if micros > 0:
+            breakdown[event.key] = (
+                breakdown.get(event.key, 0.0) + micros / 1e3 / iters
+            )
+    return dict(sorted(breakdown.items(), key=lambda item: -item[1]))
+
+
+def query_quantization_ms(kernels: dict[str, float]) -> float:
+    return sum(
+        ms
+        for name, ms in kernels.items()
+        if "quantize_query_kernel" in name
+    )
+
+
+def variant_factory(
+    name: str, inputs: Inputs, device: torch.device
+) -> tuple[Callable[[], object] | None, int | None, str | None]:
+    if name == "fa4_bf16":
+        return make_fa4(inputs, num_splits=1), 1, None
+    if name == "fa4_split":
+        splits = fa4_auto_splits(inputs.case, device)
+        return make_fa4(inputs, num_splits=splits), splits, None
+    if name == "fp4_pure_bf16q":
+        return make_fp4(inputs, hybrid=False), 1, None
+    if name == "fp4_hybrid_bf16q":
+        return make_fp4(inputs, hybrid=True), 1, None
+    if name == "fp4_pure_fp4q":
+        return None, None, "unavailable_until_phase1"
+    raise KeyError(name)
+
+
+DEFAULT_VARIANTS = (
+    "fa4_bf16",
+    "fa4_split",
+    "fp4_pure_bf16q",
+    "fp4_pure_fp4q",
+)
 
 
 def run_case(
@@ -336,129 +380,367 @@ def run_case(
     iters: int,
     warmup: int,
     breakdown: bool,
-    event_timing: bool,
+    structural_only: bool,
+    quantize_chunk_pages: int,
 ) -> list[dict]:
-    inputs = build_inputs(case, device)
+    torch.cuda.reset_peak_memory_stats(device)
+    inputs = build_inputs(
+        case, device, quantize_chunk_pages=quantize_chunk_pages
+    )
     reference = _output(make_fa4(inputs, num_splits=1)()).reshape(
         case.batch, case.heads_q, HEAD_DIM
     )
 
-    rows = []
+    rows: list[dict] = []
     for name in variants:
-        run = VARIANTS[name](inputs)
+        run, num_splits, unavailable_reason = variant_factory(name, inputs, device)
+        if run is None:
+            rows.append(
+                {
+                    **asdict(case),
+                    "attention_type": case.attention_type,
+                    "variant": name,
+                    "input_contract": "fp4_q_fp4_kv",
+                    "status": "unavailable",
+                    "unavailable_reason": unavailable_reason,
+                    "num_splits": num_splits,
+                    "gpu_ms": None,
+                    "wall_ms": None,
+                    "kv_gib": kv_bytes(case, name) / 2**30,
+                    "kv_gbps": None,
+                    "cosine_vs_fa4": None,
+                    "kernels": {},
+                    "query_quantization_ms": None,
+                    "query_quantization_fraction": None,
+                    "peak_memory_bytes": None,
+                }
+            )
+            continue
+
         out = _output(run()).reshape(case.batch, case.heads_q, HEAD_DIM)
-        if event_timing:
-            gpu_ms = measure_event_gpu_ms(run, iters, warmup)
-            kernels = {}
-        else:
-            gpu_ms, kernels = measure_gpu_ms(run, iters, warmup)
-        wall_ms = measure_wall_ms(run, iters, warmup)
+        gpu_ms = (
+            None
+            if structural_only
+            else measure_event_gpu_ms(run, iters, warmup)
+        )
+        wall_ms = (
+            None if structural_only else measure_wall_ms(run, iters, warmup)
+        )
+        kernels = (
+            measure_kernel_breakdown(run, iters, warmup) if breakdown else {}
+        )
+        quant_ms = query_quantization_ms(kernels)
         moved = kv_bytes(case, name)
+        input_contract = (
+            "bf16_q_bf16_kv" if name.startswith("fa4") else "bf16_q_fp4_kv"
+        )
         rows.append(
             {
-                "batch": case.batch,
-                "seqlen": case.seqlen,
-                "heads_q": case.heads_q,
-                "heads_kv": case.heads_kv,
+                **asdict(case),
+                "attention_type": case.attention_type,
                 "variant": name,
-                "num_splits": (
-                    fa4_auto_splits(case, device)
-                    if name == "fa4_bf16_split"
-                    else 1
-                ),
+                "input_contract": input_contract,
+                "status": "ok",
+                "unavailable_reason": None,
+                "num_splits": num_splits,
                 "gpu_ms": gpu_ms,
                 "wall_ms": wall_ms,
                 "kv_gib": moved / 2**30,
-                "kv_gbps": moved / (gpu_ms * 1e-3) / 1e9,
-                "cosine_vs_fa4": cosine(out, reference),
-                "kernels": (
-                    dict(sorted(kernels.items(), key=lambda kv: -kv[1]))
-                    if breakdown
-                    else {}
+                "kv_gbps": (
+                    moved / (gpu_ms * 1e-3) / 1e9
+                    if gpu_ms is not None
+                    else None
                 ),
+                "cosine_vs_fa4": cosine(out, reference),
+                "kernels": kernels,
+                "query_quantization_ms": quant_ms if kernels else None,
+                "query_quantization_fraction": (
+                    quant_ms / sum(kernels.values())
+                    if kernels and sum(kernels.values()) > 0
+                    else None
+                ),
+                "peak_memory_bytes": None,
             }
         )
 
+    peak_memory = torch.cuda.max_memory_allocated(device)
+    for row in rows:
+        row["peak_memory_bytes"] = peak_memory
     del inputs, reference
     gc.collect()
     torch.cuda.empty_cache()
     return rows
 
 
-def format_table(rows: list[dict], variants: list[str]) -> str:
-    by_case: dict[tuple[int, int], dict[str, dict]] = {}
-    for row in rows:
-        by_case.setdefault((row["batch"], row["seqlen"]), {})[row["variant"]] = row
+def _gmean(values: list[float]) -> float:
+    return math.exp(sum(math.log(value) for value in values) / len(values))
 
-    header = f"{'batch':>5} {'seqlen':>7} {'spl':>4}"
-    for name in variants:
-        header += f" | {name + ' ms':>17} {'GB/s':>7}"
-    header += f" | {'fp4 speedup':>11} {'cos':>6}"
-    lines = [header, "-" * len(header)]
 
-    for (batch, seqlen), entry in sorted(by_case.items()):
-        splits = entry.get("fa4_bf16_split", {}).get("num_splits", 1)
-        line = f"{batch:>5} {seqlen:>7} {splits:>4}"
-        for name in variants:
-            row = entry.get(name)
-            if row is None:
-                line += f" | {'-':>17} {'-':>7}"
-                continue
-            timing = f"{row['gpu_ms']:.3f} ({row['wall_ms']:.3f})"
-            line += f" | {timing:>17} {row['kv_gbps']:>7.0f}"
-
-        base = entry.get("fa4_bf16")
-        best_fp4 = min(
-            (entry[n] for n in ("fp4_pure", "fp4_hybrid") if n in entry),
-            key=lambda r: r["gpu_ms"],
-            default=None,
+def summarize(rows: list[dict]) -> dict:
+    ok = [row for row in rows if row["status"] == "ok"]
+    by_case: dict[tuple[int, int, int, int], dict[str, dict]] = {}
+    for row in ok:
+        key = (
+            row["batch"],
+            row["seqlen"],
+            row["heads_q"],
+            row["heads_kv"],
         )
-        if base is not None and best_fp4 is not None:
-            line += f" | {base['gpu_ms'] / best_fp4['gpu_ms']:>10.2f}x"
-            line += f" {best_fp4['cosine_vs_fa4']:>6.4f}"
-        else:
-            line += f" | {'-':>11} {'-':>6}"
-        lines.append(line)
+        by_case.setdefault(key, {})[row["variant"]] = row
 
-    lines.append("")
-    lines.append("spl is the split count FA4's heuristic picks for fa4_bf16_split.")
-    lines.append("ms column is `gpu_kernel_ms (end_to_end_wall_ms)`.")
-    lines.append("GB/s is KV cache bytes moved divided by gpu kernel time.")
-    lines.append("speedup compares the faster fp4 variant against fa4_bf16 on gpu time.")
+    ratios: list[dict] = []
+    for key, variants in sorted(by_case.items()):
+        if "fa4_bf16" not in variants or "fa4_split" not in variants:
+            continue
+        baseline = min(
+            (variants["fa4_bf16"], variants["fa4_split"]),
+            key=lambda row: row["gpu_ms"],
+        )
+        for fp4_name in ("fp4_pure_bf16q", "fp4_pure_fp4q"):
+            fp4_row = variants.get(fp4_name)
+            if (
+                fp4_row is None
+                or fp4_row["status"] != "ok"
+                or fp4_row["gpu_ms"] is None
+                or baseline["gpu_ms"] is None
+            ):
+                continue
+            ratios.append(
+                {
+                    "batch": key[0],
+                    "seqlen": key[1],
+                    "heads_q": key[2],
+                    "heads_kv": key[3],
+                    "attention_type": fp4_row["attention_type"],
+                    "fp4_variant": fp4_name,
+                    "fa4_baseline_variant": baseline["variant"],
+                    "fa4_baseline_num_splits": baseline["num_splits"],
+                    "ratio_vs_fa4_better": fp4_row["gpu_ms"] / baseline["gpu_ms"],
+                }
+            )
+
+    per_path: dict[str, dict] = {}
+    for fp4_name in ("fp4_pure_bf16q", "fp4_pure_fp4q"):
+        path_rows = [row for row in ratios if row["fp4_variant"] == fp4_name]
+        per_seqlen = {}
+        for seqlen in DEFAULT_SEQLENS:
+            values = [
+                row["ratio_vs_fa4_better"]
+                for row in path_rows
+                if row["seqlen"] == seqlen
+            ]
+            if values:
+                per_seqlen[str(seqlen)] = _gmean(values)
+        values = [row["ratio_vs_fa4_better"] for row in path_rows]
+        per_path[fp4_name] = {
+            "implemented": any(
+                row["variant"] == fp4_name and row["status"] == "ok"
+                for row in rows
+            ),
+            "timed": bool(values),
+            "per_seqlen_geomean": per_seqlen,
+            "overall_geomean": _gmean(values) if values else None,
+            "worst_point": (
+                max(path_rows, key=lambda row: row["ratio_vs_fa4_better"])
+                if values
+                else None
+            ),
+        }
+    return {"ratios": ratios, "paths": per_path}
+
+
+def format_table(rows: list[dict]) -> str:
+    by_case: dict[tuple[int, int, int, int], dict[str, dict]] = {}
+    for row in rows:
+        key = (
+            row["batch"],
+            row["seqlen"],
+            row["heads_q"],
+            row["heads_kv"],
+        )
+        by_case.setdefault(key, {})[row["variant"]] = row
+
+    header = (
+        f"{'type':>5} {'batch':>5} {'seqlen':>7} {'hq/hkv':>7}"
+        f" | {'FA4 best':>15} | {'FP4 BF16-Q':>15} | {'FP4-Q':>12}"
+    )
+    lines = [header, "-" * len(header)]
+    for key, variants in sorted(by_case.items()):
+        fa4 = [
+            variants[name]
+            for name in ("fa4_bf16", "fa4_split")
+            if (
+                name in variants
+                and variants[name]["status"] == "ok"
+                and variants[name]["gpu_ms"] is not None
+            )
+        ]
+        baseline = min(fa4, key=lambda row: row["gpu_ms"]) if fa4 else None
+        bf16q = variants.get("fp4_pure_bf16q")
+        fp4q = variants.get("fp4_pure_fp4q")
+        fa4_text = (
+            f"{baseline['gpu_ms']:.4f} {baseline['variant']}"
+            if baseline
+            else "-"
+        )
+        bf16q_text = (
+            f"{bf16q['gpu_ms']:.4f}"
+            if (
+                bf16q
+                and bf16q["status"] == "ok"
+                and bf16q["gpu_ms"] is not None
+            )
+            else "-"
+        )
+        fp4q_text = (
+            f"{fp4q['gpu_ms']:.4f}"
+            if fp4q and fp4q["status"] == "ok"
+            else "Phase 1"
+        )
+        lines.append(
+            f"{next(iter(variants.values()))['attention_type']:>5}"
+            f" {key[0]:>5} {key[1]:>7} {key[2]:>2}/{key[3]:<4}"
+            f" | {fa4_text:>15} | {bf16q_text:>15} | {fp4q_text:>12}"
+        )
     return "\n".join(lines)
+
+
+def package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def git_value(*args: str) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def provenance(args: argparse.Namespace, device: torch.device) -> dict:
+    env_root = sys.prefix
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "environment": env_root,
+        "python_executable": sys.executable,
+        "python_version": platform.python_version(),
+        "packages": {
+            "torch": package_version("torch"),
+            "nvidia-cutlass-dsl": package_version("nvidia-cutlass-dsl"),
+            "flash-attn-4": package_version("flash-attn-4"),
+            "flashinfer-python": package_version("flashinfer-python"),
+        },
+        "gpu": {
+            "requested_device": args.device,
+            "visible_device": device.index,
+            "name": torch.cuda.get_device_name(device),
+            "compute_capability": list(torch.cuda.get_device_capability(device)),
+            "multi_processor_count": (
+                torch.cuda.get_device_properties(device).multi_processor_count
+            ),
+            "total_memory_bytes": (
+                torch.cuda.get_device_properties(device).total_memory
+            ),
+        },
+        "git": {
+            "commit": git_value("rev-parse", "HEAD"),
+            "branch": git_value("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(git_value("status", "--porcelain")),
+        },
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "baseline_definition": (
+            "minimum CUDA-event gpu_ms of FA4 num_splits=1 and FA4 heuristic; "
+            "both use flash_attn_varlen_func"
+        ),
+        "fp4_q_gate_status": "unavailable_until_phase1",
+    }
+
+
+def parse_head_configs(args: argparse.Namespace) -> list[tuple[int, int]]:
+    if args.head_configs:
+        configs = []
+        for item in args.head_configs:
+            try:
+                heads_q, heads_kv = (int(value) for value in item.split(":", 1))
+            except ValueError as error:
+                raise SystemExit(
+                    f"invalid --head-config {item!r}; expected HEADS_Q:HEADS_KV"
+                ) from error
+            configs.append((heads_q, heads_kv))
+        return configs
+    if args.heads_q is not None or args.heads_kv is not None:
+        return [(args.heads_q or 32, args.heads_kv or 8)]
+    return list(DEFAULT_HEAD_CONFIGS)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", type=int, default=1)
-    parser.add_argument("--batches", type=int, nargs="+", default=[1, 4, 16, 64, 128])
     parser.add_argument(
-        "--seqlens", type=int, nargs="+", default=[1024, 4096, 16384, 65536]
+        "--device",
+        type=int,
+        default=0,
+        help=(
+            "index within CUDA_VISIBLE_DEVICES; §6.1 requires "
+            "CUDA_VISIBLE_DEVICES=1, so the visible device index is 0"
+        ),
     )
-    parser.add_argument("--heads-q", type=int, default=32)
-    parser.add_argument("--heads-kv", type=int, default=8)
+    parser.add_argument("--batches", type=int, nargs="+", default=DEFAULT_BATCHES)
+    parser.add_argument("--seqlens", type=int, nargs="+", default=DEFAULT_SEQLENS)
+    parser.add_argument(
+        "--head-config",
+        dest="head_configs",
+        action="append",
+        help="repeatable HEADS_Q:HEADS_KV; default covers MHA, GQA, and MQA",
+    )
+    parser.add_argument("--heads-q", type=int, default=None)
+    parser.add_argument("--heads-kv", type=int, default=None)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
         "--max-kv-tokens",
         type=int,
-        default=2_200_000,
+        default=DEFAULT_MAX_KV_TOKENS,
         help="skip cases whose batch*seqlen exceeds this KV token budget",
     )
-    parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
-    parser.add_argument("--breakdown", action="store_true")
     parser.add_argument(
-        "--event-timing",
+        "--quantize-chunk-pages",
+        type=int,
+        default=8192,
+        help=(
+            "quantize large benchmark inputs in bounded page chunks; this is "
+            "setup only and is outside measured decode calls"
+        ),
+    )
+    parser.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS)
+    parser.add_argument(
+        "--breakdown",
         action="store_true",
-        help="use CUDA events instead of torch profiler (required under IKET)",
+        help="run a separate Torch-Profiler pass; never use under IKET",
+    )
+    parser.add_argument(
+        "--structural-only",
+        action="store_true",
+        help=(
+            "launch workloads without timing-shaped output; use under IKET, "
+            "where instrumented durations are not performance evidence"
+        ),
     )
     parser.add_argument(
         "--clear-fp4-compile-cache",
         action="store_true",
         help="clear in-process FP4 caches before each case (required for IKET)",
     )
-    parser.add_argument("--json", type=str, default=None)
+    parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
+    if args.structural_only and args.breakdown:
+        raise SystemExit("--structural-only and --breakdown are mutually exclusive")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
@@ -468,47 +750,67 @@ def main() -> None:
     if capability[0] != 10:
         raise SystemExit(f"SM100 is required, found compute capability {capability}")
 
+    head_configs = parse_head_configs(args)
     print(f"device: {torch.cuda.get_device_name(device)} (cuda:{args.device})")
-    print(f"heads_q={args.heads_q} heads_kv={args.heads_kv} head_dim={HEAD_DIM}")
+    print(f"head_configs={head_configs} head_dim={HEAD_DIM}")
     print(f"iters={args.iters} warmup={args.warmup}")
     print()
 
     torch.manual_seed(0)
     rows: list[dict] = []
-    for batch in args.batches:
-        for seqlen in args.seqlens:
-            if batch * seqlen > args.max_kv_tokens:
-                continue
-            case = Case(batch, seqlen, args.heads_q, args.heads_kv)
-            print(f"running {case.label} ...", flush=True)
-            if args.clear_fp4_compile_cache:
-                clear_fp4_compile_caches()
-            rows.extend(
-                run_case(
-                    case,
-                    device,
-                    args.variants,
-                    args.iters,
-                    args.warmup,
-                    args.breakdown,
-                    args.event_timing,
+    skipped: list[dict] = []
+    for heads_q, heads_kv in head_configs:
+        for batch in args.batches:
+            for seqlen in args.seqlens:
+                if batch * seqlen > args.max_kv_tokens:
+                    skipped.append(
+                        {
+                            "batch": batch,
+                            "seqlen": seqlen,
+                            "heads_q": heads_q,
+                            "heads_kv": heads_kv,
+                            "reason": "max_kv_tokens",
+                        }
+                    )
+                    continue
+                case = Case(batch, seqlen, heads_q, heads_kv)
+                print(f"running {case.label} ...", flush=True)
+                if args.clear_fp4_compile_cache:
+                    clear_fp4_compile_caches()
+                rows.extend(
+                    run_case(
+                        case,
+                        device,
+                        args.variants,
+                        args.iters,
+                        args.warmup,
+                        args.breakdown,
+                        args.structural_only,
+                        args.quantize_chunk_pages,
+                    )
                 )
-            )
 
+    summary = summarize(rows)
     print()
-    print(format_table(rows, args.variants))
+    print(format_table(rows))
+    print()
+    print(json.dumps(summary["paths"], indent=2))
 
-    if args.breakdown:
-        print()
-        print("per-kernel breakdown (ms/iter):")
-        for row in rows:
-            print(f"  {row['variant']} b{row['batch']} s{row['seqlen']}")
-            for name, ms in row["kernels"].items():
-                print(f"    {ms:8.4f}  {name[:96]}")
-
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "provenance": provenance(args, device),
+        "coverage": {
+            "requested_batches": list(args.batches),
+            "requested_seqlens": list(args.seqlens),
+            "requested_head_configs": [list(config) for config in head_configs],
+            "skipped": skipped,
+        },
+        "results": rows,
+        "summary": summary,
+    }
     if args.json:
-        with open(args.json, "w") as handle:
-            json.dump(rows, handle, indent=2)
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(result, indent=2) + "\n")
         print(f"\nwrote {args.json}")
 
 

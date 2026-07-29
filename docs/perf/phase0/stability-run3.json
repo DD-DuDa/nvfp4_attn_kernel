@@ -1,0 +1,205 @@
+{
+  "schema_version": 2,
+  "provenance": {
+    "timestamp_utc": "2026-07-29T14:06:09.785009+00:00",
+    "environment": "/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4",
+    "python_executable": "/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/bin/python",
+    "python_version": "3.12.13",
+    "packages": {
+      "torch": "2.11.0+cu130",
+      "nvidia-cutlass-dsl": "4.6.0",
+      "flash-attn-4": "4.0.0b23",
+      "flashinfer-python": "0.6.15.post1"
+    },
+    "gpu": {
+      "requested_device": 0,
+      "visible_device": 0,
+      "name": "NVIDIA L20A",
+      "compute_capability": [
+        10,
+        0
+      ],
+      "multi_processor_count": 148,
+      "total_memory_bytes": 191503138816
+    },
+    "git": {
+      "commit": "5e31d8e0dc494d35e98f6c50523b30730b118e3c",
+      "branch": "perf/fp4-decode-2x",
+      "dirty": true
+    },
+    "arguments": {
+      "device": 0,
+      "batches": [
+        16
+      ],
+      "seqlens": [
+        16384
+      ],
+      "head_configs": [
+        "32:8"
+      ],
+      "heads_q": null,
+      "heads_kv": null,
+      "iters": 30,
+      "warmup": 10,
+      "max_kv_tokens": 8400000,
+      "quantize_chunk_pages": 8192,
+      "variants": [
+        "fa4_bf16",
+        "fa4_split",
+        "fp4_pure_bf16q",
+        "fp4_pure_fp4q"
+      ],
+      "breakdown": false,
+      "structural_only": false,
+      "clear_fp4_compile_cache": false,
+      "json": "docs/perf/phase0/stability-run3.json"
+    },
+    "baseline_definition": "minimum CUDA-event gpu_ms of FA4 num_splits=1 and FA4 heuristic; both use flash_attn_varlen_func",
+    "fp4_q_gate_status": "unavailable_until_phase1"
+  },
+  "coverage": {
+    "requested_batches": [
+      16
+    ],
+    "requested_seqlens": [
+      16384
+    ],
+    "requested_head_configs": [
+      [
+        32,
+        8
+      ]
+    ],
+    "skipped": []
+  },
+  "results": [
+    {
+      "batch": 16,
+      "seqlen": 16384,
+      "heads_q": 32,
+      "heads_kv": 8,
+      "attention_type": "gqa4",
+      "variant": "fa4_bf16",
+      "input_contract": "bf16_q_bf16_kv",
+      "status": "ok",
+      "unavailable_reason": null,
+      "num_splits": 1,
+      "gpu_ms": 0.164517339070638,
+      "wall_ms": 0.16428126643101373,
+      "kv_gib": 1.0,
+      "kv_gbps": 6526.617984861599,
+      "cosine_vs_fa4": 1.0,
+      "kernels": {},
+      "query_quantization_ms": null,
+      "query_quantization_fraction": null,
+      "peak_memory_bytes": 1610743808
+    },
+    {
+      "batch": 16,
+      "seqlen": 16384,
+      "heads_q": 32,
+      "heads_kv": 8,
+      "attention_type": "gqa4",
+      "variant": "fa4_split",
+      "input_contract": "bf16_q_bf16_kv",
+      "status": "ok",
+      "unavailable_reason": null,
+      "num_splits": 1,
+      "gpu_ms": 0.16439679463704426,
+      "wall_ms": 0.16428319892535606,
+      "kv_gib": 1.0,
+      "kv_gbps": 6531.40364671106,
+      "cosine_vs_fa4": 1.0,
+      "kernels": {},
+      "query_quantization_ms": null,
+      "query_quantization_fraction": null,
+      "peak_memory_bytes": 1610743808
+    },
+    {
+      "batch": 16,
+      "seqlen": 16384,
+      "heads_q": 32,
+      "heads_kv": 8,
+      "attention_type": "gqa4",
+      "variant": "fp4_pure_bf16q",
+      "input_contract": "bf16_q_fp4_kv",
+      "status": "ok",
+      "unavailable_reason": null,
+      "num_splits": 1,
+      "gpu_ms": 0.6381973266601563,
+      "wall_ms": 0.6484892296915253,
+      "kv_gib": 0.28125,
+      "kv_gbps": 473.1920291493345,
+      "cosine_vs_fa4": 0.9874743223190308,
+      "kernels": {},
+      "query_quantization_ms": null,
+      "query_quantization_fraction": null,
+      "peak_memory_bytes": 1610743808
+    },
+    {
+      "batch": 16,
+      "seqlen": 16384,
+      "heads_q": 32,
+      "heads_kv": 8,
+      "attention_type": "gqa4",
+      "variant": "fp4_pure_fp4q",
+      "input_contract": "fp4_q_fp4_kv",
+      "status": "unavailable",
+      "unavailable_reason": "unavailable_until_phase1",
+      "num_splits": null,
+      "gpu_ms": null,
+      "wall_ms": null,
+      "kv_gib": 0.28125,
+      "kv_gbps": null,
+      "cosine_vs_fa4": null,
+      "kernels": {},
+      "query_quantization_ms": null,
+      "query_quantization_fraction": null,
+      "peak_memory_bytes": 1610743808
+    }
+  ],
+  "summary": {
+    "ratios": [
+      {
+        "batch": 16,
+        "seqlen": 16384,
+        "heads_q": 32,
+        "heads_kv": 8,
+        "attention_type": "gqa4",
+        "fp4_variant": "fp4_pure_bf16q",
+        "fa4_baseline_variant": "fa4_split",
+        "fa4_baseline_num_splits": 1,
+        "ratio_vs_fa4_better": 3.882054562372522
+      }
+    ],
+    "paths": {
+      "fp4_pure_bf16q": {
+        "implemented": true,
+        "timed": true,
+        "per_seqlen_geomean": {
+          "16384": 3.882054562372522
+        },
+        "overall_geomean": 3.882054562372522,
+        "worst_point": {
+          "batch": 16,
+          "seqlen": 16384,
+          "heads_q": 32,
+          "heads_kv": 8,
+          "attention_type": "gqa4",
+          "fp4_variant": "fp4_pure_bf16q",
+          "fa4_baseline_variant": "fa4_split",
+          "fa4_baseline_num_splits": 1,
+          "ratio_vs_fa4_better": 3.882054562372522
+        }
+      },
+      "fp4_pure_fp4q": {
+        "implemented": false,
+        "timed": false,
+        "per_seqlen_geomean": {},
+        "overall_geomean": null,
+        "worst_point": null
+      }
+    }
+  }
+}
