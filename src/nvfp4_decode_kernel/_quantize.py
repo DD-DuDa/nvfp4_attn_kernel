@@ -43,7 +43,7 @@ def quantize_query(
 
     query_fp4 = torch.zeros(
         rows,
-        PAGE_SIZE,
+        1,
         heads,
         head_dim // 2,
         dtype=torch.uint8,

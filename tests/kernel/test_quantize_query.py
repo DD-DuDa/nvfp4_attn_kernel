@@ -54,7 +54,7 @@ def test_quantize_query_matches_flashinfer(quantizers, rows):
 
     assert torch.equal(
         actual_fp4.view(torch.uint8),
-        expected_fp4.view(torch.uint8),
+        expected_fp4[:, :1].view(torch.uint8),
     )
     assert torch.equal(actual_scales, expected_scales)
 
@@ -88,7 +88,7 @@ def test_quantize_query_supports_strided_indexed_input(quantizers):
 
     assert torch.equal(
         actual_fp4.view(torch.uint8),
-        expected_fp4.view(torch.uint8),
+        expected_fp4[:, :1].view(torch.uint8),
     )
     assert torch.equal(actual_scales, expected_scales)
 
@@ -108,7 +108,7 @@ def test_quantize_query_writes_padded_bf16_query(quantizers):
 
     query_fp4 = torch.zeros(
         rows,
-        PAGE_SIZE,
+        1,
         HEADS,
         HEAD_DIM // 2,
         dtype=torch.uint8,
@@ -148,11 +148,8 @@ def test_quantize_query_writes_padded_bf16_query(quantizers):
 
     assert torch.equal(
         query_fp4.view(torch.uint8),
-        expected_fp4.view(torch.uint8),
+        expected_fp4[:, :1].view(torch.uint8),
     )
     assert torch.equal(query_scales, expected_scales)
     assert torch.equal(query_padded[:, 0], query)
     assert torch.count_nonzero(query_padded[:, 1:]).item() == 0
-    assert torch.count_nonzero(
-        query_fp4.view(torch.uint8)[:, 1:]
-    ).item() == 0

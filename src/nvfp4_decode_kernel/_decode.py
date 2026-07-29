@@ -200,7 +200,7 @@ def _compile_decode(
         fused_residual_first_block=has_residual,
         residual_source="paged_bf16",
         use_out_indices=out_indices is not None,
-        seqlen_q_static_one=False,
+        seqlen_q_static_one=True,
     )
     fake_stream = cute.runtime.make_fake_stream()
     q_pointer = make_ptr(
@@ -360,7 +360,7 @@ def decode_fp4(
         raise ValueError("softmax_scale must be finite and positive")
     if query_fp4.ndim != 4:
         raise ValueError(
-            "query_fp4 must have shape [rows, 128, heads_q, 64]"
+            "query_fp4 must have shape [rows, 1, heads_q, 64]"
         )
     device = query_fp4.device
     _require_cuda_tensor(query_fp4, "query_fp4", device=device)
@@ -370,14 +370,14 @@ def decode_fp4(
     if query_fp4.dtype is not fp4_dtype or not query_fp4.is_contiguous():
         raise ValueError("query_fp4 must be contiguous packed E2M1 FP4")
 
-    rows, query_page_size, heads_q, packed_head_dim = query_fp4.shape
+    rows, query_length, heads_q, packed_head_dim = query_fp4.shape
     if (
         rows < 1
-        or query_page_size != PAGE_SIZE
+        or query_length != 1
         or packed_head_dim * 2 != HEAD_DIM
     ):
         raise ValueError(
-            "query_fp4 must have shape [rows, 128, heads_q, 64]"
+            "query_fp4 must have shape [rows, 1, heads_q, 64]"
         )
     expected_padded_shape = (rows, PAGE_SIZE, heads_q, HEAD_DIM)
 
@@ -638,7 +638,7 @@ def decode_fp4(
     else:
         output_4d = torch.empty(
             rows,
-            PAGE_SIZE,
+            1,
             heads_q,
             HEAD_DIM,
             dtype=torch.bfloat16,
@@ -707,7 +707,7 @@ def decode_fp4(
             value_scales,
             (
                 rows,
-                PAGE_SIZE,
+                1,
                 heads_q,
                 HEAD_DIM,
             ),

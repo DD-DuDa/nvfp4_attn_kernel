@@ -340,7 +340,7 @@ def quantize_decode_q_to_padded_fp4(
 
     expected_fp4_shape = (
         rows,
-        PAGE_SIZE,
+        1,
         heads,
         head_dim // 2,
     )

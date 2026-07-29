@@ -1,0 +1,291 @@
+[
+  {
+    "kernel": "kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensor00000o41112101314_None_None_None_0",
+    "wall_ns": 1859712,
+    "occupancy": {
+      "grid": [
+        148,
+        1,
+        1
+      ],
+      "grid_ctas": 148,
+      "traced_ctas": 148,
+      "sms_used": 148,
+      "max_ctas_per_sm": 1
+    },
+    "malformed_ranges": 0,
+    "roles": {
+      "corr": {
+        "warps": 592,
+        "total_ns": 1082304480,
+        "mean_ns": 1828217.027027027,
+        "max_ns": 1858624,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599140704,
+        "envelope_span_ns": 1859040,
+        "end_from_launch_start_ns": 1859040,
+        "ends_at_launch_tail": false
+      },
+      "softmax0": {
+        "warps": 592,
+        "total_ns": 1081686048,
+        "mean_ns": 1827172.3783783785,
+        "max_ns": 1859264,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599141376,
+        "envelope_span_ns": 1859712,
+        "end_from_launch_start_ns": 1859712,
+        "ends_at_launch_tail": true
+      },
+      "softmax1": {
+        "warps": 592,
+        "total_ns": 1081590432,
+        "mean_ns": 1827010.8648648649,
+        "max_ns": 1857440,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599139552,
+        "envelope_span_ns": 1857888,
+        "end_from_launch_start_ns": 1857888,
+        "ends_at_launch_tail": false
+      },
+      "epi": {
+        "warps": 148,
+        "total_ns": 270714624,
+        "mean_ns": 1829152.8648648649,
+        "max_ns": 1859168,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599141280,
+        "envelope_span_ns": 1859616,
+        "end_from_launch_start_ns": 1859616,
+        "ends_at_launch_tail": false
+      },
+      "mma": {
+        "warps": 148,
+        "total_ns": 270669728,
+        "mean_ns": 1828849.5135135136,
+        "max_ns": 1858784,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599140896,
+        "envelope_span_ns": 1859232,
+        "end_from_launch_start_ns": 1859232,
+        "ends_at_launch_tail": false
+      },
+      "load": {
+        "warps": 148,
+        "total_ns": 268368768,
+        "mean_ns": 1813302.4864864864,
+        "max_ns": 1843584,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319599125696,
+        "envelope_span_ns": 1844032,
+        "end_from_launch_start_ns": 1844032,
+        "ends_at_launch_tail": false
+      },
+      "empty": {
+        "warps": 148,
+        "total_ns": 268480,
+        "mean_ns": 1814.054054054054,
+        "max_ns": 2048,
+        "envelope_start_ns": 1785338319597281664,
+        "envelope_end_ns": 1785338319597283808,
+        "envelope_span_ns": 2144,
+        "end_from_launch_start_ns": 2144,
+        "ends_at_launch_tail": false
+      }
+    },
+    "ranges": [
+      {
+        "role": "corr",
+        "name": "corr_life",
+        "count": 592,
+        "total_ns": 1081547936,
+        "mean_ns": 1826939.0810810812,
+        "pct_of_role_life": 99.93009878329248
+      },
+      {
+        "role": "corr",
+        "name": "corr_main",
+        "count": 592,
+        "total_ns": 1081520000,
+        "mean_ns": 1826891.8918918918,
+        "pct_of_role_life": 99.92751762424562
+      },
+      {
+        "role": "softmax1",
+        "name": "softmax_life",
+        "count": 592,
+        "total_ns": 1080885888,
+        "mean_ns": 1825820.7567567567,
+        "pct_of_role_life": 99.93486037051038
+      },
+      {
+        "role": "softmax0",
+        "name": "softmax_life",
+        "count": 592,
+        "total_ns": 1080563008,
+        "mean_ns": 1825275.3513513512,
+        "pct_of_role_life": 99.89617689882601
+      },
+      {
+        "role": "corr",
+        "name": "corr_wait_sm",
+        "count": 1052672,
+        "total_ns": 971970944,
+        "mean_ns": 923.3369406614786,
+        "pct_of_role_life": 89.80568425624553
+      },
+      {
+        "role": "epi",
+        "name": "epi_life",
+        "count": 148,
+        "total_ns": 270547072,
+        "mean_ns": 1828020.7567567567,
+        "pct_of_role_life": 99.93810751797436
+      },
+      {
+        "role": "epi",
+        "name": "epi_main",
+        "count": 148,
+        "total_ns": 270540256,
+        "mean_ns": 1827974.7027027027,
+        "pct_of_role_life": 99.93558973747942
+      },
+      {
+        "role": "mma",
+        "name": "mma_life",
+        "count": 148,
+        "total_ns": 270489504,
+        "mean_ns": 1827631.7837837837,
+        "pct_of_role_life": 99.93341553141842
+      },
+      {
+        "role": "epi",
+        "name": "epi_wait_corr",
+        "count": 2048,
+        "total_ns": 269613536,
+        "mean_ns": 131647.234375,
+        "pct_of_role_life": 99.59326615469432
+      },
+      {
+        "role": "load",
+        "name": "load_life",
+        "count": 148,
+        "total_ns": 268181376,
+        "mean_ns": 1812036.3243243243,
+        "pct_of_role_life": 99.93017369293881
+      },
+      {
+        "role": "load",
+        "name": "load_main",
+        "count": 148,
+        "total_ns": 268171904,
+        "mean_ns": 1811972.3243243243,
+        "pct_of_role_life": 99.92664422113381
+      },
+      {
+        "role": "load",
+        "name": "load_wait_kv",
+        "count": 262144,
+        "total_ns": 237128192,
+        "mean_ns": 904.572265625,
+        "pct_of_role_life": 88.35908655361864
+      },
+      {
+        "role": "mma",
+        "name": "mma_wait_p",
+        "count": 262144,
+        "total_ns": 214899040,
+        "mean_ns": 819.7747802734375,
+        "pct_of_role_life": 79.39529905612495
+      },
+      {
+        "role": "softmax1",
+        "name": "sm_wait_corr",
+        "count": 528384,
+        "total_ns": 146788768,
+        "mean_ns": 277.80698885658916,
+        "pct_of_role_life": 13.571566801729992
+      },
+      {
+        "role": "softmax0",
+        "name": "sm_wait_s",
+        "count": 524288,
+        "total_ns": 144870144,
+        "mean_ns": 276.31787109375,
+        "pct_of_role_life": 13.39299367573982
+      },
+      {
+        "role": "softmax1",
+        "name": "sm_wait_s",
+        "count": 524288,
+        "total_ns": 34024800,
+        "mean_ns": 64.89715576171875,
+        "pct_of_role_life": 3.145811852004253
+      },
+      {
+        "role": "softmax0",
+        "name": "sm_wait_corr",
+        "count": 528384,
+        "total_ns": 23800352,
+        "mean_ns": 45.04366521317829,
+        "pct_of_role_life": 2.2003012837233156
+      },
+      {
+        "role": "load",
+        "name": "load_wait_q",
+        "count": 2048,
+        "total_ns": 10476320,
+        "mean_ns": 5115.390625,
+        "pct_of_role_life": 3.9037031313569246
+      },
+      {
+        "role": "mma",
+        "name": "mma_wait_sf",
+        "count": 262144,
+        "total_ns": 9428096,
+        "mean_ns": 35.96533203125,
+        "pct_of_role_life": 3.483247302779275
+      },
+      {
+        "role": "mma",
+        "name": "mma_wait_v",
+        "count": 131072,
+        "total_ns": 6368512,
+        "mean_ns": 48.587890625,
+        "pct_of_role_life": 2.352871910374846
+      },
+      {
+        "role": "mma",
+        "name": "mma_wait_k",
+        "count": 130048,
+        "total_ns": 5780672,
+        "mean_ns": 44.45029527559055,
+        "pct_of_role_life": 2.1356921007435306
+      },
+      {
+        "role": "corr",
+        "name": "corr_wait_o",
+        "count": 8192,
+        "total_ns": 1733696,
+        "mean_ns": 211.6328125,
+        "pct_of_role_life": 0.1601856069190437
+      },
+      {
+        "role": "corr",
+        "name": "corr_wait_epi",
+        "count": 8192,
+        "total_ns": 1679200,
+        "mean_ns": 204.98046875,
+        "pct_of_role_life": 0.15515042495250506
+      },
+      {
+        "role": "mma",
+        "name": "mma_wait_qk",
+        "count": 2048,
+        "total_ns": 563872,
+        "mean_ns": 275.328125,
+        "pct_of_role_life": 0.20832473737144333
+      }
+    ]
+  }
+]
