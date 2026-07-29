@@ -65,6 +65,34 @@ def _as_scale_bytes(scales: torch.Tensor, name: str) -> torch.Tensor:
     raise ValueError(f"{name} must contain E4M3 scale-factor bytes")
 
 
+def _page_stride_bytes(pages: torch.Tensor, name: str) -> int:
+    """Validate a paged tensor's strides and return its page pitch in bytes.
+
+    Everything below the page axis must be densely packed, because that is the
+    shape the quantizer writes and the MMA reads. The page axis itself is free:
+    the quantizer's own output packs pages back to back, while a page of a vLLM
+    cache is one region of a wider page that also carries the scale factors and
+    the other of K/V. TMA only requires that every stride above the contiguous
+    axis be a whole number of 16-byte lines.
+    """
+    itemsize = pages.element_size()
+    dense_stride = 1
+    for axis in range(pages.ndim - 1, 0, -1):
+        if pages.stride(axis) != dense_stride:
+            raise ValueError(
+                f"{name} must be densely packed within a page; axis {axis} has "
+                f"stride {pages.stride(axis)}, expected {dense_stride}"
+            )
+        dense_stride *= pages.shape[axis]
+    page_stride = pages.stride(0)
+    if page_stride < dense_stride or (page_stride * itemsize) % 16:
+        raise ValueError(
+            f"{name} needs a page stride of at least {dense_stride} elements, "
+            f"aligned to 16 bytes, got {page_stride}"
+        )
+    return page_stride * itemsize
+
+
 def _page_scales_for_kernel(
     scales: torch.Tensor,
     name: str,
@@ -74,7 +102,11 @@ def _page_scales_for_kernel(
     atom_bytes = 512
     m_block_stride = rest_k * atom_bytes
     head_stride = rest_m * m_block_stride
-    page_stride = heads * head_stride
+    dense_page_stride = heads * head_stride
+    # Only the swizzle below the page axis is fixed. The page pitch comes from
+    # the caller so that a scale region carved out of a paged cache works, and
+    # as_strided keeps that region's storage offset.
+    page_stride = scales.stride()[0]
     expected_strides = (
         page_stride,
         16,
@@ -84,9 +116,16 @@ def _page_scales_for_kernel(
         atom_bytes,
         head_stride,
     )
-    if scales.storage_offset() != 0 or scales.stride() != expected_strides:
+    if scales.stride() != expected_strides:
         raise ValueError(
             f"{name} must use the scale layout returned by the K/V quantizer"
+        )
+    # 512 is the scale-factor atom the SFB TMA descriptor is built around, and
+    # the kernel is told the page pitch keeps that alignment.
+    if page_stride < dense_page_stride or page_stride % 512:
+        raise ValueError(
+            f"{name} needs a page stride of at least {dense_page_stride} "
+            f"bytes, aligned to 512, got {page_stride}"
         )
     return scales.as_strided(
         (32, 4, rest_m, 4, rest_k, heads, pages),
@@ -366,6 +405,12 @@ def _compile_decode(
         symbolic_v_shape,
     )
     compile_kwargs: dict[str, Any] = {
+        # Always dynamic, so one compiled kernel serves both a densely packed
+        # page array and a page carved out of a wider cache page.
+        "k_page_stride": Int32(0),
+        "v_page_stride": Int32(0),
+        "k_sf_page_stride": Int32(0),
+        "v_sf_page_stride": Int32(0),
         "mOutIndices": (
             _to_cute_tensor(
                 out_indices,
@@ -496,10 +541,9 @@ def decode_fp4(
         or key_pages_fp4.ndim != 4
         or key_pages_fp4.shape[1] != PAGE_SIZE
         or key_pages_fp4.shape[3] * 2 != HEAD_DIM
-        or not key_pages_fp4.is_contiguous()
     ):
         raise ValueError(
-            "key_pages_fp4 must be contiguous packed FP4 with shape "
+            "key_pages_fp4 must be packed FP4 with shape "
             "[pages, 128, heads_kv, 64]"
         )
     page_count, _, heads_kv, _ = key_pages_fp4.shape
@@ -507,12 +551,13 @@ def decode_fp4(
         value_pages_fp4.dtype not in packed_types
         or tuple(value_pages_fp4.shape)
         != (page_count, heads_kv, HEAD_DIM, PAGE_SIZE // 2)
-        or not value_pages_fp4.is_contiguous()
     ):
         raise ValueError(
-            "value_pages_fp4 must be contiguous packed FP4 with shape "
+            "value_pages_fp4 must be packed FP4 with shape "
             "[pages, heads_kv, 128, 64]"
         )
+    _page_stride_bytes(key_pages_fp4, "key_pages_fp4")
+    _page_stride_bytes(value_pages_fp4, "value_pages_fp4")
     if heads_kv < 1 or heads_q % heads_kv:
         raise ValueError("heads_q must be divisible by heads_kv")
     qhead_per_kvhead = heads_q // heads_kv
@@ -794,7 +839,20 @@ def decode_fp4(
                 HEAD_DIM,
             ),
         )
-        call_kwargs: dict[str, Any] = {"mOutIndices": out_indices}
+        # Packed pitches scale by two because one byte holds two FP4. The scale
+        # slabs are byte-per-element, and _page_scales_for_kernel moved their
+        # page axis last.
+        call_kwargs: dict[str, Any] = {
+            "k_page_stride": _page_stride_bytes(
+                key_pages_fp4, "key_pages_fp4"
+            ) * 2,
+            "v_page_stride": _page_stride_bytes(
+                value_pages_fp4, "value_pages_fp4"
+            ) * 2,
+            "k_sf_page_stride": key_scales.stride()[-1],
+            "v_sf_page_stride": value_scales.stride()[-1],
+            "mOutIndices": out_indices,
+        }
         if has_residual:
             call_kwargs.update(
                 mResidualQ=query_padded_bf16,

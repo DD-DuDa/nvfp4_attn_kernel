@@ -213,6 +213,36 @@ def _torch_fp4_decode(
     return output
 
 
+def _interleaved_page_cache(*regions: torch.Tensor) -> list[torch.Tensor]:
+    """Repack dense page arrays into one page-major cache, the way vLLM stores.
+
+    A vLLM block holds all four regions of a page inside a single window, so
+    each region's page stride becomes the whole window instead of its own size.
+    The bytes are unchanged; only the addressing is. Every region must already
+    be dense below its page axis, which is what the quantizers return.
+    """
+    pages = regions[0].shape[0]
+    pitches = [region.stride()[0] * region.element_size() for region in regions]
+    page_bytes = sum(pitches)
+    cache = torch.zeros(
+        pages, page_bytes, dtype=torch.uint8, device=regions[0].device
+    )
+
+    views = []
+    offset = 0
+    for region, pitch in zip(regions, pitches):
+        flat = region.as_strided((pages, pitch), (pitch, 1)).view(torch.uint8)
+        cache[:, offset : offset + pitch] = flat
+        typed = cache if region.dtype is torch.uint8 else cache.view(region.dtype)
+        views.append(
+            typed.as_strided(
+                region.shape, (page_bytes,) + region.stride()[1:], offset
+            )
+        )
+        offset += pitch
+    return views
+
+
 @pytest.fixture(scope="module", params=CASES)
 def outputs(request):
     if not torch.cuda.is_available():
@@ -286,25 +316,35 @@ def outputs(request):
             v_pages
         )
 
-        fp4_output = _output(
-            fp4_decode(
-                query=q[:, 0],
-                key_pages_fp4=key_pages_fp4,
-                key_scales=key_scales,
-                value_pages_fp4=value_pages_fp4,
-                value_scales=value_scales,
-                fp4_page_table=page_table,
-                seqused_fp4=seqused_fp4,
-                residual_key_pages_bf16=k_pages,
-                residual_value_pages_bf16=v_pages,
-                residual_page_ids=residual_page_ids,
-                seqused_residual=seqused_residual,
-                has_bf16=torch.ones_like(
-                    seqused_residual, dtype=torch.bool
-                ),
-                softmax_scale=softmax_scale,
+        def decode(k_fp4, k_sf, v_fp4, v_sf):
+            return _output(
+                fp4_decode(
+                    query=q[:, 0],
+                    key_pages_fp4=k_fp4,
+                    key_scales=k_sf,
+                    value_pages_fp4=v_fp4,
+                    value_scales=v_sf,
+                    fp4_page_table=page_table,
+                    seqused_fp4=seqused_fp4,
+                    residual_key_pages_bf16=k_pages,
+                    residual_value_pages_bf16=v_pages,
+                    residual_page_ids=residual_page_ids,
+                    seqused_residual=seqused_residual,
+                    has_bf16=torch.ones_like(
+                        seqused_residual, dtype=torch.bool
+                    ),
+                    softmax_scale=softmax_scale,
+                )
+            ).unsqueeze(1)
+
+        fp4_output = decode(
+            key_pages_fp4, key_scales, value_pages_fp4, value_scales
+        )
+        paged_output = decode(
+            *_interleaved_page_cache(
+                key_pages_fp4, key_scales, value_pages_fp4, value_scales
             )
-        ).unsqueeze(1)
+        )
 
         bf16_output = _flash_attention_reference(
             q,
@@ -339,11 +379,33 @@ def outputs(request):
 
     torch.cuda.synchronize()
 
-    return fp4_output, bf16_output, flash_fp4_output, torch_fp4_output
+    return (
+        fp4_output,
+        bf16_output,
+        flash_fp4_output,
+        torch_fp4_output,
+        paged_output,
+    )
+
+
+def test_fp4_decode_reads_pages_carved_out_of_a_vllm_block(outputs):
+    """Page stride must not change a single bit of the result.
+
+    Same bytes, same kernel, only the distance between pages differs, so any
+    difference is an addressing bug rather than a numerical one. Bit equality
+    also carries every oracle below over to the interleaved layout without
+    running them twice.
+    """
+    fp4_output, _, _, _, paged_output = outputs
+
+    assert torch.equal(fp4_output, paged_output), (
+        "decoding from pages interleaved at vLLM's block pitch disagreed with "
+        "decoding from densely packed pages"
+    )
 
 
 def test_fp4_decode_quality_against_bf16_fa4(outputs):
-    fp4_output, bf16_output, _, torch_fp4_output = outputs
+    fp4_output, bf16_output, _, torch_fp4_output, _ = outputs
 
     assert torch.isfinite(fp4_output).all()
 
@@ -361,7 +423,7 @@ def test_fp4_decode_quality_against_bf16_fa4(outputs):
 
 
 def test_fp4_decode_matches_flash_attention_on_hybrid_qkv(outputs):
-    fp4_output, _, flash_fp4_output, torch_fp4_output = outputs
+    fp4_output, _, flash_fp4_output, torch_fp4_output, _ = outputs
     kernel_cosine = _cosine(fp4_output, flash_fp4_output)
     oracle_cosine = _cosine(torch_fp4_output, flash_fp4_output)
 
@@ -373,7 +435,7 @@ def test_fp4_decode_matches_flash_attention_on_hybrid_qkv(outputs):
 
 
 def test_fp4_decode_matches_torch_hybrid_semantics(outputs):
-    fp4_output, _, _, torch_fp4_output = outputs
+    fp4_output, _, _, torch_fp4_output, _ = outputs
 
     cosine = _cosine(fp4_output, torch_fp4_output)
     row_cosines = [

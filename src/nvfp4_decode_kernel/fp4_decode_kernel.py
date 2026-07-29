@@ -45,6 +45,39 @@ from ._fa4.tile_scheduler import (
     ParamsBase,
 )
 
+def _sf_layout_with_page_stride(layout, page_stride):
+    """Override the page pitch of a K/V block-scale layout.
+
+    ``tile_to_shape`` derives every stride from the shape, which assumes the
+    scale factors of consecutive pages sit back to back. When a page is a region
+    of a wider cache page the pitch is larger, and it is the only stride that
+    changes: the swizzle inside a page is fixed by the MMA. The page axis is
+    mode 3, whose stride is ``(0, pitch)``.
+
+    Reconstructing the layout drops the divisibility facts ``tile_to_shape``
+    attached to the dynamic strides, so they are reapplied; the SFB TMA atom
+    needs the 512-byte atom alignment to remain known.
+    """
+    if page_stride is None:
+        return layout
+
+    def assume_atom_aligned(value):
+        if isinstance(value, int):
+            return value
+        return cute.assume(value, divby=512)
+
+    stride = layout.stride
+    return cute.make_layout(
+        layout.shape,
+        stride=(
+            (stride[0][0], assume_atom_aligned(stride[0][1])),
+            stride[1],
+            (stride[2][0], assume_atom_aligned(stride[2][1])),
+            (stride[3][0], assume_atom_aligned(page_stride)),
+        ),
+    )
+
+
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
 #     WarpSchedulerWG1 = enum.auto()
@@ -366,6 +399,15 @@ class FP4DecodeKernel:
         k_ptr_shape: tuple = (),
         # For pointer-based V (FP4 K-major): full headdim shape (b, s, h, d)
         v_ptr_shape: tuple = (),
+        # Distance between consecutive K/V pages, in FP4 elements for the packed
+        # data and in bytes for the scale factors. None means the pages are
+        # densely packed, which is what the shapes alone imply. A larger stride
+        # lets one page be a region of a wider cache page that also holds the
+        # scale factors and the other of K/V.
+        k_page_stride=None,
+        v_page_stride=None,
+        k_sf_page_stride=None,
+        v_sf_page_stride=None,
         compute_sp1: cutlass.Constexpr[bool] = False,
         mResidualQ: Optional[cute.Tensor] = None,
         mResidualK: Optional[cute.Tensor] = None,
@@ -389,9 +431,18 @@ class FP4DecodeKernel:
         mQ = cute.make_tensor(q_iter, cute.make_ordered_layout(
             q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))
         ))
-        mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
-            k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
-        ))
+        if const_expr(k_page_stride is None):
+            mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
+                k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
+            ))
+        else:
+            # Same row-major (b, s, h, d) layout the ordered form produces, with
+            # the page stride supplied instead of derived. The innermost stride
+            # stays a literal 1 so the major mode is still statically known.
+            _, _, k_h, k_d = k_ptr_shape
+            mK = cute.make_tensor(k_iter, cute.make_layout(
+                k_ptr_shape, stride=(k_page_stride, k_h * k_d, k_d, 1)
+            ))
         # FP4 K-major V: build from pointer with explicit (b, s, h, d) shape and
         # K-major strides (S*H*D, 1, S, S*H). The host transposes V's underlying
         # buffer so that seqlen has stride 1 in the FP4 byte buffer.
@@ -410,10 +461,24 @@ class FP4DecodeKernel:
             # (tma_partition for SFV requires Int64).
             from cutlass import Int64
             v_b, v_s, v_h, v_d = v_ptr_shape
-            mV = cute.make_tensor(v_iter, cute.make_ordered_layout(
-                (Int64(v_b), Int64(v_s), Int64(v_h), Int64(v_d)),
-                order=(3, 0, 2, 1),
-            ))
+            v_shape = (Int64(v_b), Int64(v_s), Int64(v_h), Int64(v_d))
+            if const_expr(v_page_stride is None):
+                mV = cute.make_tensor(v_iter, cute.make_ordered_layout(
+                    v_shape, order=(3, 0, 2, 1),
+                ))
+            else:
+                # The order=(3, 0, 2, 1) strides written out, with the page
+                # stride supplied. Seqlen keeps a literal stride of 1 so V stays
+                # statically K-major.
+                mV = cute.make_tensor(v_iter, cute.make_layout(
+                    v_shape,
+                    stride=(
+                        Int64(v_page_stride),
+                        1,
+                        Int64(v_s) * Int64(v_d),
+                        Int64(v_s),
+                    ),
+                ))
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -995,6 +1060,7 @@ class FP4DecodeKernel:
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
             sfk_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mK_shape, (2, 1, 3, 4))
+            sfk_layout = _sf_layout_with_page_stride(sfk_layout, k_sf_page_stride)
             mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
 
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
@@ -1046,6 +1112,7 @@ class FP4DecodeKernel:
             )
             # Setup scale factor tensor layout
             sfv_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mV_shape, (2, 1, 3, 4))
+            sfv_layout = _sf_layout_with_page_stride(sfv_layout, v_sf_page_stride)
             mSFV = cute.make_tensor(mSFV.iterator, sfv_layout)
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
             mma_inst_shape_mnk_pv = ( # the same processed by one tcgen05.mma instruction
