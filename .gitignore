@@ -2,3 +2,7 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 *.egg-info/
+
+# Third-party corpus, ~24MB / 3.4k files. Re-clone from
+# https://github.com/DongyunZou/KernelWiki into .claude/skills/KernelWiki
+.claude/skills/KernelWiki/
