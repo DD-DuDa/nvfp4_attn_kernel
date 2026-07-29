@@ -41,3 +41,29 @@ FA4 baseline in this cell, so later structural phases are still necessary.
 
 `short-case.json` records both paths separately and uses FP4-Q versus D0 as the
 D4 gate path.
+
+## Review-fix close evidence
+
+The first internal review found that host-side `_pack_sfq_for_gqa` still
+materialized mutable scale scratch every call. The quantizer now accepts
+`heads_kv` and writes scale factors directly in the kernel-consumed PackGQA
+layout. The decode path consumes this tensor directly; the host repack cache,
+`torch.take`, and `index_copy_` path were removed. This also removes the
+cross-stream mutable-buffer hazard.
+
+Final clean evidence at commit `19edfbd`:
+
+| Path | GPU ms |
+|---|---:|
+| FA4 split=1 | 0.04406 |
+| FA4 heuristic | 0.06000 |
+| FP4 BF16-Q | 0.32179 |
+| **FP4 FP4-Q** | **0.10903** |
+
+FP4-Q is **2.95x faster** than BF16-Q (`0.339x` latency) on the representative
+short case. `short-case-final.json` records `dirty=false`, commit `19edfbd`, and
+the correct `fp4_q_fp4_kv` contract label.
+
+Final gate: **56 passed**. Negative tests cover partial/ambiguous contracts,
+wrong packed dtype/shape, wrong scale shape/layout, row/head mismatch, and FP4-Q
+indexing rejection. Residual remains deliberately deferred by user decision.
