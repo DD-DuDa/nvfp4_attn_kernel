@@ -201,5 +201,10 @@
         "worst_point": null
       }
     }
+  },
+  "artifact_metadata": {
+    "historical": true,
+    "schema_compatibility": "pre-Round-3 benchmark schema",
+    "evidence_scope": "clean timing run generated from working tree at 5e31d8e plus uncommitted benchmark schema work; historical values retained, not final-schema JSON"
   }
 }

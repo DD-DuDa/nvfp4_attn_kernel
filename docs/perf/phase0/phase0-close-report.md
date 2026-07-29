@@ -2,7 +2,7 @@
 
 ## Outcome
 
-Phase 0 established reliable IKET and clean benchmark infrastructure without changing the decode algorithm. The Phase-level gate is met: numerical tests remain green, clean timing is stable, IKET evidence is non-empty and attributable, and the benchmark records D0/D4/provenance/coverage semantics. The final §8.1 performance gate is intentionally not evaluated until Phase 5.
+Phase 0 established reliable IKET and clean benchmark infrastructure without changing the decode algorithm. The Phase-level measurement gate is met: numerical tests remain green, clean timing is stable, IKET evidence is non-empty and attributable, and the benchmark records D0/D4/provenance/coverage semantics. The final §8.1 performance gate is intentionally not evaluated until Phase 5.
 
 ## Expected versus measured
 
@@ -19,15 +19,18 @@ Phase 0 established reliable IKET and clean benchmark infrastructure without cha
 
 ## Benchmark evidence
 
-- `full-grid-smoke.json` contains all 96 required batch/seqlen/head-config cases (384 variant/status rows), with zero missing or skipped cases.
+- Historical `full-grid-smoke.json` contains all 96 required batch/seqlen/head-config cases (384 variant/status rows), with zero missing or skipped cases. It is explicitly a dirty-tree one-iteration coverage/representability smoke, not clean final performance evidence.
 - D0 selects the faster of FA4 split=1 and FA4 heuristic, preserving varlen pack-GQA.
 - D4 records BF16-Q and explicit FP4-Q unavailable-until-Phase-1 status.
 - Long case batch=128, seqlen=65536 completes with 48.077 GiB conservative
   whole-case peak allocation; no artificial max-token skip.
-- Kernel breakdown is non-empty; Q quantization is 0.00611 ms (11.15% of diagnostic profiler GPU time).
+- Historical pre-Round-3-schema kernel breakdown is non-empty; Q quantization is 0.00611 ms (11.15% of diagnostic profiler GPU time).
 - Provenance records environment, versions, GPU, commit, arguments, timestamp and baseline definition.
 
 ## Stability
+
+The following are historical clean timing runs generated during Round 2 on the pre-Round-3 JSON schema; their raw provenance is retained and they are used only for the <3% noise check.
+
 
 | Variant | Run 1 | Run 2 | Run 3 | Range/geomean |
 |---|---:|---:|---:|---:|
@@ -46,7 +49,7 @@ Phase 0 established reliable IKET and clean benchmark infrastructure without cha
 ## Numerical gate
 
 - `tests/kernel` remains 46/46 green.
-- Benchmark aggregation tests are 2/2 green.
+- Benchmark infrastructure tests are 5/5 green (51/51 combined).
 - No numerical thresholds or D0–D8 decisions were changed.
 
 ## Next phase

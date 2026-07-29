@@ -9333,5 +9333,10 @@
         "worst_point": null
       }
     }
+  },
+  "artifact_metadata": {
+    "historical": true,
+    "schema_compatibility": "Round-3 full-grid schema before close commit",
+    "evidence_scope": "coverage and representability smoke; one iteration; dirty working tree; not clean performance evidence"
   }
 }

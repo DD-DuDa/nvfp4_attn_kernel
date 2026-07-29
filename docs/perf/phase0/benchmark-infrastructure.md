@@ -14,7 +14,7 @@ Schema v2 records the environment path, Python and package versions, GPU identit
 
 ## Per-kernel attribution
 
-`kernel-breakdown.json` is a clean, separate Torch-Profiler run for
+`kernel-breakdown.json` is a historical, separate Torch-Profiler run on the pre-Round-3 schema for
 `batch=1, seqlen=1024, heads_q=32, heads_kv=8`. It contains 12 non-empty GPU
 entries. The BF16-Q query quantization kernel is 0.00611 ms and 11.15% of the
 summed profiler kernel time for that run. These figures diagnose composition;
@@ -22,7 +22,7 @@ the CUDA-event `gpu_ms` remains the benchmark comparison value.
 
 ## Stability
 
-Three independent clean runs of `batch=16, seqlen=16384, GQA-4`, each with 10
+Three independent historical clean runs on the pre-Round-3 schema of `batch=16, seqlen=16384, GQA-4`, each with 10
 warmups and 30 measured iterations:
 
 | Variant | Run 1 ms | Run 2 ms | Run 3 ms | Geomean ms | Range / geomean |
@@ -40,3 +40,7 @@ All are below the 3% stability threshold.
 - The full-grid artifact includes `batch=128, seqlen=65536` for MHA/GQA/MQA. The conservative whole-case peak is **48.077 GiB**, below the 178.35 GiB device capacity. FA4 split=1, FA4 heuristic and FP4 BF16-Q completed; FP4-Q is explicitly unavailable; no max-token skip occurred.
 
 Phase 0 archives the complete BF16-Q/FA4 grid as a functional smoke. Phase 5 will rerun the same complete grid with production iteration counts on the Phase 1 FP4-Q path for the final D3 gate.
+
+## Artifact provenance note
+
+The stability and kernel-breakdown JSON files preserve their original dirty/pre-close provenance and are explicitly marked historical. The full-grid JSON is likewise a dirty-tree one-iteration coverage smoke. Phase 5 will generate clean final-schema performance evidence after the FP4-Q path exists. Phase 0 does not rewrite provenance to pretend these were generated from the close commit.
