@@ -694,7 +694,11 @@ def format_table(rows: list[dict]) -> str:
         )
         fp4q_text = (
             f"{fp4q['gpu_ms']:.4f}"
-            if fp4q and fp4q["status"] == "ok"
+            if (
+                fp4q
+                and fp4q["status"] == "ok"
+                and fp4q["gpu_ms"] is not None
+            )
             else "Phase 1"
         )
         lines.append(
