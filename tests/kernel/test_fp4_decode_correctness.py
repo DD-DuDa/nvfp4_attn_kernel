@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_attn import flash_attn_func
+from flash_attn.cute import flash_attn_func
 from nvfp4_decode_kernel import _quantize
 from nvfp4_decode_kernel import fp4_decode
 

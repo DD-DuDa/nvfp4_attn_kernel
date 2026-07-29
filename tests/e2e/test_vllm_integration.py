@@ -1,12 +1,14 @@
-"""Opt-in end-to-end coverage for the vendored vLLM integration.
+"""Opt-in end-to-end check that the CUSTOM backend is a pass-through.
 
-``test_gsm8k_subset_accuracy_tracks_bf16`` proves that the FP4 KV cache still
-answers correctly, by scoring a GSM8K subset against a BF16 baseline taken from
-the same engine configuration in the same process.
+Scores the same GSM8K subset on stock ``FLASH_ATTN`` and on ``CUSTOM``, both
+with a BF16 KV cache and no quantization anywhere. The two arms run identical
+arithmetic, so greedy decoding must produce the same token ids exactly. The
+BF16 arm additionally has to clear an absolute accuracy floor, or two arms
+agreeing on garbage would satisfy the equality check.
 
-Attribution and accuracy are both required. Accuracy alone cannot distinguish
-a correct FP4 path from a silent fallback to BF16 attention, and attribution
-alone cannot distinguish a running kernel from a numerically broken one.
+``CUSTOM`` resolves through the ``vllm.general_plugins`` entry point declared
+in ``pyproject.toml``. The test must not register the backend itself, or that
+declaration would stop being covered.
 
 The test is skipped unless ``NVFP4_RUN_VLLM_E2E=1``, and it needs the
 ``datasets`` package and access to ``openai/gsm8k``.
@@ -23,8 +25,7 @@ from __future__ import annotations
 import gc
 import os
 import re
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 import pytest
 
@@ -34,55 +35,31 @@ MODEL = os.environ.get(
     "NVFP4_TEST_MODEL",
     "NousResearch/Meta-Llama-3.1-8B-Instruct",
 )
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-VLLM_ROOT = REPOSITORY_ROOT / "third_party" / "vllm"
 
 PAGE_SIZE = 128
 
 BF16_ATTENTION_CONFIG = {"backend": "FLASH_ATTN"}
-NVFP4_ATTENTION_CONFIG = {
-    "backend": "FLASH_ATTN",
-    "nvfp4_kv_mode": "tagged",
-}
+CUSTOM_ATTENTION_CONFIG = {"backend": "CUSTOM"}
 
 GSM8K_NUM_EXAMPLES = int(os.environ.get("NVFP4_GSM8K_N", "32"))
 GSM8K_NUM_FEWSHOT = 5
 GSM8K_MAX_NEW_TOKENS = 256
 GSM8K_MAX_MODEL_LEN = 4096
-GSM8K_MAX_NUM_SEQS = int(os.environ.get("NVFP4_GSM8K_MAX_NUM_SEQS", "1"))
-# Wide enough that every prompt prefills in one execution. Unaligned chunked
-# prefill is a separate contract and is deliberately not exercised here.
+# FlashAttention is not batch invariant, so both arms have to decode at the
+# same batch width to be comparable.
+GSM8K_MAX_NUM_SEQS = int(os.environ.get("NVFP4_GSM8K_MAX_NUM_SEQS", "8"))
+# Wide enough that every prompt prefills in one execution.
 GSM8K_MAX_NUM_BATCHED_TOKENS = 16384
 
-# Llama-3.1-8B-Instruct scores about 0.78 on this harness with a BF16 cache and
-# about 0.75 with an NVFP4 cache, and greedy GSM8K shifts by up to two samples
-# at N=32. A 0.125 budget covers that band while still failing on the class of
-# integration faults that drop accuracy to 0.6 or below.
-GSM8K_MAX_ACCURACY_DROP = 0.125
+# Llama-3.1-8B-Instruct scores about 0.78 here; the floor leaves room for the
+# few-sample noise of greedy GSM8K at N=32.
 GSM8K_MIN_ACCURACY = 0.60
-
-# Reading a device tensor synchronizes, so only the first few decode calls are
-# inspected; later calls only advance the counter.
-DECODE_CALLS_INSPECTED = 8
 
 
 @dataclass(frozen=True)
-class DecodeCall:
-    """One observed call into the standalone decode kernel."""
-
-    rows: int
-    max_seqused_fp4: int
-    max_seqused_residual: int
-
-
-@dataclass
-class DecodeSpy:
-    calls: int = 0
-    inspected: list[DecodeCall] = field(default_factory=list)
-
-    @property
-    def saw_fp4_prefix(self) -> bool:
-        return any(call.max_seqused_fp4 > 0 for call in self.inspected)
+class Completion:
+    token_ids: tuple[int, ...]
+    text: str
 
 
 @dataclass(frozen=True)
@@ -102,29 +79,6 @@ class Score:
         )
 
 
-def _require_vllm_fork() -> None:
-    if not (VLLM_ROOT / "vllm" / "__init__.py").is_file():
-        pytest.fail(
-            "the vLLM submodule is not initialized; run "
-            "`git submodule update --init third_party/vllm`"
-        )
-
-    try:
-        import vllm
-    except ImportError:
-        pytest.fail(
-            "the vendored vLLM fork is not installed; install "
-            "`third_party/vllm` in the test environment"
-        )
-
-    source = Path(vllm.__file__).resolve()
-    if not source.is_relative_to(VLLM_ROOT):
-        pytest.fail(
-            "tests must import the vendored vLLM fork, but imported "
-            f"{source}"
-        )
-
-
 def _require_sm100() -> None:
     import torch
 
@@ -135,41 +89,7 @@ def _require_sm100() -> None:
         pytest.skip(f"SM100 is required, found compute capability {capability}")
 
 
-def _spy_on_fp4_decode(monkeypatch) -> DecodeSpy:
-    """Record every decode call the engine makes.
-
-    ``interface.fp4_decode`` resolves its implementation on each call, so
-    patching the implementation also catches callers that bound the public
-    ``fp4_decode`` name at import time.
-    """
-    from nvfp4_decode_kernel import _kernel
-
-    spy = DecodeSpy()
-    original = _kernel.fp4_decode_impl
-
-    def traced(**kwargs):
-        if spy.calls < DECODE_CALLS_INSPECTED:
-            seqused_fp4 = kwargs["seqused_fp4"]
-            seqused_residual = kwargs.get("seqused_residual")
-            spy.inspected.append(
-                DecodeCall(
-                    rows=seqused_fp4.numel(),
-                    max_seqused_fp4=int(seqused_fp4.max()),
-                    max_seqused_residual=(
-                        0
-                        if seqused_residual is None
-                        else int(seqused_residual.max())
-                    ),
-                )
-            )
-        spy.calls += 1
-        return original(**kwargs)
-
-    monkeypatch.setattr(_kernel, "fp4_decode_impl", traced)
-    return spy
-
-
-def _run_gsm8k(attention_config: dict, prompts: list[str]) -> list[str]:
+def _run_gsm8k(attention_config: dict, prompts: list[str]) -> list[Completion]:
     import torch
     from vllm import LLM, SamplingParams
 
@@ -183,9 +103,8 @@ def _run_gsm8k(attention_config: dict, prompts: list[str]) -> list[str]:
         gpu_memory_utilization=0.9,
         enforce_eager=True,
         block_size=PAGE_SIZE,
-        # Few-shot prompts share a prefix. Prefix caching would skip prefill
-        # for the shared tokens, so the FP4 write path would only ever see the
-        # per-example delta.
+        # The few-shot prompts share a prefix, and caching it would leave the
+        # write path seeing only the per-example delta.
         enable_prefix_caching=False,
         attention_config=attention_config,
     )
@@ -199,10 +118,17 @@ def _run_gsm8k(attention_config: dict, prompts: list[str]) -> list[str]:
             ),
             use_tqdm=False,
         )
-        return [output.outputs[0].text for output in outputs]
+        return [
+            Completion(
+                token_ids=tuple(output.outputs[0].token_ids),
+                text=output.outputs[0].text,
+            )
+            for output in outputs
+        ]
     finally:
-        # Both backends run back to back in one process, so this engine must
-        # release its KV cache before the next one is built.
+        # The next engine sizes its cache from free memory. Startup allocations
+        # are behind a gc.freeze(); only shutdown() unfreezes them.
+        llm.llm_engine.engine_core.shutdown()
         del llm
         gc.collect()
         torch.cuda.empty_cache()
@@ -260,13 +186,13 @@ def _same_number(reference: str, prediction: str) -> bool:
         return reference == prediction
 
 
-def _score(references: list[str], completions: list[str]) -> Score:
+def _score(references: list[str], completions: list[Completion]) -> Score:
     assert len(references) == len(completions)
 
     correct = 0
     mismatches = []
     for reference, completion in zip(references, completions):
-        prediction = _predicted_answer(completion)
+        prediction = _predicted_answer(completion.text)
         if _same_number(reference, prediction):
             correct += 1
         else:
@@ -288,49 +214,65 @@ def _mismatch_report(score: Score, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _divergence_report(
+    index: int, baseline: Completion, candidate: Completion
+) -> str:
+    """Report a window around where two completions first differ."""
+    position = next(
+        (
+            i
+            for i, (left, right) in enumerate(
+                zip(baseline.token_ids, candidate.token_ids)
+            )
+            if left != right
+        ),
+        min(len(baseline.token_ids), len(candidate.token_ids)),
+    )
+    start = max(0, position - 8)
+    stop = position + 8
+    return (
+        f"request {index}: first difference at token {position} of "
+        f"{len(baseline.token_ids)}/{len(candidate.token_ids)}\n"
+        f"  FLASH_ATTN[{start}:{stop}] = "
+        f"{list(baseline.token_ids[start:stop])}\n"
+        f"  CUSTOM    [{start}:{stop}] = "
+        f"{list(candidate.token_ids[start:stop])}"
+    )
+
+
 @pytest.mark.skipif(
     not RUN_E2E,
     reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
 )
-def test_gsm8k_subset_accuracy_tracks_bf16(monkeypatch):
+def test_custom_backend_matches_flash_attn(monkeypatch):
     _require_sm100()
+    # In-process engine core, so the first arm's teardown is deterministic.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _require_vllm_fork()
 
     references, prompts = _load_gsm8k(GSM8K_NUM_EXAMPLES)
-    spy = _spy_on_fp4_decode(monkeypatch)
 
-    bf16 = _score(references, _run_gsm8k(BF16_ATTENTION_CONFIG, prompts))
-    assert spy.calls == 0, (
-        f"the BF16 baseline reached the decode kernel {spy.calls} times; it "
-        "must not share the FP4 path"
-    )
+    baseline = _run_gsm8k(BF16_ATTENTION_CONFIG, prompts)
+    candidate = _run_gsm8k(CUSTOM_ATTENTION_CONFIG, prompts)
+
+    bf16 = _score(references, baseline)
+    custom = _score(references, candidate)
+    print(f"GSM8K {bf16.summary('FLASH_ATTN')} | {custom.summary('CUSTOM')}")
+
     assert bf16.accuracy >= GSM8K_MIN_ACCURACY, (
         "the BF16 baseline is too weak to gate against: "
-        f"{bf16.summary('BF16')}. Check the model and the GSM8K split.\n"
+        f"{bf16.summary('FLASH_ATTN')}. Check the model and the GSM8K split.\n"
         f"{_mismatch_report(bf16)}"
     )
 
-    nvfp4 = _score(references, _run_gsm8k(NVFP4_ATTENTION_CONFIG, prompts))
-    print(f"GSM8K {bf16.summary('BF16')} | {nvfp4.summary('NVFP4')}")
-
-    assert spy.calls > 0, (
-        "the NVFP4 configuration never reached the standalone decode kernel, "
-        "so the accuracy above only measures a fallback path"
-    )
-    assert spy.saw_fp4_prefix, (
-        "every inspected decode call had an empty FP4 prefix, so the run only "
-        "exercised the BF16 residual path"
-    )
-    assert nvfp4.accuracy >= GSM8K_MIN_ACCURACY, (
-        f"{nvfp4.summary('NVFP4')} is below the "
-        f"{GSM8K_MIN_ACCURACY:.2f} floor.\n{_mismatch_report(nvfp4)}"
-    )
-
-    drop = bf16.accuracy - nvfp4.accuracy
-    assert drop <= GSM8K_MAX_ACCURACY_DROP, (
-        f"NVFP4 lost {drop * 100:.2f} pp against BF16 "
-        f"({bf16.summary('BF16')}, {nvfp4.summary('NVFP4')}), more than the "
-        f"{GSM8K_MAX_ACCURACY_DROP * 100:.2f} pp budget.\n"
-        f"{_mismatch_report(nvfp4)}"
+    divergences = [
+        _divergence_report(index, left, right)
+        for index, (left, right) in enumerate(zip(baseline, candidate))
+        if left.token_ids != right.token_ids
+    ]
+    assert not divergences, (
+        f"{len(divergences)} of {len(baseline)} requests decoded differently "
+        "under the CUSTOM backend, which means it is not a pass-through or "
+        "the two engines were scheduled differently.\n"
+        f"{bf16.summary('FLASH_ATTN')} | {custom.summary('CUSTOM')}\n"
+        + "\n".join(divergences[:3])
     )

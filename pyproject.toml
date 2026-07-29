@@ -9,17 +9,22 @@ description = "NVFP4 paged-decode kernel interface"
 requires-python = ">=3.10"
 dependencies = [
     "torch",
-    "nvidia-cutlass-dsl==4.4.0.dev0",
+    "nvidia-cutlass-dsl==4.6.0",
     "cuda-python",
     "typing_extensions",
-    "apache-tvm-ffi==0.1.6",
+    "apache-tvm-ffi==0.1.10",
     "torch-c-dlpack-ext",
 ]
+
+# Points `backend: CUSTOM` at NVFP4Backend in every vLLM process.
+[project.entry-points."vllm.general_plugins"]
+nvfp4_vllm = "nvfp4_vllm:register"
 
 [project.optional-dependencies]
 test = [
     "pytest",
-    "flash-attn",
+    # flash-attn-4: CuTeDSL build, install with --no-deps to avoid version conflict.
+    "flash-attn-4",
     "flashinfer-python",
     "datasets",
 ]
