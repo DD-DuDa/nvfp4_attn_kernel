@@ -4,6 +4,8 @@
 
 - D2：保持单入口 `fp4_decode`，新增可选 `query_fp4 + query_scales`；BF16 与 FP4-Q 双路径共用 core。
 - Phase 1 必须新增 FP4-Q 数值测试；不得改数值门槛。
+- 本 Phase 的 FP4-Q 新路径先假定无 residual 且 `len % 128 == 0`；达到性能目标后再补
+  FP4-Q + BF16 residual。现有 BF16-Q residual 测试仍必须保持。
 - Phase 1 失败必须整体停下等用户。
 - 所有 shell 显式设置 §6.1 PATH 和 `CUDA_VISIBLE_DEVICES=1`。
 - 禁止外部 `codex exec`/`codex review`；主审 Terra/high，另一内部模型交叉 review。

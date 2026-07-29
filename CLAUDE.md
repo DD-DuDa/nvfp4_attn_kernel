@@ -17,9 +17,13 @@ from nvfp4_decode_kernel import fp4_decode
 - NVIDIA SM100 GPUs only.
 - Decode query length is one.
 - Page size and head dimension are both fixed at 128.
-- Q is BF16 and quantized internally for each decode call.
+- Q is either BF16 and quantized internally, or pre-quantized E2M1 FP4 with
+  E4M3 scales through the same `fp4_decode` entry.
 - Full K/V pages are pre-quantized E2M1 FP4 with E4M3 scale factors.
 - An optional paged BF16 residual tail is fused into the same decode launch.
+- The pre-quantized FP4-Q path initially targets pure page-aligned FP4 K/V;
+  FP4-Q plus BF16 residual is implemented only after the performance target.
+  The BF16-Q path continues to support residual tails throughout.
 - MHA, GQA, and MQA are supported.
 - Attention is non-causal because decode only attends to the supplied cache.
 - Split-K, fused output scatter, prefill, backward, and serving-framework cache
