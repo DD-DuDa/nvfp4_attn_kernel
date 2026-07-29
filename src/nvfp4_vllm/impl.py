@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+from .guards import check_supported
 
 
 def _is_nvfp4_cache(kv_cache: torch.Tensor) -> bool:
@@ -22,6 +25,12 @@ class NVFP4Impl(FlashAttentionImpl):
     with ``kv_cache_dtype="nvfp4"`` starts and allocates but cannot produce
     meaningful output.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Ahead of super(), so an unsupported engine configuration is reported
+        # instead of whatever FlashAttention's own setup happens to fail on.
+        check_supported(get_current_vllm_config())
+        super().__init__(*args, **kwargs)
 
     def do_kv_cache_update(
         self,

@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
+import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
+from .guards import NVFP4
+
+if TYPE_CHECKING:
+    from vllm.platforms.interface import DeviceCapability
+
 
 PAGE_SIZE = 128
-NVFP4 = "nvfp4"
+HEAD_SIZE = 128
+SM100 = 10
 
 
 def _cache_dtype() -> str | None:
@@ -62,6 +69,46 @@ class NVFP4Backend(FlashAttentionBackend):
         # V is quantized along the token axis a full page at a time, so a page
         # cannot be split or partially filled.
         return [PAGE_SIZE]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        # Stricter than the inherited "multiple of 128": vLLM would otherwise
+        # accept a 256-token cache block and split it into two kernel blocks.
+        return block_size is None or block_size == PAGE_SIZE
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major == SM100
+
+    @classmethod
+    def supports_kv_connector(cls) -> bool:
+        # A connector moves pages by address and size, which does not describe
+        # the packed FP4 layout.
+        return False
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: str | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        # Only meaningful for the FP4 path; with any other cache dtype this
+        # backend is a FlashAttention pass-through. Both head_size and
+        # kv_cache_dtype are part of the selector's cache key, so a verdict
+        # conditioned on them cannot be reused for a different combination.
+        if kv_cache_dtype == NVFP4 and head_size != HEAD_SIZE:
+            return (
+                f"NVFP4 decode is compiled for head_size {HEAD_SIZE}, "
+                f"got {head_size}"
+            )
+        return None
 
     @staticmethod
     def get_kv_cache_shape(
