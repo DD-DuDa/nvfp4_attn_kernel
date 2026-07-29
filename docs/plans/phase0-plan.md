@@ -95,6 +95,9 @@
 ## Implementation Notes
 
 - 每次执行命令都必须在该 shell 顶部写出 §6.1 两行环境设置。
+- 禁止调用外部 `codex exec` / `codex review`；每轮独立 review 必须新 launch
+  内部 sub-agent，并把结果写入对应 `round-*-review-result.md`。其余 RLCR 工件、
+  commit、修复和验证纪律不变。
 - 先读 trace JSON 再看 Perfetto；空 trace 必须报错。
 - 计划文件中的 AC/Milestone 术语不得进入产品代码注释。
 - §12 的 D0–D8 是不可变约束；任何需要改变它们的情况必须停止并等待用户。

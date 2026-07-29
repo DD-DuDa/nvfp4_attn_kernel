@@ -70,6 +70,11 @@ a batch containing other rows with nonzero residual lengths.
    behavior—not development history.
 9. Validate changes on an SM100 GPU. Import or syntax checks alone are not
    sufficient for CuTeDSL changes.
+10. For this repository's Humanize/RLCR workflow, do not invoke the external
+    `codex exec` or `codex review` transport. Independent implementation and
+    code reviews must be performed by a newly launched internal sub-agent,
+    with the usual plan, round contract, committed implementation, summary,
+    review-result, fix, and verification artifacts preserved.
 
 ## Verification
 
