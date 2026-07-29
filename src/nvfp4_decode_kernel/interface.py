@@ -29,6 +29,7 @@ def fp4_decode(
     query_row_indices: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
+    trusted_metadata: bool = False,
 ) -> torch.Tensor:
     """Run paged NVFP4 decode attention.
 
@@ -111,4 +112,5 @@ def fp4_decode(
         query_row_indices=query_row_indices,
         out=out,
         out_indices=out_indices,
+        trusted_metadata=trusted_metadata,
     )

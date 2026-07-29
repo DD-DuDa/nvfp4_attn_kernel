@@ -352,6 +352,7 @@ def decode_fp4(
     softmax_scale: float,
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
+    trusted_metadata: bool = False,
 ) -> torch.Tensor:
     """Validate, compile/cache, and launch FP4 paged decode on SM100."""
     if not torch.cuda.is_available():
@@ -478,13 +479,14 @@ def decode_fp4(
     # The tagged-metadata producer owns consumed-prefix ID validation. Do not
     # scan unused columns here: persistent vLLM scratch may retain poison or
     # stale IDs beyond the prefix selected by seqused_fp4.
-    _check_device_values(
-        (seqused_fp4 < 0)
-        | (seqused_fp4 > max_fp4_tokens)
-        | (seqused_fp4 % PAGE_SIZE != 0),
-        "seqused_fp4 values must be page-aligned and in "
-        f"[0, {max_fp4_tokens}]",
-    )
+    if not trusted_metadata:
+        _check_device_values(
+            (seqused_fp4 < 0)
+            | (seqused_fp4 > max_fp4_tokens)
+            | (seqused_fp4 % PAGE_SIZE != 0),
+            "seqused_fp4 values must be page-aligned and in "
+            f"[0, {max_fp4_tokens}]",
+        )
 
     residual_values = (
         residual_key_pages_bf16,
@@ -576,16 +578,17 @@ def decode_fp4(
             raise ValueError(
                 "seqused_residual must be contiguous INT32 with shape [rows]"
             )
-        _check_device_values(
-            (residual_page_ids < 0)
-            | (residual_page_ids >= residual_pages),
-            "residual_page_ids contains an out-of-range physical page ID",
-        )
-        _check_device_values(
-            (seqused_residual < 0)
-            | (seqused_residual > PAGE_SIZE),
-            "seqused_residual values must be in [0, 128]",
-        )
+        if not trusted_metadata:
+            _check_device_values(
+                (residual_page_ids < 0)
+                | (residual_page_ids >= residual_pages),
+                "residual_page_ids contains an out-of-range physical page ID",
+            )
+            _check_device_values(
+                (seqused_residual < 0)
+                | (seqused_residual > PAGE_SIZE),
+                "seqused_residual values must be in [0, 128]",
+            )
         if has_bf16 is not None:
             _require_cuda_tensor(has_bf16, "has_bf16", device=device)
             if (
@@ -596,10 +599,11 @@ def decode_fp4(
                 raise ValueError(
                     "has_bf16 must be contiguous BOOL with shape [rows]"
                 )
-            _check_device_values(
-                has_bf16 != (seqused_residual > 0),
-                "has_bf16 must agree with seqused_residual > 0",
-            )
+            if not trusted_metadata:
+                _check_device_values(
+                    has_bf16 != (seqused_residual > 0),
+                    "has_bf16 must agree with seqused_residual > 0",
+                )
     elif has_bf16 is not None:
         raise ValueError(
             "has_bf16 requires the BF16 residual cache arguments"
@@ -630,10 +634,11 @@ def decode_fp4(
             raise ValueError(
                 "out_indices must be contiguous INT32 with shape [rows]"
             )
-        _check_device_values(
-            (out_indices < 0) | (out_indices >= out.shape[0]),
-            "out_indices contains an out-of-range output row",
-        )
+        if not trusted_metadata:
+            _check_device_values(
+                (out_indices < 0) | (out_indices >= out.shape[0]),
+                "out_indices contains an out-of-range output row",
+            )
         output_4d = out.unsqueeze(1)
     else:
         output_4d = torch.empty(

@@ -884,3 +884,51 @@ def test_prequantized_query_contract_rejects_bad_tensor_metadata(
             query_fp4=query_fp4[:, :, :31],
             query_scales=query_scales,
         )
+
+
+def test_trusted_metadata_matches_checked_path_exactly(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    compact_query = inputs.query.index_select(
+        0, inputs.query_row_indices.long()
+    )
+    query_fp4, query_scales = _quantize.quantize_query(
+        compact_query, heads_kv=8
+    )
+    kwargs = {
+        "key_pages_fp4": inputs.key_pages_fp4,
+        "key_scales": inputs.key_scales,
+        "value_pages_fp4": inputs.value_pages_fp4,
+        "value_scales": inputs.value_scales,
+        "fp4_page_table": inputs.page_table,
+        "seqused_fp4": inputs.seqused_fp4,
+        "query_fp4": query_fp4,
+        "query_scales": query_scales,
+    }
+    with torch.no_grad():
+        checked = fp4_decode(**kwargs)
+        trusted = fp4_decode(**kwargs, trusted_metadata=True)
+    torch.cuda.synchronize()
+    assert torch.equal(trusted, checked)
+
+
+def test_trusted_metadata_keeps_host_shape_checks(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    query_fp4, query_scales = _quantize.quantize_query(
+        inputs.query[:3], heads_kv=8
+    )
+    with pytest.raises(ValueError, match="shape"):
+        fp4_decode(
+            key_pages_fp4=inputs.key_pages_fp4,
+            key_scales=inputs.key_scales,
+            value_pages_fp4=inputs.value_pages_fp4,
+            value_scales=inputs.value_scales,
+            fp4_page_table=inputs.page_table,
+            seqused_fp4=inputs.seqused_fp4[:2],
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            trusted_metadata=True,
+        )

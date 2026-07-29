@@ -25,6 +25,7 @@ def fp4_decode_impl(
     query_row_indices: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
+    trusted_metadata: bool = False,
 ) -> torch.Tensor:
     """Prepare either query contract and run the shared decode core."""
     from ._decode import decode_fp4
@@ -99,4 +100,5 @@ def fp4_decode_impl(
         softmax_scale=softmax_scale,
         out=out,
         out_indices=out_indices,
+        trusted_metadata=trusted_metadata,
     )
