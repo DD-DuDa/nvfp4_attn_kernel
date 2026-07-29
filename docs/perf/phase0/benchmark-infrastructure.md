@@ -35,11 +35,8 @@ All are below the 3% stability threshold.
 
 ## Coverage and long-case capacity smoke
 
-- `phase0a_coverage_smoke.json` (preserved outside the repository during development) exercised batches 1/2 at seqlen 1024 for MHA, GQA, and MQA with no skipped cases.
+- `full-grid-smoke.json` contains all 96 required `(batch, seqlen, head-config)` cases and 384 variant/status rows; `phase0_required_grid_complete=true`, with zero missing or skipped cases. It is a one-iteration functional/timing smoke, not the final Phase 5 gate.
 - Large setup quantization is chunked by pages outside measured decode calls. This avoids a CuTe launch-size failure while preserving the quantizer's native packed/scale layouts.
-- `batch=128, seqlen=65536, MHA-8` ran all four result entries (including the explicit unavailable FP4-Q row) with **48.000 GiB peak allocated memory**, below the 178.35 GiB device capacity. FA4 split=1, FA4 heuristic and FP4 BF16-Q all completed; no max-token skip occurred.
+- The full-grid artifact includes `batch=128, seqlen=65536` for MHA/GQA/MQA. The conservative whole-case peak is **48.077 GiB**, below the 178.35 GiB device capacity. FA4 split=1, FA4 heuristic and FP4 BF16-Q completed; FP4-Q is explicitly unavailable; no max-token skip occurred.
 
-The full grid is intentionally deferred to Phase 5 for the final gate and to
-Phase-level checkpoints after Phase 1 makes the FP4-Q path available. Phase 0a
-establishes that the declared grid is representable, long cases are no longer
-silently skipped, and all required aggregation/provenance fields exist.
+Phase 0 archives the complete BF16-Q/FA4 grid as a functional smoke. Phase 5 will rerun the same complete grid with production iteration counts on the Phase 1 FP4-Q path for the final D3 gate.

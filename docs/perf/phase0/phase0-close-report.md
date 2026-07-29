@@ -12,16 +12,18 @@ Phase 0 established reliable IKET and clean benchmark infrastructure without cha
 ## IKET decision
 
 - GO: real decode trace, three launches, zero malformed ranges.
-- Launch-tail role: softmax0 for all three baseline launches.
+- Launch-tail envelope owner: softmax0 for all three baseline launches. This
+  is descriptive timing evidence, not a causal dependency proof.
 - Structural stall: MMA is strongly producer-starved on P/O-ready dependency; complete zero-overlap serialization is not claimed.
 - Baseline grid: 16 CTAs across 16 SMs, one CTA/SM.
 
 ## Benchmark evidence
 
-- Default grid contains all required batches and seqlens and MHA/GQA/MQA configurations.
+- `full-grid-smoke.json` contains all 96 required batch/seqlen/head-config cases (384 variant/status rows), with zero missing or skipped cases.
 - D0 selects the faster of FA4 split=1 and FA4 heuristic, preserving varlen pack-GQA.
 - D4 records BF16-Q and explicit FP4-Q unavailable-until-Phase-1 status.
-- Long case batch=128, seqlen=65536 completes with 48.000 GiB peak allocation; no artificial max-token skip.
+- Long case batch=128, seqlen=65536 completes with 48.077 GiB conservative
+  whole-case peak allocation; no artificial max-token skip.
 - Kernel breakdown is non-empty; Q quantization is 0.00611 ms (11.15% of diagnostic profiler GPU time).
 - Provenance records environment, versions, GPU, commit, arguments, timestamp and baseline definition.
 

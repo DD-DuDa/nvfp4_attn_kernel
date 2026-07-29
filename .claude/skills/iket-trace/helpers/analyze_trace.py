@@ -104,7 +104,14 @@ class LaunchReport:
         acc: dict[tuple[str, str], list[int]] = defaultdict(list)
         for rng in self.launch.get("ranges", []):
             locs = rng.get("warpLocIdxs") or []
-            if not locs:
+            if (
+                not locs
+                or any(
+                    not isinstance(idx, int) or idx < 0 or idx >= len(self.loc)
+                    for idx in locs
+                )
+                or len(set(locs)) != 1
+            ):
                 continue
             name = self.strings[rng["rangeNameIdx"]]
             acc[(self.role_of(locs[0]), name)].append(rng["endTs"] - rng["startTs"])
@@ -120,9 +127,15 @@ class LaunchReport:
         bad = 0
         for rng in self.launch.get("ranges", []):
             locs = rng.get("warpLocIdxs") or []
-            if rng["endTs"] < rng["startTs"]:
-                bad += 1
-            elif len(locs) >= 2 and locs[0] != locs[1]:
+            if (
+                rng["endTs"] < rng["startTs"]
+                or not locs
+                or any(
+                    not isinstance(idx, int) or idx < 0 or idx >= len(self.loc)
+                    for idx in locs
+                )
+                or len(set(locs)) != 1
+            ):
                 bad += 1
         return bad
 

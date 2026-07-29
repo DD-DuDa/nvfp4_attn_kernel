@@ -412,7 +412,7 @@ def run_case(
                     "kernels": {},
                     "query_quantization_ms": None,
                     "query_quantization_fraction": None,
-                    "peak_memory_bytes": None,
+                    "case_peak_memory_bytes": None,
                 }
             )
             continue
@@ -459,13 +459,13 @@ def run_case(
                     if kernels and sum(kernels.values()) > 0
                     else None
                 ),
-                "peak_memory_bytes": None,
+                "case_peak_memory_bytes": None,
             }
         )
 
     peak_memory = torch.cuda.max_memory_allocated(device)
     for row in rows:
-        row["peak_memory_bytes"] = peak_memory
+        row["case_peak_memory_bytes"] = peak_memory
     del inputs, reference
     gc.collect()
     torch.cuda.empty_cache()
@@ -522,15 +522,38 @@ def summarize(rows: list[dict]) -> dict:
     per_path: dict[str, dict] = {}
     for fp4_name in ("fp4_pure_bf16q", "fp4_pure_fp4q"):
         path_rows = [row for row in ratios if row["fp4_variant"] == fp4_name]
-        per_seqlen = {}
-        for seqlen in DEFAULT_SEQLENS:
-            values = [
-                row["ratio_vs_fa4_better"]
+        by_head_config: dict[str, dict] = {}
+        for heads_q, heads_kv in sorted(
+            {(row["heads_q"], row["heads_kv"]) for row in path_rows}
+        ):
+            config_rows = [
+                row
                 for row in path_rows
-                if row["seqlen"] == seqlen
+                if row["heads_q"] == heads_q and row["heads_kv"] == heads_kv
             ]
-            if values:
-                per_seqlen[str(seqlen)] = _gmean(values)
+            per_seqlen = {}
+            for seqlen in DEFAULT_SEQLENS:
+                batch_values = [
+                    row["ratio_vs_fa4_better"]
+                    for row in config_rows
+                    if row["seqlen"] == seqlen
+                ]
+                if batch_values:
+                    per_seqlen[str(seqlen)] = _gmean(batch_values)
+            config_values = [
+                row["ratio_vs_fa4_better"] for row in config_rows
+            ]
+            by_head_config[f"{heads_q}:{heads_kv}"] = {
+                "heads_q": heads_q,
+                "heads_kv": heads_kv,
+                "attention_type": config_rows[0]["attention_type"],
+                "per_seqlen_batch_geomean": per_seqlen,
+                "diagnostic_overall_geomean": _gmean(config_values),
+                "worst_point": max(
+                    config_rows,
+                    key=lambda row: row["ratio_vs_fa4_better"],
+                ),
+            }
         values = [row["ratio_vs_fa4_better"] for row in path_rows]
         per_path[fp4_name] = {
             "implemented": any(
@@ -538,8 +561,10 @@ def summarize(rows: list[dict]) -> dict:
                 for row in rows
             ),
             "timed": bool(values),
-            "per_seqlen_geomean": per_seqlen,
-            "overall_geomean": _gmean(values) if values else None,
+            "by_head_config": by_head_config,
+            "diagnostic_cross_head_geomean": (
+                _gmean(values) if values else None
+            ),
             "worst_point": (
                 max(path_rows, key=lambda row: row["ratio_vs_fa4_better"])
                 if values
@@ -547,6 +572,45 @@ def summarize(rows: list[dict]) -> dict:
             ),
         }
     return {"ratios": ratios, "paths": per_path}
+
+
+def coverage_report(
+    rows: list[dict],
+    args: argparse.Namespace,
+    head_configs: list[tuple[int, int]],
+) -> dict:
+    observed = {
+        (
+            row["batch"],
+            row["seqlen"],
+            row["heads_q"],
+            row["heads_kv"],
+        )
+        for row in rows
+    }
+    requested = {
+        (batch, seqlen, heads_q, heads_kv)
+        for heads_q, heads_kv in head_configs
+        for batch in args.batches
+        for seqlen in args.seqlens
+        if batch * seqlen <= args.max_kv_tokens
+    }
+    phase0_required = {
+        (batch, seqlen, heads_q, heads_kv)
+        for heads_q, heads_kv in DEFAULT_HEAD_CONFIGS
+        for batch in DEFAULT_BATCHES
+        for seqlen in DEFAULT_SEQLENS
+    }
+    return {
+        "requested_complete": requested <= observed,
+        "requested_missing": [
+            list(item) for item in sorted(requested - observed)
+        ],
+        "phase0_required_grid_complete": phase0_required <= observed,
+        "phase0_required_grid_missing": [
+            list(item) for item in sorted(phase0_required - observed)
+        ],
+    }
 
 
 def format_table(rows: list[dict]) -> str:
@@ -737,6 +801,11 @@ def main() -> None:
         action="store_true",
         help="clear in-process FP4 caches before each case (required for IKET)",
     )
+    parser.add_argument(
+        "--require-phase0-grid",
+        action="store_true",
+        help="exit nonzero unless the complete Phase 0 MHA/GQA/MQA grid ran",
+    )
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
     if args.structural_only and args.breakdown:
@@ -796,6 +865,7 @@ def main() -> None:
     print()
     print(json.dumps(summary["paths"], indent=2))
 
+    coverage = coverage_report(rows, args, head_configs)
     result = {
         "schema_version": SCHEMA_VERSION,
         "provenance": provenance(args, device),
@@ -804,6 +874,7 @@ def main() -> None:
             "requested_seqlens": list(args.seqlens),
             "requested_head_configs": [list(config) for config in head_configs],
             "skipped": skipped,
+            **coverage,
         },
         "results": rows,
         "summary": summary,
@@ -812,6 +883,11 @@ def main() -> None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(result, indent=2) + "\n")
         print(f"\nwrote {args.json}")
+    if args.require_phase0_grid and not coverage["phase0_required_grid_complete"]:
+        raise SystemExit(
+            "Phase 0 required grid is incomplete: "
+            f"{len(coverage['phase0_required_grid_missing'])} cases missing"
+        )
 
 
 if __name__ == "__main__":

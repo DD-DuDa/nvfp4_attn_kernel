@@ -21,12 +21,15 @@ Exact commands are recorded below; both shells began with the mandated PATH and
    passes and emitted a 4.2 MiB non-empty JSON trace. `analyze_trace.py` reported
    `malformed_ranges = 0` for all three launches.
 
+The historical trace was generated at implementation revision `6bef371`.
+
 Attempt 1:
 
 ```bash
-run-iket -o /tmp/iket_fp4_round1_<timestamp> --clobber --log-level debug \
+V=/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4
+"$V/bin/run-iket" -o /tmp/iket_fp4_round1_1785332389 --clobber --log-level debug \
   profile --postprocess all -- \
-  python tests/kernel_profile/bench_decode.py --device 0 \
+  "$V/bin/python" tests/kernel_profile/bench_decode.py --device 0 \
   --batches 1 --seqlens 1024 --heads-q 32 --heads-kv 8 \
   --iters 1 --warmup 0 --variants fp4_pure \
   --clear-fp4-compile-cache
@@ -38,9 +41,10 @@ activities, then zero-derived bandwidth.
 Attempt 2:
 
 ```bash
-run-iket -o /tmp/iket_fp4_round1b_<timestamp> --clobber --log-level debug \
+V=/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4
+"$V/bin/run-iket" -o /tmp/iket_fp4_round1b_1785332527 --clobber --log-level debug \
   profile --postprocess all -- \
-  python tests/kernel_profile/bench_decode.py --device 0 \
+  "$V/bin/python" tests/kernel_profile/bench_decode.py --device 0 \
   --batches 1 --seqlens 1024 --heads-q 32 --heads-kv 8 \
   --iters 1 --warmup 0 --variants fp4_pure \
   --clear-fp4-compile-cache --event-timing
@@ -49,6 +53,11 @@ run-iket -o /tmp/iket_fp4_round1b_<timestamp> --clobber --log-level debug \
 Result: exit 0; `iket-baseline-b1-s1024.trace.json` is 4,339,958 bytes and
 contains three launches. The cache-clear flag was active in both passes, and the
 tracker output identified/patched the real decode kernel.
+
+The benchmark CLI evolved after this trace was captured. The current equivalent
+structural collection uses `--variants fp4_pure_bf16q --structural-only`;
+the historical `--variants fp4_pure --event-timing` spelling above is retained
+only to reproduce revision `6bef371`.
 
 The topology warnings (`gpcId`/`tpcId` unavailable) match the documented non-fatal IKET
 failure mode; `smId`, CTA ids, warp ids, and role analysis are present.
