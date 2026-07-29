@@ -838,5 +838,12 @@
         }
       }
     }
+  },
+  "artifact_metadata": {
+    "historical": true,
+    "generating_revision": "adf98adf37d3e966391f73ce20231af8350a233a",
+    "dirty_at_generation": true,
+    "reviewed_implementation_commit": "4c31c11e0ea0634ab28be4e6229b41e0c51e1eee",
+    "scope": "clean CUDA-event short-case measurement generated from the pre-commit implementation working tree; not Phase 5 final gate"
   }
 }
