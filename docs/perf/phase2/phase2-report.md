@@ -69,3 +69,25 @@ is not inferred from this trace.
 - `test-results-clean.txt` records 56 passing tests at the same clean revision.
 - MHA regression is **not waived**. Per §6.6 item 4, it is recorded as a failed/negative branch and Phase 2 retains the grouped-query gains while later phases must check full-table non-regression. The Phase 2 acceptance wording is narrowed to the intended GQA/MQA mechanism; Phase 5 remains the only final gate.
 - IKET is explicitly a single-case high-batch diagnosis/hypothesis; no DRAM conclusion is claimed. The exact D0 source is each row's `fa4_bf16`/`fa4_split` entries in `after-clean.json`.
+
+## §6.6 item 4 failure record
+
+Phase-level broad non-regression was not achieved. The failed clean comparison
+set is the high-batch MHA `8:8` subset against the clean Phase 1 padded-Q
+artifact:
+
+- geomean speedup: **0.911x** (regression)
+- point range: 0.692–1.148x
+- worst: batch 128 / seqlen 1024, 0.182790 ms padded vs 0.264123 ms unpadded
+
+This gate is **not waived or redefined**. The last green implementation is
+retained because independent grouped-query branches improve (GQA 1.432x, MQA
+2.844x geomean). Owner/follow-up: every later Phase and the Phase 5 full-table
+gate must retain and report the MHA regression; Phase 2b specifically must
+check whether its intra-CTA changes recover MHA without losing GQA/MQA. Low
+batch and BF16-Q clean before/after evidence was not used to claim a Phase 2
+pass; it remains part of later full-table regression checks. IKET is one-case
+structural hypothesis only, with ncu required for byte quantities.
+
+Final green lineage: implementation `f24cfe0`, clean evidence/tests `763d452`,
+evidence close `b29f11d`. `test-results-clean.txt` records 56 passed.
