@@ -66,37 +66,45 @@ def _markers(cls) -> dict:
 # omission, which is what the field-set assertion below forces.
 NOT_SPLICED = {"error_code"}
 
+# The other source of appended fields: the page work table, which build()
+# produces alongside the control plane's outputs.
+WORK_TABLE = ("source_tokens", "destination_pages")
+
+
+def _splice():
+    """One spliced object plus the two things it was spliced from."""
+    base = FlashAttentionMetadata(**_markers(FlashAttentionMetadata))
+    outputs = ControlOutputs(**_markers(ControlOutputs))
+    work_table = tuple(_Marker(name) for name in WORK_TABLE)
+    return NVFP4Metadata.from_flash(base, outputs, work_table), base, outputs
+
 
 def test_the_splice_keeps_every_flash_attention_field():
     # Values are markers rather than tensors because this is plumbing: a field
     # that is dropped, defaulted, or filled from the wrong source shows up as
     # an identity mismatch whatever its declared type.
-    base = FlashAttentionMetadata(**_markers(FlashAttentionMetadata))
-    spliced = NVFP4Metadata.from_flash(base, ControlOutputs(**_markers(ControlOutputs)))
+    spliced, base, _ = _splice()
     for field in fields(FlashAttentionMetadata):
         assert getattr(spliced, field.name) is getattr(base, field.name), field.name
 
 
 def test_the_splice_keeps_every_control_plane_output():
-    outputs = ControlOutputs(**_markers(ControlOutputs))
-    spliced = NVFP4Metadata.from_flash(
-        FlashAttentionMetadata(**_markers(FlashAttentionMetadata)), outputs
-    )
+    spliced, _, outputs = _splice()
     added = {field.name for field in fields(NVFP4Metadata)} - {
         field.name for field in fields(FlashAttentionMetadata)
     }
-    assert added == {field.name for field in fields(ControlOutputs)} - NOT_SPLICED
-    for name in added:
+    from_control = {field.name for field in fields(ControlOutputs)} - NOT_SPLICED
+    assert added == from_control | set(WORK_TABLE)
+    for name in from_control:
         assert getattr(spliced, name) is getattr(outputs, name), name
+    for name in WORK_TABLE:
+        assert getattr(spliced, name).name == name
 
 
 def test_the_result_is_still_flash_attention_metadata():
     # Until the decode kernel lands, every layer still runs FlashAttention and
     # reads these objects through the base class.
-    spliced = NVFP4Metadata.from_flash(
-        FlashAttentionMetadata(**_markers(FlashAttentionMetadata)),
-        ControlOutputs(**_markers(ControlOutputs)),
-    )
+    spliced, _, _ = _splice()
     assert isinstance(spliced, FlashAttentionMetadata)
 
 

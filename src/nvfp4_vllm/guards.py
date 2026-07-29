@@ -79,6 +79,16 @@ def check_supported(vllm_config: VllmConfig) -> None:
             "attends one query token per sequence."
         )
 
+    if cache_config.kv_cache_dtype_skip_layers:
+        raise UnsupportedConfigError(
+            "kv_cache_dtype_skip_layers="
+            f"{cache_config.kv_cache_dtype_skip_layers} leaves some layers on "
+            "a different cache dtype. That splits the model into KV cache "
+            "groups with their own metadata builders, so the slot table would "
+            "advance more than once per step, and it makes vLLM zero freshly "
+            "allocated blocks. Leave it empty."
+        )
+
     if cache_config.kv_offloading_size is not None:
         raise UnsupportedConfigError(
             "KV offloading is not supported by the NVFP4 KV cache: it copies "

@@ -61,9 +61,21 @@ class NVFP4Metadata(FlashAttentionMetadata):
     """``[num_slots]`` bool. The same information as ``decode_count`` in the
     shape a kernel can predicate on."""
 
+    source_tokens: torch.Tensor
+    """``[work]`` int32. First token of each full page this step must quantize,
+    as an index into the step's flattened K/V."""
+
+    destination_pages: torch.Tensor
+    """``[work]`` int32. Block each of those pages belongs in, -1 where the
+    grid slot has no work. Paired with ``source_tokens`` and shared by every
+    layer, since which pages exist does not depend on the layer."""
+
     @classmethod
     def from_flash(
-        cls, base: FlashAttentionMetadata, outputs: ControlOutputs
+        cls,
+        base: FlashAttentionMetadata,
+        outputs: ControlOutputs,
+        work_table: tuple[torch.Tensor, torch.Tensor],
     ) -> "NVFP4Metadata":
         """Carry every FlashAttention field across and append the slot fields.
 
@@ -81,4 +93,6 @@ class NVFP4Metadata(FlashAttentionMetadata):
             decode_row_indices=outputs.decode_row_indices,
             decode_count=outputs.decode_count,
             active_row_mask=outputs.active_row_mask,
+            source_tokens=work_table[0],
+            destination_pages=work_table[1],
         )

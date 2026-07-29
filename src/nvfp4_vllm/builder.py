@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from .control import ControlPlane
 from .guards import NVFP4, check_supported
 from .metadata import NVFP4Metadata
+from .write import PageWorkTable
 
 
 class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
@@ -73,6 +74,14 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
             device=device,
         )
+        # Which full pages this step writes depends only on the batch, so it is
+        # resolved here alongside the slot assignment rather than once per
+        # layer.
+        self.work_table = PageWorkTable(
+            max_num_seqs=scheduler_config.max_num_seqs,
+            max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+            device=device,
+        )
 
     def build(
         self,
@@ -100,4 +109,13 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
         )
 
-        return NVFP4Metadata.from_flash(base, outputs)
+        work_table = self.work_table.build(
+            query_start_loc=common_attn_metadata.query_start_loc,
+            seqused_fp4=outputs.seqused_fp4,
+            row_to_slot=outputs.row_to_slot,
+            block_table=common_attn_metadata.block_table_tensor,
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+        )
+
+        return NVFP4Metadata.from_flash(base, outputs, work_table)
