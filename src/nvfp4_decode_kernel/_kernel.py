@@ -6,7 +6,7 @@ import torch
 
 
 def fp4_decode_impl(
-    query: torch.Tensor,
+    query: torch.Tensor | None,
     key_pages_fp4: torch.Tensor,
     key_scales: torch.Tensor,
     value_pages_fp4: torch.Tensor,
@@ -14,6 +14,8 @@ def fp4_decode_impl(
     fp4_page_table: torch.Tensor,
     seqused_fp4: torch.Tensor,
     *,
+    query_fp4: torch.Tensor | None = None,
+    query_scales: torch.Tensor | None = None,
     residual_key_pages_bf16: torch.Tensor | None = None,
     residual_value_pages_bf16: torch.Tensor | None = None,
     residual_page_ids: torch.Tensor | None = None,
@@ -24,31 +26,59 @@ def fp4_decode_impl(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Quantize the current query and run the paged NVFP4 decode kernel."""
+    """Prepare either query contract and run the shared decode core."""
     from ._decode import decode_fp4
     from ._quantize import quantize_query
 
-    if softmax_scale is None:
-        softmax_scale = query.shape[-1] ** -0.5
+    has_bf16_query = query is not None
+    has_fp4_query = query_fp4 is not None or query_scales is not None
+    if has_bf16_query == has_fp4_query:
+        raise ValueError(
+            "supply either BF16 query or query_fp4 + query_scales"
+        )
 
-    rows = (
-        query.shape[0]
-        if query_row_indices is None
-        else query_row_indices.shape[0]
-    )
-    query_padded_bf16 = torch.zeros(
-        rows,
-        128,
-        query.shape[1],
-        query.shape[2],
-        dtype=torch.bfloat16,
-        device=query.device,
-    )
-    query_fp4, query_scales = quantize_query(
-        query,
-        row_indices=query_row_indices,
-        query_padded_out=query_padded_bf16,
-    )
+    if has_bf16_query:
+        assert query is not None
+        if query_fp4 is not None or query_scales is not None:
+            raise ValueError(
+                "BF16 query is mutually exclusive with query_fp4/query_scales"
+            )
+        if softmax_scale is None:
+            softmax_scale = query.shape[-1] ** -0.5
+        rows = (
+            query.shape[0]
+            if query_row_indices is None
+            else query_row_indices.shape[0]
+        )
+        query_padded_bf16 = (
+            torch.zeros(
+                rows,
+                128,
+                query.shape[1],
+                query.shape[2],
+                dtype=torch.bfloat16,
+                device=query.device,
+            )
+            if residual_key_pages_bf16 is not None
+            else None
+        )
+        query_fp4, query_scales = quantize_query(
+            query,
+            row_indices=query_row_indices,
+            query_padded_out=query_padded_bf16,
+        )
+    else:
+        if query_fp4 is None or query_scales is None:
+            raise ValueError(
+                "query_fp4 and query_scales must be provided together"
+            )
+        if query_row_indices is not None:
+            raise ValueError(
+                "query_row_indices applies only to the BF16 query path"
+            )
+        if softmax_scale is None:
+            softmax_scale = 128**-0.5
+        query_padded_bf16 = None
 
     return decode_fp4(
         query_fp4=query_fp4,

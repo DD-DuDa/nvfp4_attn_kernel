@@ -77,6 +77,8 @@ class Inputs:
     key_scales: torch.Tensor
     value_pages_fp4: torch.Tensor
     value_scales: torch.Tensor
+    query_fp4: torch.Tensor
+    query_scales: torch.Tensor
     seqused_fp4_full: torch.Tensor
     seqused_fp4_hybrid: torch.Tensor
     seqused_residual: torch.Tensor
@@ -123,6 +125,7 @@ def build_inputs(
     value_pages_fp4, value_scales = quantize_pages_chunked(
         v_pages, is_value=True, chunk_pages=quantize_chunk_pages
     )
+    query_fp4, query_scales = _quantize.quantize_query(query)
 
     seqused_fp4_hybrid = seqused_k - PAGE_SIZE
     seqused_residual = torch.full(
@@ -147,6 +150,8 @@ def build_inputs(
         key_scales=key_scales,
         value_pages_fp4=value_pages_fp4,
         value_scales=value_scales,
+        query_fp4=query_fp4,
+        query_scales=query_scales,
         seqused_fp4_full=seqused_k.clone(),
         seqused_fp4_hybrid=seqused_fp4_hybrid,
         seqused_residual=seqused_residual,
@@ -224,7 +229,9 @@ def make_fa4(inputs: Inputs, num_splits: int) -> Callable[[], object]:
     return run
 
 
-def make_fp4(inputs: Inputs, hybrid: bool) -> Callable[[], torch.Tensor]:
+def make_fp4(
+    inputs: Inputs, hybrid: bool, *, prequantized_query: bool
+) -> Callable[[], torch.Tensor]:
     def run_pure():
         return fp4_decode(
             query=inputs.query,
@@ -254,6 +261,25 @@ def make_fp4(inputs: Inputs, hybrid: bool) -> Callable[[], torch.Tensor]:
             softmax_scale=inputs.softmax_scale,
         )
 
+    def run_prequantized():
+        return fp4_decode(
+            key_pages_fp4=inputs.key_pages_fp4,
+            key_scales=inputs.key_scales,
+            value_pages_fp4=inputs.value_pages_fp4,
+            value_scales=inputs.value_scales,
+            fp4_page_table=inputs.page_table,
+            seqused_fp4=inputs.seqused_fp4_full,
+            query_fp4=inputs.query_fp4,
+            query_scales=inputs.query_scales,
+            softmax_scale=inputs.softmax_scale,
+        )
+
+    if prequantized_query:
+        if hybrid:
+            raise ValueError(
+                "pre-quantized query benchmark currently covers pure FP4 KV"
+            )
+        return run_prequantized
     return run_hybrid if hybrid else run_pure
 
 
@@ -357,11 +383,17 @@ def variant_factory(
         splits = fa4_auto_splits(inputs.case, device)
         return make_fa4(inputs, num_splits=splits), splits, None
     if name == "fp4_pure_bf16q":
-        return make_fp4(inputs, hybrid=False), 1, None
+        return make_fp4(
+            inputs, hybrid=False, prequantized_query=False
+        ), 1, None
     if name == "fp4_hybrid_bf16q":
-        return make_fp4(inputs, hybrid=True), 1, None
+        return make_fp4(
+            inputs, hybrid=True, prequantized_query=False
+        ), 1, None
     if name == "fp4_pure_fp4q":
-        return None, None, "unavailable_until_phase1"
+        return make_fp4(
+            inputs, hybrid=False, prequantized_query=True
+        ), 1, None
     raise KeyError(name)
 
 
@@ -723,7 +755,7 @@ def provenance(args: argparse.Namespace, device: torch.device) -> dict:
             "minimum CUDA-event gpu_ms of FA4 num_splits=1 and FA4 heuristic; "
             "both use flash_attn_varlen_func"
         ),
-        "fp4_q_gate_status": "unavailable_until_phase1",
+        "fp4_q_gate_status": "available",
     }
 
 

@@ -279,7 +279,7 @@ def _compile_decode(
     *,
     query_fp4: torch.Tensor,
     query_scales: torch.Tensor,
-    query_padded_bf16: torch.Tensor,
+    query_padded_bf16: torch.Tensor | None,
     key_pages_fp4: torch.Tensor,
     key_scales: torch.Tensor,
     value_pages_fp4: torch.Tensor,
@@ -468,7 +468,7 @@ def decode_fp4(
     *,
     query_fp4: torch.Tensor,
     query_scales: torch.Tensor,
-    query_padded_bf16: torch.Tensor,
+    query_padded_bf16: torch.Tensor | None,
     key_pages_fp4: torch.Tensor,
     key_scales: torch.Tensor,
     value_pages_fp4: torch.Tensor,
@@ -511,18 +511,6 @@ def decode_fp4(
             "query_fp4 must have shape [rows, 128, heads_q, 64]"
         )
     expected_padded_shape = (rows, PAGE_SIZE, heads_q, HEAD_DIM)
-    _require_cuda_tensor(
-        query_padded_bf16, "query_padded_bf16", device=device
-    )
-    if (
-        query_padded_bf16.dtype is not torch.bfloat16
-        or tuple(query_padded_bf16.shape) != expected_padded_shape
-        or not query_padded_bf16.is_contiguous()
-    ):
-        raise ValueError(
-            f"query_padded_bf16 must be contiguous BF16 with shape "
-            f"{expected_padded_shape}"
-        )
 
     for tensor, name in (
         (key_pages_fp4, "key_pages_fp4"),
@@ -571,6 +559,19 @@ def decode_fp4(
     if tuple(query_scales.shape) != expected_query_sf:
         raise ValueError(
             f"query_scales must have shape {expected_query_sf}"
+        )
+    expected_query_sf_strides = (
+        16,
+        4,
+        heads_q * 1024,
+        1,
+        512,
+        1024,
+        heads_q * 1024,
+    )
+    if query_scales.stride() != expected_query_sf_strides:
+        raise ValueError(
+            "query_scales must use the layout returned by quantize_query"
         )
     if tuple(key_scales.shape) != expected_page_sf:
         raise ValueError(f"key_scales must have shape {expected_page_sf}")
@@ -631,6 +632,23 @@ def decode_fp4(
             "residual_page_ids, and seqused_residual must be provided together"
         )
     if has_residual:
+        if query_padded_bf16 is None:
+            raise ValueError(
+                "pre-quantized query with a BF16 residual requires "
+                "query_padded_bf16 support; use the BF16 query path"
+            )
+        _require_cuda_tensor(
+            query_padded_bf16, "query_padded_bf16", device=device
+        )
+        if (
+            query_padded_bf16.dtype is not torch.bfloat16
+            or tuple(query_padded_bf16.shape) != expected_padded_shape
+            or not query_padded_bf16.is_contiguous()
+        ):
+            raise ValueError(
+                f"query_padded_bf16 must be contiguous BF16 with shape "
+                f"{expected_padded_shape}"
+            )
         assert residual_key_pages_bf16 is not None
         assert residual_value_pages_bf16 is not None
         assert residual_page_ids is not None

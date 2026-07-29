@@ -704,3 +704,100 @@ def test_out_indices_scatter_into_vllm_output(
     assert torch.equal(output.index_select(0, out_indices.long()), compact)
     assert torch.equal(output[1], torch.full_like(output[1], sentinel))
     assert torch.equal(output[2], torch.full_like(output[2], sentinel))
+
+
+@pytest.mark.parametrize(
+    ("heads_q", "heads_kv"),
+    [(8, 8), (32, 8), (32, 1)],
+)
+def test_prequantized_query_matches_bf16_query_exactly(
+    heads_q: int,
+    heads_kv: int,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    torch.manual_seed(0xF04 + heads_kv)
+    query = torch.randn(
+        2, heads_q, 128, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        4, 128, heads_kv, 128, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    query_fp4, query_scales = _quantize.quantize_query(query)
+    page_table = torch.tensor(
+        [[0, 1], [2, 3]], device="cuda", dtype=torch.int32
+    )
+    seqused_fp4 = torch.full(
+        (2,), 256, device="cuda", dtype=torch.int32
+    )
+
+    with torch.no_grad():
+        bf16_query_output = fp4_decode(
+            query,
+            key_pages_fp4,
+            key_scales,
+            value_pages_fp4,
+            value_scales,
+            page_table,
+            seqused_fp4,
+        )
+        fp4_query_output = fp4_decode(
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales,
+            fp4_page_table=page_table,
+            seqused_fp4=seqused_fp4,
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(fp4_query_output, bf16_query_output)
+
+
+def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    query_fp4, query_scales = _quantize.quantize_query(inputs.query[:3])
+    common = (
+        inputs.key_pages_fp4,
+        inputs.key_scales,
+        inputs.value_pages_fp4,
+        inputs.value_scales,
+        inputs.page_table,
+        inputs.seqused_fp4,
+    )
+
+    with pytest.raises(ValueError, match="either BF16 query"):
+        fp4_decode(None, *common)
+    with pytest.raises(ValueError, match="must be provided together"):
+        fp4_decode(None, *common, query_fp4=query_fp4)
+    with pytest.raises(ValueError, match="either BF16 query"):
+        fp4_decode(
+            inputs.query[:3],
+            *common,
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+        )
+    with pytest.raises(ValueError, match="applies only"):
+        fp4_decode(
+            None,
+            *common,
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            query_row_indices=inputs.query_row_indices,
+        )
+    with pytest.raises(ValueError, match="layout returned"):
+        fp4_decode(
+            None,
+            *common,
+            query_fp4=query_fp4,
+            query_scales=query_scales.contiguous(),
+        )
