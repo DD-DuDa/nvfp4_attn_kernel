@@ -62,3 +62,10 @@ is not inferred from this trace.
   redundancy to recover and some cases regress.
 - The exact static “four CTAs per KV head” estimate is not used: persistent
   launch shape caps at SM count, and work tiles are consumed dynamically.
+
+## Close-review disposition
+
+- The clean post-review artifact `after-clean.json` is generated at commit `763d452`, `dirty=false`, and covers batches `{1,4,16,64,128}`, all three target seqlens, MHA/GQA/MQA, plus BF16-Q and FP4-Q.
+- `test-results-clean.txt` records 56 passing tests at the same clean revision.
+- MHA regression is **not waived**. Per §6.6 item 4, it is recorded as a failed/negative branch and Phase 2 retains the grouped-query gains while later phases must check full-table non-regression. The Phase 2 acceptance wording is narrowed to the intended GQA/MQA mechanism; Phase 5 remains the only final gate.
+- IKET is explicitly a single-case high-batch diagnosis/hypothesis; no DRAM conclusion is claimed. The exact D0 source is each row's `fa4_bf16`/`fa4_split` entries in `after-clean.json`.
