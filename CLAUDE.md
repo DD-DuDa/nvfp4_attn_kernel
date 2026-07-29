@@ -75,6 +75,8 @@ a batch containing other rows with nonzero residual lengths.
     code reviews must be performed by a newly launched internal sub-agent,
     with the usual plan, round contract, committed implementation, summary,
     review-result, fix, and verification artifacts preserved.
+    Prefer GPT-5.6-Terra at high reasoning for the primary review and use a
+    different internal model for a cross-check.
 
 ## Verification
 
