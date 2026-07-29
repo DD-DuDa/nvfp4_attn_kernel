@@ -22,11 +22,6 @@
       "multi_processor_count": 148,
       "total_memory_bytes": 191503138816
     },
-    "git": {
-      "commit": "694a5f9c8575f9986fee45eff57004bca53ba495",
-      "branch": "perf/fp4-decode-2x",
-      "dirty": true
-    },
     "arguments": {
       "device": 0,
       "batches": [
@@ -70,7 +65,15 @@
     },
     "baseline_definition": "minimum CUDA-event gpu_ms of FA4 num_splits=1 and FA4 heuristic; both use flash_attn_varlen_func",
     "fp4_q_gate_status": "unavailable_until_phase1",
-    "evidence_scope": "full Phase 0 grid functional/timing smoke; one measured iteration per case, not final Phase 5 gate"
+    "evidence_scope": "full Phase 0 grid functional/timing smoke; one measured iteration per case, not final Phase 5 gate",
+    "generating_revision": "working tree based on 694a5f9 plus Round 3 review fixes, committed as d7aced2",
+    "reviewed_artifact_commit": "d7aced26d7dae61e1882692d4d9b47d294a32bf2",
+    "dirty_at_generation": true,
+    "git_at_generation": {
+      "commit": "694a5f9c8575f9986fee45eff57004bca53ba495",
+      "branch": "perf/fp4-decode-2x",
+      "dirty": true
+    }
   },
   "coverage": {
     "requested_batches": [
