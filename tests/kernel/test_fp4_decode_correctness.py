@@ -840,6 +840,32 @@ def test_prequantized_query_contract_rejects_bad_tensor_metadata(
             query_fp4=query_fp4,
             query_scales=query_scales[..., :2],
         )
+    with pytest.raises(ValueError, match="layout returned|E4M3 scale-factor bytes"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4,
+            query_scales=query_scales.to(torch.int16),
+        )
+    wrong_rows = query_scales.as_strided(
+        (*query_scales.shape[:-1], 2),
+        query_scales.stride(),
+    )
+    with pytest.raises(ValueError, match="shape"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4,
+            query_scales=wrong_rows,
+        )
+    wrong_heads = query_scales.as_strided(
+        (*query_scales.shape[:-2], 7, query_scales.shape[-1]),
+        query_scales.stride(),
+    )
+    with pytest.raises(ValueError, match="shape"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4,
+            query_scales=wrong_heads,
+        )
     with pytest.raises(ValueError, match="contiguous packed|heads_q"):
         fp4_decode(
             **common,
