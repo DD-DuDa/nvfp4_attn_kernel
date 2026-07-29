@@ -33,11 +33,6 @@ class SeqlenInfo:
             seqlen = seqlen_static
         return SeqlenInfo(offset, seqlen)
 
-    def offset_batch(self, tensor: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
-        """Offset a fixed-batch or varlen tensor along its batch/sequence axis."""
-        idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(tensor) - 1 - dim)
-        return tensor[idx]
-
 
 @dataclass(frozen=True)
 class SeqlenInfoQK:
