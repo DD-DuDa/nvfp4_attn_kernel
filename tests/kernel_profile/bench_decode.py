@@ -43,7 +43,7 @@ from dataclasses import dataclass
 import torch
 
 from flash_attn.cute import flash_attn_varlen_func
-from flash_attn.cute.internal.interface import num_splits_heuristic
+from flash_attn.cute.interface import num_splits_heuristic
 from nvfp4_decode_kernel import _quantize
 from nvfp4_decode_kernel import fp4_decode
 from nvfp4_decode_kernel._decode import _decode_compile_cache, _sfq_pack_cache
@@ -304,6 +304,21 @@ def measure_gpu_ms(run, iters: int, warmup: int) -> tuple[float, dict[str, float
     return sum(breakdown.values()), breakdown
 
 
+def measure_event_gpu_ms(run, iters: int, warmup: int) -> float:
+    """Clean CUDA-event timing that does not acquire CUPTI."""
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        run()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / iters
+
+
 VARIANTS = {
     "fa4_bf16": lambda inputs: make_fa4(inputs, num_splits=1),
     "fa4_bf16_split": lambda inputs: make_fa4(
@@ -321,6 +336,7 @@ def run_case(
     iters: int,
     warmup: int,
     breakdown: bool,
+    event_timing: bool,
 ) -> list[dict]:
     inputs = build_inputs(case, device)
     reference = _output(make_fa4(inputs, num_splits=1)()).reshape(
@@ -331,7 +347,11 @@ def run_case(
     for name in variants:
         run = VARIANTS[name](inputs)
         out = _output(run()).reshape(case.batch, case.heads_q, HEAD_DIM)
-        gpu_ms, kernels = measure_gpu_ms(run, iters, warmup)
+        if event_timing:
+            gpu_ms = measure_event_gpu_ms(run, iters, warmup)
+            kernels = {}
+        else:
+            gpu_ms, kernels = measure_gpu_ms(run, iters, warmup)
         wall_ms = measure_wall_ms(run, iters, warmup)
         moved = kv_bytes(case, name)
         rows.append(
@@ -428,6 +448,11 @@ def main() -> None:
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
     parser.add_argument("--breakdown", action="store_true")
     parser.add_argument(
+        "--event-timing",
+        action="store_true",
+        help="use CUDA events instead of torch profiler (required under IKET)",
+    )
+    parser.add_argument(
         "--clear-fp4-compile-cache",
         action="store_true",
         help="clear in-process FP4 caches before each case (required for IKET)",
@@ -466,6 +491,7 @@ def main() -> None:
                     args.iters,
                     args.warmup,
                     args.breakdown,
+                    args.event_timing,
                 )
             )
 

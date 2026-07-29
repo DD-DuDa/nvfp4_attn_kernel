@@ -2481,6 +2481,7 @@ class FP4DecodeKernel:
                     bf16_full_mbar = mbar_ptr + self.mbar_residual_kv_full_offset
                     bf16_empty_mbar = mbar_ptr + self.mbar_residual_kv_empty_offset
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
+                        iket.range_push("load_wait_res")
                         cute.arch.mbarrier_wait(
                             bf16_empty_mbar + 0, residual_kv_empty_producer_phase,
                         )
@@ -2490,6 +2491,7 @@ class FP4DecodeKernel:
                         cute.arch.mbarrier_wait(
                             bf16_empty_mbar + 2, residual_kv_empty_producer_phase,
                         )
+                        iket.range_pop()
                         # Slot 0: BF16 K
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -4430,7 +4432,9 @@ class FP4DecodeKernel:
         phase: Int32,
         load_SFQ_fn: Optional[Callable] = None,
     ):
+        iket.range_push("load_wait_q")
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
+        iket.range_pop()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes["Q"])
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
@@ -4647,12 +4651,14 @@ class FP4DecodeKernel:
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
+        iket.range_push("load_wait_kv")
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
+        iket.range_pop()
 
         if const_expr(self.use_tma_KV):
             assert (

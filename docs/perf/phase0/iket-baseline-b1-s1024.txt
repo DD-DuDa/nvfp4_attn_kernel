@@ -1,0 +1,153 @@
+========================================================================
+LAUNCH 0
+========================================================================
+kernel   kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensor00000o41112101314_None_None_None_0
+grid     (16, 1, 1)  ->  16 CTAs, 16 traced
+spread   16 SMs used, max 1 CTA/SM
+wall     20.80us (first warp start to last warp end)
+
+WARP LIFETIME BY ROLE  (longest = critical path)
+  role      warps  total     mean     max      vs critical
+  --------  -----  --------  -------  -------  --------------------
+  corr      64     1.261ms   19.70us  19.84us  100.0%  <== critical
+  softmax1  64     1.235ms   19.30us  19.46us  98.0%
+  softmax0  64     1.228ms   19.18us  20.77us  97.4%
+  epi       16     329.31us  20.58us  20.70us  26.1%
+  mma       16     319.07us  19.94us  20.06us  25.3%
+  load      16     87.33us   5.46us   5.60us   6.9%
+  empty     16     23.46us   1.47us   1.60us   1.9%
+
+RANGE TIME  (pct is of that role's total warp lifetime)
+  role      range          count  total     mean     pct
+  --------  -------------  -----  --------  -------  -----
+  corr      corr_life      64     1.196ms   18.68us  94.8%
+  corr      corr_main      64     1.192ms   18.63us  94.5%
+  softmax1  softmax_life   64     1.170ms   18.28us  94.7%
+  softmax0  softmax_life   64     1.129ms   17.63us  91.9%
+  corr      corr_wait_sm   1088   1.013ms   931ns    80.3%
+  epi       epi_life       16     313.60us  19.60us  95.2%
+  epi       epi_main       16     312.90us  19.56us  95.0%
+  mma       mma_life       16     302.21us  18.89us  94.7%
+  epi       epi_wait_corr  32     298.02us  9.31us   90.5%
+  mma       mma_wait_p     256    215.62us  842ns    67.6%
+  softmax0  sm_wait_s      512    188.06us  367ns    15.3%
+  softmax1  sm_wait_corr   576    138.91us  241ns    11.2%
+  softmax1  sm_wait_s      512    113.98us  223ns    9.2%
+  load      load_life      16     69.70us   4.36us   79.8%
+  load      load_main      16     68.86us   4.30us   78.9%
+  load      load_wait_kv   256    41.25us   161ns    47.2%
+  softmax0  sm_wait_corr   576    25.38us   44ns     2.1%
+  mma       mma_wait_qk    32     15.58us   487ns    4.9%
+  mma       mma_wait_sf    256    12.80us   50ns     4.0%
+  corr      corr_wait_o    128    8.29us    65ns     0.7%
+  mma       mma_wait_v     128    5.47us    43ns     1.7%
+  corr      corr_wait_epi  128    5.38us    42ns     0.4%
+  mma       mma_wait_k     112    5.22us    47ns     1.6%
+  load      load_wait_q    32     1.06us    33ns     1.2%
+
+Nested ranges overlap, so percentages may exceed 100%. A role whose wait
+range dominates its lifetime is starved by its producer; a producer that
+waits is blocked by slow consumers.
+
+========================================================================
+LAUNCH 1
+========================================================================
+kernel   kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensor00000o41112101314_None_None_None_0
+grid     (16, 1, 1)  ->  16 CTAs, 16 traced
+spread   16 SMs used, max 1 CTA/SM
+wall     20.77us (first warp start to last warp end)
+
+WARP LIFETIME BY ROLE  (longest = critical path)
+  role      warps  total     mean     max      vs critical
+  --------  -----  --------  -------  -------  --------------------
+  corr      64     1.244ms   19.45us  19.74us  100.0%  <== critical
+  softmax1  64     1.219ms   19.04us  19.39us  97.9%
+  softmax0  64     1.213ms   18.95us  20.70us  97.4%
+  epi       16     326.88us  20.43us  20.61us  26.3%
+  mma       16     314.85us  19.68us  19.97us  25.3%
+  load      16     82.72us   5.17us   5.34us   6.6%
+  empty     16     19.49us   1.22us   1.25us   1.6%
+
+RANGE TIME  (pct is of that role's total warp lifetime)
+  role      range          count  total     mean     pct
+  --------  -------------  -----  --------  -------  -----
+  corr      corr_life      64     1.178ms   18.41us  94.7%
+  corr      corr_main      64     1.175ms   18.36us  94.4%
+  softmax1  softmax_life   64     1.152ms   18.00us  94.6%
+  softmax0  softmax_life   64     1.111ms   17.36us  91.6%
+  corr      corr_wait_sm   1088   996.77us  916ns    80.1%
+  epi       epi_life       16     311.17us  19.45us  95.2%
+  epi       epi_main       16     310.40us  19.40us  95.0%
+  mma       mma_life       16     298.08us  18.63us  94.7%
+  epi       epi_wait_corr  32     294.24us  9.20us   90.0%
+  mma       mma_wait_p     256    216.51us  846ns    68.8%
+  softmax0  sm_wait_s      512    169.50us  331ns    14.0%
+  softmax1  sm_wait_corr   576    138.46us  240ns    11.4%
+  softmax1  sm_wait_s      512    96.64us   189ns    7.9%
+  load      load_life      16     65.22us   4.08us   78.8%
+  load      load_main      16     64.19us   4.01us   77.6%
+  load      load_wait_kv   256    39.81us   156ns    48.1%
+  softmax0  sm_wait_corr   576    23.78us   41ns     2.0%
+  mma       mma_wait_sf    256    11.84us   46ns     3.8%
+  mma       mma_wait_qk    32     11.46us   358ns    3.6%
+  corr      corr_wait_o    128    8.80us    69ns     0.7%
+  mma       mma_wait_v     128    5.79us    45ns     1.8%
+  corr      corr_wait_epi  128    5.60us    44ns     0.4%
+  mma       mma_wait_k     112    4.70us    42ns     1.5%
+  load      load_wait_q    32     1.09us    34ns     1.3%
+
+Nested ranges overlap, so percentages may exceed 100%. A role whose wait
+range dominates its lifetime is starved by its producer; a producer that
+waits is blocked by slow consumers.
+
+========================================================================
+LAUNCH 2
+========================================================================
+kernel   kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensor00000o41112101314_None_None_None_0
+grid     (16, 1, 1)  ->  16 CTAs, 16 traced
+spread   16 SMs used, max 1 CTA/SM
+wall     20.70us (first warp start to last warp end)
+
+WARP LIFETIME BY ROLE  (longest = critical path)
+  role      warps  total     mean     max      vs critical
+  --------  -----  --------  -------  -------  --------------------
+  corr      64     1.245ms   19.45us  19.74us  100.0%  <== critical
+  softmax1  64     1.219ms   19.05us  19.36us  97.9%
+  softmax0  64     1.212ms   18.93us  20.67us  97.3%
+  epi       16     325.28us  20.33us  20.58us  26.1%
+  mma       16     315.07us  19.69us  19.97us  25.3%
+  load      16     82.62us   5.16us   5.41us   6.6%
+  empty     16     19.33us   1.21us   1.25us   1.6%
+
+RANGE TIME  (pct is of that role's total warp lifetime)
+  role      range          count  total     mean     pct
+  --------  -------------  -----  --------  -------  -----
+  corr      corr_life      64     1.180ms   18.43us  94.7%
+  corr      corr_main      64     1.177ms   18.39us  94.5%
+  softmax1  softmax_life   64     1.154ms   18.03us  94.6%
+  softmax0  softmax_life   64     1.113ms   17.39us  91.9%
+  corr      corr_wait_sm   1088   998.08us  917ns    80.2%
+  epi       epi_life       16     309.86us  19.37us  95.3%
+  epi       epi_main       16     309.15us  19.32us  95.0%
+  mma       mma_life       16     298.40us  18.65us  94.7%
+  epi       epi_wait_corr  32     294.30us  9.20us   90.5%
+  mma       mma_wait_p     256    216.67us  846ns    68.8%
+  softmax0  sm_wait_s      512    170.46us  333ns    14.1%
+  softmax1  sm_wait_corr   576    140.19us  243ns    11.5%
+  softmax1  sm_wait_s      512    96.86us   189ns    7.9%
+  load      load_life      16     65.09us   4.07us   78.8%
+  load      load_main      16     64.42us   4.03us   78.0%
+  load      load_wait_kv   256    38.94us   152ns    47.1%
+  softmax0  sm_wait_corr   576    24.96us   43ns     2.1%
+  mma       mma_wait_sf    256    12.32us   48ns     3.9%
+  mma       mma_wait_qk    32     11.20us   350ns    3.6%
+  corr      corr_wait_o    128    8.38us    66ns     0.7%
+  mma       mma_wait_v     128    5.95us    46ns     1.9%
+  corr      corr_wait_epi  128    5.18us    40ns     0.4%
+  mma       mma_wait_k     112    5.02us    45ns     1.6%
+  load      load_wait_q    32     1.12us    35ns     1.4%
+
+Nested ranges overlap, so percentages may exceed 100%. A role whose wait
+range dominates its lifetime is starved by its producer; a producer that
+waits is blocked by slow consumers.
+
