@@ -846,6 +846,18 @@ def test_prequantized_query_contract_rejects_bad_tensor_metadata(
             query_fp4=query_fp4,
             query_scales=query_scales.to(torch.int16),
         )
+    cpu_scales = torch.empty_strided(
+        query_scales.shape,
+        query_scales.stride(),
+        dtype=query_scales.dtype,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="query_scales must be a CUDA tensor"):
+        fp4_decode(
+            **common,
+            query_fp4=query_fp4,
+            query_scales=cpu_scales,
+        )
     wrong_rows = query_scales.as_strided(
         (*query_scales.shape[:-1], 2),
         query_scales.stride(),
