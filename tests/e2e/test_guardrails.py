@@ -6,10 +6,10 @@ than_tail_slots`` says a live engine reaches it at all. Without the second the
 matrix could pass in full while nothing ever calls the function.
 
 The matrix calls ``check_supported`` directly instead of building an engine per
-case. Thirteen engines cost about six minutes and the 8B weights, and the half
-of the matrix that asserts a configuration is *accepted* would have to prove it
-by starting an engine successfully — including a two-GPU one for the pipeline
-parallel case.
+case. Twenty-one engines cost several minutes each and the 8B weights, and the
+half of the matrix that asserts a configuration is *accepted* would have to
+prove it by starting an engine successfully — including a two-GPU one for the
+pipeline parallel case.
 
 Only the wiring test needs a GPU and a model, so only it is gated behind
 ``NVFP4_RUN_VLLM_E2E=1``.
@@ -44,13 +44,15 @@ def _config(cache_dtype: str = "nvfp4", **overrides) -> VllmConfig:
     """A configuration the NVFP4 path accepts, with fields overridden.
 
     Overrides are applied by attribute name against whichever sub-config
-    declares them, so a typo raises instead of silently testing nothing.
+    declares them, falling back to the top-level config, so a typo raises
+    instead of silently testing nothing.
     """
     config = VllmConfig()
     config.cache_config.cache_dtype = cache_dtype
     config.cache_config.enable_prefix_caching = False
     config.cache_config.block_size = PAGE_SIZE
     config.scheduler_config.max_num_seqs = MAX_SLOTS
+    config.scheduler_config.enable_chunked_prefill = False
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
     for name, value in overrides.items():
@@ -59,6 +61,7 @@ def _config(cache_dtype: str = "nvfp4", **overrides) -> VllmConfig:
             config.scheduler_config,
             config.parallel_config,
             config.compilation_config,
+            config,
         ):
             if hasattr(section, name):
                 setattr(section, name, value)
@@ -71,7 +74,13 @@ def _config(cache_dtype: str = "nvfp4", **overrides) -> VllmConfig:
 REJECTED = {
     "max_num_seqs": {"max_num_seqs": MAX_SLOTS + 1},
     "prefix_caching": {"enable_prefix_caching": True},
+    "chunked_prefill": {"enable_chunked_prefill": True},
+    "long_prefill_threshold": {"long_prefill_token_threshold": 512},
+    "speculative_decoding": {"speculative_config": object()},
     "kv_offloading": {"kv_offloading_size": 8.0},
+    # use_ubatching is a property over these two, so both have to be refused.
+    "dual_batch_overlap": {"enable_dbo": True},
+    "ubatch_size": {"ubatch_size": 2},
     "pipeline_parallel": {"pipeline_parallel_size": 2},
     "cudagraphs": {"cudagraph_mode": CUDAGraphMode.PIECEWISE},
 }

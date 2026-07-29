@@ -36,6 +36,11 @@ MAX_MODEL_LEN = 4096
 MAX_NUM_SEQS = 8
 GPU_MEMORY_UTILIZATION = 0.9
 
+# The NVFP4 path refuses chunked prefill, and vLLM then requires a batch wide
+# enough that no prompt has to be split. Both engines get the same setting so
+# the comparison is not measuring a scheduler difference.
+MAX_NUM_BATCHED_TOKENS = MAX_MODEL_LEN
+
 # A BF16 value costs 16 bits; an NVFP4 one costs 4 plus a shared E4M3 scale per
 # group of 16, so 4.5. The page size ratio is exactly 16 / 4.5.
 EXPECTED_PAGE_SIZE_RATIO = 32 / 9
@@ -120,10 +125,12 @@ def _measure(label: str, kv_cache_dtype: str, backend: str) -> CacheReport:
         tensor_parallel_size=1,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         enforce_eager=True,
         block_size=PAGE_SIZE,
         enable_prefix_caching=False,
+        enable_chunked_prefill=False,
         attention_config={"backend": backend},
     )
     try:

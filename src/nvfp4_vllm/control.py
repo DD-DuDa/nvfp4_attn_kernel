@@ -1,0 +1,448 @@
+"""Per-step bookkeeping for the BF16 tail slots, resolved entirely on device.
+
+A sequence whose length is not a multiple of the page size has a partial page
+that cannot be quantized, because V is packed along the token axis a page at a
+time. Those trailing tokens stay in BF16 in a buffer of our own until the page
+fills. One such buffer per running request is a *slot*.
+
+vLLM never learns that these buffers exist, so it never tells us when one is
+dead. It cannot: ``CommonAttentionMetadata`` carries no request identity, and
+``finished_req_ids`` lives in ``SchedulerOutput``, which no attention backend
+sees. Slot lifetime therefore has to be inferred from what does arrive each
+step, which is three device tensors.
+
+The inference keys on ``block_table[row, 0]``, the physical block holding
+logical page 0. It is fixed for the life of a request and unique among live
+requests, whereas the batch row index is not: ``InputBatch.condense()`` slides
+the last live row into the hole a finished request leaves.
+
+Slots are reclaimed lazily. A slot is never released because its key is absent
+from a step: the scheduler can leave a live request out of a batch when its
+token budget runs out, and releasing that request's tail would silently lose
+the only copy of its most recent keys and values. Instead a slot is taken only
+when a new key needs one, and the victim is the one whose owner has been unseen
+longest. The stronger failure mode this replaces is still detected: a row that
+has computed tokens but matches no slot is reported through ``error_code``.
+
+A row is live when its sequence length is nonzero and its key is not vLLM's
+null block. Neither test is redundant. Padding rows, which vLLM appends to
+reach a captured width for full CUDA graphs, get a zero sequence length but
+keep whatever block table entry ``condense()`` left behind, so counting rows
+would hand a slot to a request that finished several steps ago. The startup
+profile run goes the other way: it reports a full batch of long sequences over
+an untouched block table, so every row keys on block 0, which the block pool
+reserves as its null block and never allocates. Those rows are not requests.
+
+Everything runs in a single CTA. With a slot table this small the whole
+matching problem is a ``[rows, slots]`` comparison held in registers, and one
+CTA can mutate the table without grid-wide synchronization.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import triton
+import triton.language as tl
+
+
+PAGE_SIZE = 128
+
+# The largest slot table v1 is validated for. The constraint is the BF16 tail
+# buffer this control plane hands out indices into, which is preallocated at
+# 16 MiB per slot on an 8B model; the kernel below holds a [slots, slots]
+# comparison in registers and stays comfortable into the low hundreds.
+MAX_SUPPORTED_SLOTS = 8
+
+FREE_KEY = -1
+# vLLM's block pool takes block 0 out of the free list at startup and hands it
+# to no one, so a row keyed on it is not a request. Dummy batches read it
+# straight out of the zero-initialized block table.
+NULL_BLOCK = 0
+# Fills ``decode_row_indices`` past ``decode_count``. A real row index would be
+# indistinguishable from a live entry, and pointing spare entries at a real row
+# would make the decode kernel re-read that row's whole KV.
+INACTIVE_ROW = -1
+
+# Sticky bit flags in ``error_code``. Nothing on the hot path reads them;
+# reading one costs a host synchronization. They exist so that a violated
+# assumption is attributable after the fact rather than silent.
+ERR_CONTINUATION_PREFILL = 1
+ERR_SLOT_LOST = 2
+ERR_STALE_SLOT_HISTORY = 4
+ERR_NO_FREE_SLOT = 8
+ERR_DUPLICATE_KEY = 16
+
+_TOKEN_BLOCK = 256
+
+# Triton cannot close over plain Python globals, only over constexpr ones.
+_FREE = tl.constexpr(FREE_KEY)
+_NULL_BLOCK = tl.constexpr(NULL_BLOCK)
+_INACTIVE = tl.constexpr(INACTIVE_ROW)
+_E_CONTINUATION_PREFILL = tl.constexpr(ERR_CONTINUATION_PREFILL)
+_E_SLOT_LOST = tl.constexpr(ERR_SLOT_LOST)
+_E_STALE_SLOT_HISTORY = tl.constexpr(ERR_STALE_SLOT_HISTORY)
+_E_NO_FREE_SLOT = tl.constexpr(ERR_NO_FREE_SLOT)
+_E_DUPLICATE_KEY = tl.constexpr(ERR_DUPLICATE_KEY)
+
+
+@triton.jit
+def _control_kernel(
+    block_table_ptr,
+    block_table_stride,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    slot_keys_ptr,
+    slot_last_seq_ptr,
+    slot_last_seen_ptr,
+    step_ptr,
+    row_to_slot_ptr,
+    token_to_slot_ptr,
+    seqused_fp4_ptr,
+    seqused_residual_ptr,
+    promotion_mask_ptr,
+    decode_row_indices_ptr,
+    decode_count_ptr,
+    active_row_mask_ptr,
+    error_code_ptr,
+    num_reqs,
+    num_actual_tokens,
+    NUM_SLOTS: tl.constexpr,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
+):
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+
+    idx = tl.arange(0, BLOCK)
+    in_batch = idx < num_reqs
+    is_slot = idx < NUM_SLOTS
+
+    # Column 0 of the block table, which is a strided read: vLLM owns the
+    # tensor and reshaping it per step would cost an allocation and a copy.
+    key = tl.load(block_table_ptr + idx * block_table_stride, mask=in_batch, other=_FREE)
+    seq = tl.load(seq_lens_ptr + idx, mask=in_batch, other=0)
+    q_begin = tl.load(query_start_loc_ptr + idx, mask=in_batch, other=0)
+    q_end = tl.load(query_start_loc_ptr + idx + 1, mask=in_batch, other=0)
+    query_len = q_end - q_begin
+
+    # ``num_reqs`` only bounds how far the input tensors may be read. A row is
+    # a request only if vLLM gave it both a length and a block: padding rows
+    # keep a stale block table entry under a zeroed length, and the rows of a
+    # dummy batch keep a nonzero length over the null block.
+    live = in_batch & (seq > 0) & (key != _NULL_BLOCK)
+    # Tokens already in the cache before this step. seq_lens is written as
+    # num_computed_tokens + num_scheduled_tokens, so it already counts the
+    # tokens this step will store.
+    computed = seq - query_len
+
+    slot_key = tl.load(slot_keys_ptr + idx, mask=is_slot, other=_FREE)
+    slot_last_seq = tl.load(slot_last_seq_ptr + idx, mask=is_slot, other=-1)
+    slot_last_seen = tl.load(slot_last_seen_ptr + idx, mask=is_slot, other=-1)
+
+    # A dead row reads FREE_KEY, which is also an unused slot's key, so the
+    # liveness of the row has to be part of the match.
+    #
+    # Reduced with min rather than a sum of matching indices: two live rows
+    # carrying the same key is a broken invariant, not an impossible state, and
+    # a sum would answer with an index outside the table. Min answers with a
+    # real slot, and the duplicate itself is reported below.
+    match = (key[:, None] == slot_key[None, :]) & live[:, None] & is_slot[None, :]
+    matched_slot = tl.min(tl.where(match, idx[None, :], NUM_SLOTS), axis=1)
+    has_match = matched_slot < NUM_SLOTS
+    owns_match = match & (idx[None, :] == matched_slot[:, None])
+    matched_last_seq = tl.sum(tl.where(owns_match, slot_last_seq[None, :], 0), axis=1)
+    claimed = tl.sum(owns_match.to(tl.int32), axis=0) > 0
+
+    # Rows without a slot take one of the slots no row claimed this step,
+    # oldest first. Ranking both sides and pairing the ranks avoids a serial
+    # scan over the table.
+    needs_slot = live & (has_match == 0)
+    need_rank = tl.cumsum(needs_slot.to(tl.int32), axis=0) - 1
+    free = is_slot & (claimed == 0)
+    older = free[None, :] & (
+        (slot_last_seen[None, :] < slot_last_seen[:, None])
+        | (
+            (slot_last_seen[None, :] == slot_last_seen[:, None])
+            & (idx[None, :] < idx[:, None])
+        )
+    )
+    free_rank = tl.sum(older.to(tl.int32), axis=1)
+    pick = (
+        needs_slot[:, None]
+        & free[None, :]
+        & (free_rank[None, :] == need_rank[:, None])
+    )
+    allocated = tl.sum(tl.where(pick, idx[None, :], 0), axis=1)
+    got_slot = tl.sum(pick.to(tl.int32), axis=1) > 0
+
+    slot = tl.where(has_match, matched_slot, allocated)
+    slot = tl.where(live, slot, _INACTIVE)
+
+    errors = 0
+    # A prompt split across steps would arrive with history and more than one
+    # query token. Guarded against at configuration time; reported here so a
+    # regression is attributable.
+    errors += tl.where(
+        tl.sum((live & (query_len > 1) & (computed > 0)).to(tl.int32), axis=0) > 0,
+        _E_CONTINUATION_PREFILL,
+        0,
+    )
+    # A row that has already computed tokens but matches no slot has lost its
+    # tail. This is exactly the failure mode eager reclamation would cause.
+    errors += tl.where(
+        tl.sum((needs_slot & (computed > 0)).to(tl.int32), axis=0) > 0,
+        _E_SLOT_LOST,
+        0,
+    )
+    # A matched slot whose recorded length does not continue into this step
+    # means the block id was recycled, and only a brand new request can be
+    # given a recycled block, so it should have no history to continue.
+    errors += tl.where(
+        tl.sum(
+            (has_match & (matched_last_seq != computed) & (computed > 0)).to(tl.int32),
+            axis=0,
+        )
+        > 0,
+        _E_STALE_SLOT_HISTORY,
+        0,
+    )
+    # Unreachable through the caller, which refuses more rows than slots: a
+    # needy row always has an unclaimed slot waiting. This checks the rank
+    # pairing above rather than the input.
+    errors += tl.where(
+        tl.sum((needs_slot & (got_slot == 0)).to(tl.int32), axis=0) > 0,
+        _E_NO_FREE_SLOT,
+        0,
+    )
+    # Two live rows sharing a physical block would have to share a tail, which
+    # no pair of live requests can legitimately need. Everything above answers
+    # in range regardless, but the answer is meaningless.
+    same_key = (key[:, None] == key[None, :]) & live[:, None] & live[None, :]
+    errors += tl.where(
+        tl.max(tl.sum(same_key.to(tl.int32), axis=1), axis=0) > 1,
+        _E_DUPLICATE_KEY,
+        0,
+    )
+    tl.atomic_or(error_code_ptr, errors)
+
+    # Slot state follows its owner. Slots nobody claimed keep their old key so
+    # a request that sits out a step can still find its tail. Min again, so a
+    # slot two rows landed on takes one of them rather than their sum.
+    owns = (slot[:, None] == idx[None, :]) & live[:, None] & is_slot[None, :]
+    owned = tl.sum(owns.to(tl.int32), axis=0) > 0
+    owner_row = tl.min(tl.where(owns, idx[:, None], BLOCK), axis=0)
+    sole_owner = owns & (idx[:, None] == owner_row[None, :])
+    owner_key = tl.sum(tl.where(sole_owner, key[:, None], 0), axis=0)
+    owner_seq = tl.sum(tl.where(sole_owner, seq[:, None], 0), axis=0)
+    tl.store(slot_keys_ptr + idx, tl.where(owned, owner_key, slot_key), mask=is_slot)
+    tl.store(
+        slot_last_seq_ptr + idx,
+        tl.where(owned, owner_seq, slot_last_seq),
+        mask=is_slot,
+    )
+    tl.store(
+        slot_last_seen_ptr + idx,
+        tl.where(owned, step, slot_last_seen),
+        mask=is_slot,
+    )
+
+    tl.store(row_to_slot_ptr + idx, slot, mask=is_slot)
+
+    # Pages [0, seqused_fp4) are FP4 in vLLM's blocks; the rest is the tail.
+    # A dead row is zeroed rather than left stale, so a consumer that reads the
+    # full-width buffer sees a row that attends to nothing.
+    seq_safe = tl.where(live, seq, 1)
+    fp4 = tl.where(live, ((seq_safe - 1) // PAGE) * PAGE, 0)
+    tl.store(seqused_fp4_ptr + idx, fp4, mask=is_slot)
+    tl.store(seqused_residual_ptr + idx, tl.where(live, seq - fp4, 0), mask=is_slot)
+    tl.store(promotion_mask_ptr + idx, live & (seq % PAGE == 0), mask=is_slot)
+
+    is_decode = live & (query_len == 1)
+    decode_rank = tl.cumsum(is_decode.to(tl.int32), axis=0) - 1
+    decode_count = tl.sum(is_decode.to(tl.int32), axis=0)
+    compact = is_decode[None, :] & (decode_rank[None, :] == idx[:, None])
+    decode_rows = tl.sum(tl.where(compact, idx[None, :], 0), axis=1)
+    tl.store(
+        decode_row_indices_ptr + idx,
+        tl.where(idx < decode_count, decode_rows, _INACTIVE),
+        mask=is_slot,
+    )
+    tl.store(active_row_mask_ptr + idx, idx < decode_count, mask=is_slot)
+    tl.store(decode_count_ptr, decode_count)
+
+    # Bounded by the tokens actually present, so a steady-state decode step
+    # runs one iteration.
+    for base in tl.range(0, num_actual_tokens, TOKEN_BLOCK):
+        offs = base + tl.arange(0, TOKEN_BLOCK)
+        in_range = offs < num_actual_tokens
+        belongs = (
+            (offs[:, None] >= q_begin[None, :])
+            & (offs[:, None] < q_end[None, :])
+            & live[None, :]
+        )
+        tl.store(
+            token_to_slot_ptr + offs,
+            tl.sum(tl.where(belongs, slot[None, :], 0), axis=1),
+            mask=in_range,
+        )
+
+
+@dataclass(frozen=True)
+class ControlOutputs:
+    """Views into the control plane's scratch, valid until the next step.
+
+    Nothing here may be read on the host during a decode step; every tensor
+    stays on device and is consumed by later kernels.
+    """
+
+    row_to_slot: torch.Tensor
+    token_to_slot: torch.Tensor
+    seqused_fp4: torch.Tensor
+    seqused_residual: torch.Tensor
+    promotion_mask: torch.Tensor
+    decode_row_indices: torch.Tensor
+    decode_count: torch.Tensor
+    active_row_mask: torch.Tensor
+    error_code: torch.Tensor
+
+
+class ControlPlane:
+    """Slot table and per-step scratch for one engine.
+
+    All buffers are allocated once at the high-water mark. Reallocating inside
+    a step would both cost a synchronization and move the addresses a captured
+    graph would have baked in.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+        device: torch.device | str,
+        page_size: int = PAGE_SIZE,
+    ) -> None:
+        if max_num_seqs < 1:
+            raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
+        if max_num_batched_tokens < max_num_seqs:
+            raise ValueError(
+                f"max_num_batched_tokens ({max_num_batched_tokens}) must cover "
+                f"one token per row ({max_num_seqs})"
+            )
+
+        self.num_slots = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.page_size = page_size
+        self.device = torch.device(device)
+        # Triton indexes the table with tl.arange, which needs a power of two.
+        self._block = triton.next_power_of_2(max_num_seqs)
+
+        def _slots(dtype: torch.dtype, fill) -> torch.Tensor:
+            return torch.full(
+                (self.num_slots,), fill, dtype=dtype, device=self.device
+            )
+
+        self.slot_keys = _slots(torch.int32, FREE_KEY)
+        # -1 is not a reachable computed-token count, so a slot handed out for
+        # the first time never looks like a continuation of anything.
+        self.slot_last_seq = _slots(torch.int32, -1)
+        # int64 so a long-running server cannot wrap the LRU ordering.
+        self.slot_last_seen = _slots(torch.int64, -1)
+        self.step = torch.zeros(1, dtype=torch.int64, device=self.device)
+
+        self.row_to_slot = _slots(torch.int32, INACTIVE_ROW)
+        self.seqused_fp4 = _slots(torch.int32, 0)
+        self.seqused_residual = _slots(torch.int32, 0)
+        self.promotion_mask = _slots(torch.bool, False)
+        self.decode_row_indices = _slots(torch.int32, INACTIVE_ROW)
+        self.active_row_mask = _slots(torch.bool, False)
+        self.decode_count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.error_code = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.token_to_slot = torch.full(
+            (max_num_batched_tokens,),
+            INACTIVE_ROW,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def reset(self) -> None:
+        """Forget every slot. Only valid when no request is in flight."""
+        self.slot_keys.fill_(FREE_KEY)
+        self.slot_last_seq.fill_(-1)
+        self.slot_last_seen.fill_(-1)
+        self.step.zero_()
+        self.error_code.zero_()
+
+    def prepare(
+        self,
+        *,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_reqs: int,
+        num_actual_tokens: int,
+    ) -> ControlOutputs:
+        """Advance the slot table by one step and return this step's mapping.
+
+        ``block_table`` is vLLM's ``[rows, max_blocks]`` tensor; only column 0
+        is read, as the identity of the row's request. ``seq_lens`` must
+        already include the tokens this step will write, as vLLM's model runner
+        computes it, and a row whose length is zero is treated as padding.
+        ``num_reqs`` and ``num_actual_tokens`` are host values the caller
+        already has; nothing is read back from the device.
+        """
+        if block_table.ndim != 2:
+            raise ValueError(f"block_table must be 2-D, got {block_table.ndim}-D")
+        if num_reqs > self.num_slots:
+            raise ValueError(
+                f"{num_reqs} rows exceeds the {self.num_slots} tail slots"
+            )
+        if num_actual_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                f"{num_actual_tokens} tokens exceeds the "
+                f"{self.max_num_batched_tokens} the scratch was sized for"
+            )
+
+        _control_kernel[(1,)](
+            block_table,
+            block_table.stride(0),
+            seq_lens,
+            query_start_loc,
+            self.slot_keys,
+            self.slot_last_seq,
+            self.slot_last_seen,
+            self.step,
+            self.row_to_slot,
+            self.token_to_slot,
+            self.seqused_fp4,
+            self.seqused_residual,
+            self.promotion_mask,
+            self.decode_row_indices,
+            self.decode_count,
+            self.active_row_mask,
+            self.error_code,
+            num_reqs,
+            num_actual_tokens,
+            NUM_SLOTS=self.num_slots,
+            PAGE=self.page_size,
+            BLOCK=self._block,
+            TOKEN_BLOCK=_TOKEN_BLOCK,
+            num_warps=4,
+        )
+
+        return ControlOutputs(
+            row_to_slot=self.row_to_slot[:num_reqs],
+            token_to_slot=self.token_to_slot[:num_actual_tokens],
+            seqused_fp4=self.seqused_fp4[:num_reqs],
+            seqused_residual=self.seqused_residual[:num_reqs],
+            promotion_mask=self.promotion_mask[:num_reqs],
+            # Fixed capacity: the number of decode rows is only known on the
+            # device, and slicing to it would require reading it back.
+            decode_row_indices=self.decode_row_indices,
+            decode_count=self.decode_count,
+            active_row_mask=self.active_row_mask,
+            error_code=self.error_code,
+        )

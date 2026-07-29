@@ -44,8 +44,9 @@ def nvfp4_page_size_bytes(
 class NVFP4Backend(FlashAttentionBackend):
     """Paged NVFP4 KV cache backend.
 
-    Inherits FlashAttention's impl and builder for now; only the KV cache
-    declaration is NVFP4-specific.
+    Extends FlashAttention rather than replacing it: the attention math is
+    still FlashAttention's, and the NVFP4 parts are the KV cache declaration
+    and the per-step tail-slot metadata.
     """
 
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
@@ -63,6 +64,12 @@ class NVFP4Backend(FlashAttentionBackend):
         from .impl import NVFP4Impl
 
         return NVFP4Impl
+
+    @staticmethod
+    def get_builder_cls() -> type:
+        from .builder import NVFP4MetadataBuilder
+
+        return NVFP4MetadataBuilder
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:

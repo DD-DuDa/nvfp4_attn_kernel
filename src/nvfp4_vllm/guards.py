@@ -11,17 +11,15 @@ from __future__ import annotations
 
 from vllm.config import CUDAGraphMode, VllmConfig
 
+from .control import MAX_SUPPORTED_SLOTS
+
 
 NVFP4 = "nvfp4"
 
 # vLLM runs at most ``max_num_seqs`` requests concurrently, and each running
-# request needs one BF16 tail slot: the partial page its sequence has not
-# filled yet, for every layer. That is 16 MiB per slot on an 8B model, and the
-# buffer is preallocated, so the engine cannot admit more rows than slots.
-#
-# Eight rather than vLLM's default of 256 is a v1 scope limit: wide enough to
-# exercise the multi-row decode path, narrow enough to preallocate 128 MiB.
-MAX_SLOTS = 8
+# request needs one BF16 tail slot. The slot table itself is sized from
+# ``max_num_seqs``; this is the width v1 is validated at.
+MAX_SLOTS = MAX_SUPPORTED_SLOTS
 
 
 class UnsupportedConfigError(ValueError):
@@ -54,6 +52,33 @@ def check_supported(vllm_config: VllmConfig) -> None:
             "is not implemented. Pass enable_prefix_caching=False."
         )
 
+    # Everything below keeps one invariant: a step either runs a whole prompt
+    # from nothing, or extends a sequence by exactly one token. The control
+    # plane reports a violation through ``error_code``, but only after the
+    # tokens have gone somewhere wrong, so the configuration is refused first.
+    if scheduler_config is not None and scheduler_config.enable_chunked_prefill:
+        raise UnsupportedConfigError(
+            "chunked prefill is not supported by the NVFP4 KV cache: the "
+            "second chunk of a split prompt resumes mid-page, which needs "
+            "prefill over an FP4 prefix. Pass enable_chunked_prefill=False; "
+            "vLLM then requires max_num_batched_tokens >= max_model_len so "
+            "that no prompt has to be split."
+        )
+
+    if scheduler_config is not None and scheduler_config.long_prefill_token_threshold:
+        raise UnsupportedConfigError(
+            "long_prefill_token_threshold="
+            f"{scheduler_config.long_prefill_token_threshold} splits long "
+            "prompts even with chunked prefill disabled. Leave it at 0."
+        )
+
+    if vllm_config.speculative_config is not None:
+        raise UnsupportedConfigError(
+            "speculative decoding is not supported by the NVFP4 KV cache: it "
+            "verifies several draft tokens per step, and the decode kernel "
+            "attends one query token per sequence."
+        )
+
     if cache_config.kv_offloading_size is not None:
         raise UnsupportedConfigError(
             "KV offloading is not supported by the NVFP4 KV cache: it copies "
@@ -62,6 +87,15 @@ def check_supported(vllm_config: VllmConfig) -> None:
         )
 
     parallel_config = vllm_config.parallel_config
+    if parallel_config is not None and parallel_config.use_ubatching:
+        raise UnsupportedConfigError(
+            "microbatching is not supported by the NVFP4 KV cache: each "
+            "ubatch builds its own attention metadata, so the slot table "
+            "would advance twice per step and the second half of the batch "
+            "would extend tails the first half had already extended. Leave "
+            "enable_dbo unset and ubatch_size at 0."
+        )
+
     if parallel_config is not None and parallel_config.pipeline_parallel_size > 1:
         raise UnsupportedConfigError(
             f"pipeline_parallel_size={parallel_config.pipeline_parallel_size} "
