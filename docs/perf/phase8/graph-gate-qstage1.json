@@ -1,0 +1,54 @@
+[
+  {
+    "case": "gqa4_b1_s16384_hq32_hkv8",
+    "batch": 1,
+    "seqlen": 16384,
+    "fp4_graph_us": 18.665599822998047,
+    "fp4_error": "",
+    "fp4_event_us": 93.92160177230835,
+    "fa4_splits": 18,
+    "fa4_graph_us": 22.729599475860596,
+    "fa4_event_us": 61.37920022010803,
+    "graph_ratio": 0.8212023200330204,
+    "event_ratio": 1.5301861450703511
+  },
+  {
+    "case": "gqa4_b4_s16384_hq32_hkv8",
+    "batch": 4,
+    "seqlen": 16384,
+    "fp4_graph_us": 57.523202896118164,
+    "fp4_error": "",
+    "fp4_event_us": 92.69279837608337,
+    "fa4_splits": 4,
+    "fa4_graph_us": 53.115200996398926,
+    "fa4_event_us": 62.057602405548096,
+    "graph_ratio": 1.0829894609646322,
+    "event_ratio": 1.4936574212186517
+  },
+  {
+    "case": "gqa4_b16_s16384_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 16384,
+    "fp4_graph_us": 213.54880332946777,
+    "fp4_error": "",
+    "fp4_event_us": 219.94080543518066,
+    "fa4_splits": 1,
+    "fa4_graph_us": 165.1039958000183,
+    "fa4_event_us": 166.11039638519287,
+    "graph_ratio": 1.2934199580979742,
+    "event_ratio": 1.324064057526903
+  },
+  {
+    "case": "gqa4_b64_s16384_hq32_hkv8",
+    "batch": 64,
+    "seqlen": 16384,
+    "fp4_graph_us": 823.8847732543945,
+    "fp4_error": "",
+    "fp4_event_us": 825.3264427185059,
+    "fa4_splits": 1,
+    "fa4_graph_us": 688.0303859710693,
+    "fa4_event_us": 793.4192180633545,
+    "graph_ratio": 1.1974540515264942,
+    "event_ratio": 1.0402148371614104
+  }
+]

@@ -141,7 +141,14 @@ class FP4DecodeKernel:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        if is_split_kv:
+        # A second Q stage only earns its keep when a CTA carries two Q tiles.
+        # With seqlen_q statically one the packed M extent is qhead_per_kvhead
+        # rows under PackGQA and a single row without it, either way at most one
+        # m_block_size, so stage 1 would TMA an out-of-range Q, get zeros, and
+        # run a full softmax, TMEM round trip and PV MMA over them.
+        if seqlen_q_static_one:
+            assert qhead_per_kvhead <= m_block_size
+        if is_split_kv or seqlen_q_static_one:
             self.q_stage = 1
         elif getattr(type(self), "_force_q_stage_1", False):
             self.q_stage = 1

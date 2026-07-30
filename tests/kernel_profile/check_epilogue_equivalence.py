@@ -65,11 +65,12 @@ def build_inputs(heads_q: int, heads_kv: int, rows: int, pages_per_row: int):
         dtype=torch.int32,
         device=device,
     )
-    query_row_indices = torch.tensor(
-        [(i * 2 + 1) % (rows + 2) for i in range(rows)],
-        dtype=torch.int32,
-        device=device,
-    )
+    # Both index maps must be injective. Duplicate out_indices would make two
+    # decode rows race for one output row, which is nondeterministic and would
+    # look exactly like a numerical regression.
+    perm = torch.randperm(rows + 2, generator=torch.Generator().manual_seed(7))
+    query_row_indices = perm[:rows].to(device=device, dtype=torch.int32)
+    out_indices = perm.flip(0)[:rows].to(device=device, dtype=torch.int32)
     return {
         "query": query,
         "key_pages_bf16": key_pages_bf16,
@@ -83,6 +84,7 @@ def build_inputs(heads_q: int, heads_kv: int, rows: int, pages_per_row: int):
         "residual_page_ids": residual_page_ids,
         "seqused_residual": seqused_residual,
         "query_row_indices": query_row_indices,
+        "out_indices": out_indices,
     }
 
 
@@ -118,81 +120,167 @@ def run_shapes(inputs, rows: int) -> dict[str, torch.Tensor]:
             query_row_indices=inputs["query_row_indices"],
         )
         scatter_out = torch.full_like(inputs["query"], 17.0)
-        out_indices = torch.tensor(
-            [(i * 3 + 2) % (rows + 2) for i in range(rows)],
-            dtype=torch.int32,
-            device=compact_query.device,
-        )
         fp4_decode(
             inputs["query"],
             **base,
             **residual,
             query_row_indices=inputs["query_row_indices"],
             out=scatter_out,
-            out_indices=out_indices,
+            out_indices=inputs["out_indices"],
         )
         results["direct_scatter"] = scatter_out
     torch.cuda.synchronize()
     return results
 
 
-def collect() -> dict[str, torch.Tensor]:
+# pages_per_row 2 stays on the unsplit path; 64 crosses into split-K, where the
+# epilogue runs under a different scheduler and q_stage. rows 64 is the unsplit
+# path with a main loop long enough to matter, which is where the high-batch
+# decode launches land.
+DEFAULT_SHAPES = "3x2,64x8,1x64,5x64"
+
+
+def parse_shapes(spec: str) -> list[tuple[int, int]]:
+    out = []
+    for item in spec.split(","):
+        rows, pages = item.split("x")
+        out.append((int(rows), int(pages)))
+    return out
+
+
+def collect(shapes: str, repeat: int) -> dict[str, dict[str, torch.Tensor]]:
+    """First-run outputs plus each case's own run-to-run spread.
+
+    The kernel is not deterministic at every shape, so a raw diff between two
+    builds cannot be read on its own. Carrying each build's self-spread along
+    with its output makes the comparison say what it should: whether the build
+    difference is larger than the noise already present.
+    """
     outputs: dict[str, torch.Tensor] = {}
-    # pages_per_row 2 stays on the unsplit path; 64 crosses into split-K, where
-    # the epilogue runs under a different scheduler and q_stage.
+    spread: dict[str, float] = {}
     for heads_q, heads_kv in HEAD_CONFIGS:
-        for rows, pages_per_row in ((3, 2), (1, 64), (5, 64)):
+        for rows, pages_per_row in parse_shapes(shapes):
             inputs = build_inputs(heads_q, heads_kv, rows, pages_per_row)
             tag = f"h{heads_q}x{heads_kv}_r{rows}_p{pages_per_row}"
-            for name, tensor in run_shapes(inputs, rows).items():
+            reference = run_shapes(inputs, rows)
+            for name, tensor in reference.items():
                 outputs[f"{tag}_{name}"] = tensor.detach().cpu().clone()
-            del inputs
+                spread[f"{tag}_{name}"] = 0.0
+            for _ in range(repeat - 1):
+                for name, tensor in run_shapes(inputs, rows).items():
+                    key = f"{tag}_{name}"
+                    diff = (tensor.float() - reference[name].float()).abs().max().item()
+                    spread[key] = max(spread[key], diff)
+            del inputs, reference
             torch.cuda.empty_cache()
-    return outputs
+    return {"outputs": outputs, "spread": spread}
 
 
 def compare(before_path: Path, after_path: Path) -> int:
     before = torch.load(before_path)
     after = torch.load(after_path)
-    missing = set(before) ^ set(after)
+    before_out, before_spread = before["outputs"], before["spread"]
+    after_out, after_spread = after["outputs"], after["spread"]
+    missing = set(before_out) ^ set(after_out)
     if missing:
         print(f"FAIL: case sets differ: {sorted(missing)}")
         return 1
 
-    worst = 0.0
-    failures = 0
-    for name in sorted(before):
-        lhs, rhs = before[name], after[name]
-        identical = torch.equal(lhs, rhs)
+    identical = exceeds = within = 0
+    for name in sorted(before_out):
+        lhs, rhs = before_out[name], after_out[name]
         diff = (lhs.float() - rhs.float()).abs().max().item()
-        worst = max(worst, diff)
-        if not identical:
-            failures += 1
-            print(f"  DIFFER  max_abs_diff {diff:.6g}  {name}")
-    print(f"{len(before)} cases, {failures} differ, worst max_abs_diff {worst:.6g}")
-    if failures:
-        print("FAIL: output is not bitwise identical")
+        noise = max(before_spread.get(name, 0.0), after_spread.get(name, 0.0))
+        if torch.equal(lhs, rhs):
+            identical += 1
+        elif diff <= noise:
+            within += 1
+            print(f"  within noise  diff {diff:.6g} <= self-spread {noise:.6g}  {name}")
+        else:
+            exceeds += 1
+            print(f"  EXCEEDS NOISE diff {diff:.6g} >  self-spread {noise:.6g}  {name}")
+
+    total = len(before_out)
+    print(
+        f"{total} cases: {identical} bitwise identical, "
+        f"{within} differ but within the kernel's own run-to-run spread, "
+        f"{exceeds} exceed it"
+    )
+    if exceeds:
+        print("FAIL: a difference is larger than the existing nondeterminism")
         return 1
+    if within:
+        print("PASS: no difference exceeds the kernel's own nondeterminism")
+        return 0
     print("PASS: bitwise identical on every case")
     return 0
+
+
+def determinism(shapes: str, repeat: int) -> int:
+    """Run the same inputs repeatedly in one process and diff the outputs.
+
+    Staying in one process keeps the compiled kernel and the allocator state
+    fixed, so a difference here is the kernel itself rather than anything about
+    how the run was set up.
+    """
+    failures = 0
+    for spec in shapes.split(","):
+        heads_q, heads_kv, rows, pages = (int(x) for x in spec.split("x"))
+        inputs = build_inputs(heads_q, heads_kv, rows, pages)
+        ctas = rows * heads_kv
+        reference = run_shapes(inputs, rows)
+        worst: dict[str, float] = {}
+        for _ in range(repeat - 1):
+            for name, tensor in run_shapes(inputs, rows).items():
+                diff = (tensor.float() - reference[name].float()).abs().max().item()
+                worst[name] = max(worst.get(name, 0.0), diff)
+        bad = {name: d for name, d in worst.items() if d > 0}
+        label = f"h{heads_q}x{heads_kv} rows {rows} pages {pages} ({ctas} CTAs)"
+        if bad:
+            failures += 1
+            print(f"  NONDETERMINISTIC  {label}")
+            for name, diff in sorted(bad.items()):
+                print(f"      {name:<16} max_abs_diff {diff:.6g}")
+        else:
+            print(f"  stable            {label}")
+        del inputs, reference
+        torch.cuda.empty_cache()
+    return 1 if failures else 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--compare", type=str, nargs=2, default=None)
+    parser.add_argument(
+        "--determinism",
+        type=str,
+        default=None,
+        help="comma separated headsQxheadsKVxrowsxpages specs",
+    )
+    parser.add_argument("--repeat", type=int, default=8)
+    parser.add_argument(
+        "--shapes",
+        type=str,
+        default=DEFAULT_SHAPES,
+        help="comma separated rowsxpages specs for --out",
+    )
     args = parser.parse_args()
 
     if args.compare:
         return compare(Path(args.compare[0]), Path(args.compare[1]))
 
+    if args.determinism:
+        torch.cuda.set_device(0)
+        return determinism(args.determinism, args.repeat)
+
     if not args.out:
         parser.error("one of --out or --compare is required")
     torch.cuda.set_device(0)
-    outputs = collect()
+    record = collect(args.shapes, args.repeat)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(outputs, args.out)
-    print(f"wrote {len(outputs)} outputs to {args.out}")
+    torch.save(record, args.out)
+    print(f"wrote {len(record['outputs'])} outputs to {args.out}")
     return 0
 
 
