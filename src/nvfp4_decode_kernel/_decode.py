@@ -35,6 +35,16 @@ def split_k_heuristic(
     splits than there are page blocks. Power-of-two candidates keep one
     compiled kernel per useful occupancy tier and match the combine kernel's
     fixed workspace contract.
+
+    ``max_pages_per_row`` is the page table's second extent, not the pages the
+    rows actually consume, because the real lengths live in ``seqused_fp4`` on
+    the device and reading them here would force a synchronization on every
+    decode. Callers must therefore size the page table to the batch's own
+    longest row. A table left at some global capacity makes short batches look
+    long, and splitting a short context is not free: at one page block per
+    split a 1K context measured 1.7x slower purely from the combine launch.
+    Choosing too few splits only forfeits occupancy, so the ratio below is set
+    to err in that direction.
     """
     if rows < 1 or heads_kv < 1 or max_pages_per_row < 2 or sms < 1:
         return 1
