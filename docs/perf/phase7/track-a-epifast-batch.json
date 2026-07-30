@@ -1,0 +1,92 @@
+[
+  {
+    "case": "gqa4_b2_s1024_hq32_hkv8",
+    "batch": 2,
+    "seqlen": 1024,
+    "variant": "epi_fast",
+    "forced_splits": null,
+    "cosine_vs_fa4": 0.9877440929412842,
+    "total_us": 20.779420000000002,
+    "vs_fa4": 1.8969363349217654,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8_None__0",
+        "launches": 50,
+        "grid": [
+          16,
+          1,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 223232,
+        "us_per_iter": 20.779420000000002,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b8_s1024_hq32_hkv8",
+    "batch": 8,
+    "seqlen": 1024,
+    "variant": "epi_fast",
+    "forced_splits": null,
+    "cosine_vs_fa4": 0.9870539903640747,
+    "total_us": 21.191080000000003,
+    "vs_fa4": 1.4241336345882178,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8_None__0",
+        "launches": 50,
+        "grid": [
+          64,
+          1,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 223232,
+        "us_per_iter": 21.191080000000003,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 1024,
+    "variant": "epi_fast",
+    "forced_splits": null,
+    "cosine_vs_fa4": 0.9873458743095398,
+    "total_us": 21.67538,
+    "vs_fa4": 1.348731312543012,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8_None__0",
+        "launches": 50,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 223232,
+        "us_per_iter": 21.67538,
+        "launches_per_iter": 1.0
+      }
+    ]
+  }
+]

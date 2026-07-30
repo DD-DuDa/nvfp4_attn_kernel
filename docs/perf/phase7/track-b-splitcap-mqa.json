@@ -1,0 +1,159 @@
+[
+  {
+    "case": "mqa_b32_s16384_hq32_hkv1",
+    "batch": 32,
+    "seqlen": 16384,
+    "heads_q": 32,
+    "heads_kv": 1,
+    "fp4_bytes": 75497472,
+    "fa4_bytes": 268435456,
+    "fa4_ms": 0.05627575000000001,
+    "fa4_tbps": 4.770002283399153,
+    "production_ms": 0.062045149999999966,
+    "production_tbps": 1.21681504517275,
+    "configs": [
+      {
+        "config": "free_baseline",
+        "cfg": {},
+        "status": "ok",
+        "smem_kb": [
+          175.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 4,
+          "default_kv_stage": 4,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.022600049999999917,
+        "decode_ms": 0.019883199999999927,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o321112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o32i64div4i64div41i64div128i64div_0": 0.019883199999999927,
+          "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0": 0.002716849999999988
+        },
+        "tbps": 3.3405887155117036,
+        "vs_fa4": 2.4900719246196457
+      },
+      {
+        "config": "free_s4_kv6",
+        "cfg": {
+          "softmax": "free",
+          "splits": 4,
+          "kv_stage": 6
+        },
+        "status": "ok",
+        "smem_kb": [
+          195.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 6,
+          "default_kv_stage": 4,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.022223900000000022,
+        "decode_ms": 0.019499200000000008,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o321112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o32i64div4i64div41i64div128i64div_0": 0.019499200000000008,
+          "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0": 0.002724700000000013
+        },
+        "tbps": 3.3971297567033654,
+        "vs_fa4": 2.5322175675736465
+      },
+      {
+        "config": "free_s4_kv8",
+        "cfg": {
+          "softmax": "free",
+          "splits": 4,
+          "kv_stage": 8
+        },
+        "status": "ok",
+        "smem_kb": [
+          215.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 8,
+          "default_kv_stage": 4,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.022193600000000015,
+        "decode_ms": 0.01947364999999999,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o321112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o32i64div4i64div41i64div128i64div_0": 0.01947364999999999,
+          "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0": 0.0027199500000000226
+        },
+        "tbps": 3.4017677168192613,
+        "vs_fa4": 2.535674699012327
+      },
+      {
+        "config": "free_s8_kv8",
+        "cfg": {
+          "softmax": "free",
+          "splits": 8,
+          "kv_stage": 8
+        },
+        "status": "ok",
+        "smem_kb": [
+          215.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 8,
+          "default_kv_stage": 4,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.02892645000000004,
+        "decode_ms": 0.02578245000000002,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o321112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o32i64div4i64div41i64div128i64div_0": 0.02578245000000002,
+          "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0": 0.0031440000000000226
+        },
+        "tbps": 2.6099805541295216,
+        "vs_fa4": 1.9454772362318893
+      },
+      {
+        "config": "full_s4_kv8",
+        "cfg": {
+          "softmax": "full",
+          "splits": 4,
+          "kv_stage": 8
+        },
+        "cosine_vs_fa4": 0.9876270890235901,
+        "status": "ok",
+        "smem_kb": [
+          215.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 8,
+          "default_kv_stage": 4,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.06208775000000002,
+        "decode_ms": 0.05936445,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o321112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o32i64div4i64div41i64div128i64div_0": 0.05936445,
+          "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0": 0.0027233000000000175
+        },
+        "tbps": 1.215980157116339,
+        "vs_fa4": 0.9063905520815297
+      }
+    ]
+  }
+]

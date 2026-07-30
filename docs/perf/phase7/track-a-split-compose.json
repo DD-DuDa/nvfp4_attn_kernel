@@ -1,0 +1,386 @@
+[
+  {
+    "case": "gqa4_b1_s1024_hq32_hkv8",
+    "batch": 1,
+    "seqlen": 1024,
+    "variant": "prod_split8",
+    "forced_splits": 8,
+    "cosine_vs_fa4": 0.9877465963363647,
+    "total_us": 12.196519999999996,
+    "vs_fa4": 1.186173440806672,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div_0",
+        "launches": 50,
+        "grid": [
+          1,
+          64,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 9.261459999999994,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.9350600000000013,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b1_s1024_hq32_hkv8",
+    "batch": 1,
+    "seqlen": 1024,
+    "variant": "epi_fast_split2",
+    "forced_splits": 2,
+    "cosine_vs_fa4": 0.9876671433448792,
+    "total_us": 13.148160000000006,
+    "vs_fa4": 1.278725258309474,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          16,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 10.837120000000006,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.3110399999999998,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b1_s1024_hq32_hkv8",
+    "batch": 1,
+    "seqlen": 1024,
+    "variant": "epi_fast_split4",
+    "forced_splits": 4,
+    "cosine_vs_fa4": 0.9876785278320312,
+    "total_us": 10.161919999999999,
+    "vs_fa4": 0.988298269637744,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          32,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 7.704919999999998,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.4570000000000007,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b1_s1024_hq32_hkv8",
+    "batch": 1,
+    "seqlen": 1024,
+    "variant": "epi_fast_split8",
+    "forced_splits": 8,
+    "cosine_vs_fa4": 0.9877465963363647,
+    "total_us": 9.052120000000006,
+    "vs_fa4": 0.8803645898170053,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          64,
+          1
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 6.119640000000004,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.932480000000001,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 1024,
+    "variant": "prod_split8",
+    "forced_splits": 8,
+    "cosine_vs_fa4": 0.9874681830406189,
+    "total_us": 61.69315999999998,
+    "vs_fa4": 3.825932403100774,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div_0",
+        "launches": 50,
+        "grid": [
+          1,
+          64,
+          16
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 58.62429999999998,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          16
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 3.0688600000000004,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 1024,
+    "variant": "epi_fast_split2",
+    "forced_splits": 2,
+    "cosine_vs_fa4": 0.9873733520507812,
+    "total_us": 23.52714,
+    "vs_fa4": 1.459047441860465,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          16,
+          16
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 21.07912,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          16
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.448020000000001,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 1024,
+    "variant": "epi_fast_split4",
+    "forced_splits": 4,
+    "cosine_vs_fa4": 0.987396240234375,
+    "total_us": 29.95073999999999,
+    "vs_fa4": 1.8574102325581388,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          32,
+          16
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 27.310759999999988,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          16
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 2.6399800000000004,
+        "launches_per_iter": 1.0
+      }
+    ]
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "batch": 16,
+    "seqlen": 1024,
+    "variant": "epi_fast_split8",
+    "forced_splits": 8,
+    "cosine_vs_fa4": 0.9874681830406189,
+    "total_us": 39.57372000000001,
+    "vs_fa4": 2.454184186046512,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel___main__EpilogueProbeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrf32gmemalign16o4i64div4i64div41i64div16i64div4i64div4_0",
+        "launches": 50,
+        "grid": [
+          1,
+          64,
+          16
+        ],
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "registers": 128,
+        "smem": 179200,
+        "us_per_iter": 36.514520000000005,
+        "launches_per_iter": 1.0
+      },
+      {
+        "name": "kernel_cutlass_kernel_nvfp4_decode_kernelsplit_k_combineFlashAttentionForwardCombine_object_at__tensorptrf32gmemalign16oi64div41i64div4i64div4i64div4_tensorptrf32gmemalign16oi64i641i64_te_0",
+        "launches": 50,
+        "grid": [
+          4,
+          1,
+          16
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "registers": 34,
+        "smem": 17536,
+        "us_per_iter": 3.059200000000002,
+        "launches_per_iter": 1.0
+      }
+    ]
+  }
+]

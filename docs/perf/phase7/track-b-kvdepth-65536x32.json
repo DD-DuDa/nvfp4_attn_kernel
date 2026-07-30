@@ -1,0 +1,275 @@
+[
+  {
+    "case": "gqa4_b32_s65536_hq32_hkv8",
+    "batch": 32,
+    "seqlen": 65536,
+    "heads_q": 32,
+    "heads_kv": 8,
+    "fp4_bytes": 2415919104,
+    "fa4_bytes": 8589934592,
+    "fa4_ms": 1.3230655999999998,
+    "fa4_tbps": 6.492447987461848,
+    "production_ms": 2.10486335,
+    "production_tbps": 1.1477795477791943,
+    "configs": [
+      {
+        "config": "free_q1_kv2",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 2
+        },
+        "status": "ok",
+        "smem_kb": [
+          98.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 2,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.94244065,
+        "decode_ms": 0.94244065,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.94244065
+        },
+        "tbps": 2.5634708180297614,
+        "vs_fa4": 1.4038715329182796
+      },
+      {
+        "config": "free_q1_kv4",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 4
+        },
+        "status": "ok",
+        "smem_kb": [
+          118.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 4,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.5337539,
+        "decode_ms": 0.5337539,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.5337539
+        },
+        "tbps": 4.5262790660639665,
+        "vs_fa4": 2.4787933165453215
+      },
+      {
+        "config": "free_q1_kv6",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 6
+        },
+        "status": "ok",
+        "smem_kb": [
+          138.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 6,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.4312166000000001,
+        "decode_ms": 0.4312166000000001,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.4312166000000001
+        },
+        "tbps": 5.602565170264779,
+        "vs_fa4": 3.0682158339915473
+      },
+      {
+        "config": "free_q1_kv8",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 8
+        },
+        "status": "ok",
+        "smem_kb": [
+          158.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 8,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.4035300000000001,
+        "decode_ms": 0.4035300000000001,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.4035300000000001
+        },
+        "tbps": 5.986962813173739,
+        "vs_fa4": 3.278729214680444
+      },
+      {
+        "config": "free_q1_kv10",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 10
+        },
+        "status": "ok",
+        "smem_kb": [
+          178.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 10,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.3941039000000001,
+        "decode_ms": 0.3941039000000001,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.3941039000000001
+        },
+        "tbps": 6.130157818788393,
+        "vs_fa4": 3.3571492187720025
+      },
+      {
+        "config": "free_q1_kv12",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 12
+        },
+        "status": "ok",
+        "smem_kb": [
+          198.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 12,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.39703575000000013,
+        "decode_ms": 0.39703575000000013,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.39703575000000013
+        },
+        "tbps": 6.08489060242056,
+        "vs_fa4": 3.332358861890899
+      },
+      {
+        "config": "free_q1_kv14",
+        "cfg": {
+          "softmax": "free",
+          "q_stage1": true,
+          "kv_stage": 14
+        },
+        "status": "ok",
+        "smem_kb": [
+          218.0
+        ],
+        "setup": {
+          "q_stage": 1,
+          "kv_stage": 14,
+          "default_kv_stage": 14,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 384
+        },
+        "kernel_ms": 0.39727785000000004,
+        "decode_ms": 0.39727785000000004,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.39727785000000004
+        },
+        "tbps": 6.0811824872693,
+        "vs_fa4": 3.330328131810016
+      },
+      {
+        "config": "free_q1_kv16",
+        "cfg": {
+          "q_stage1": true,
+          "kv_stage": 16
+        },
+        "status": "failed",
+        "error": "AssertionError: SharedStorage 238KB exceeds 227KB limit. Reduce kv_stage (currently 16).",
+        "traceback_tail": "Traceback (most recent call last):\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/tests/kernel_profile/probe_bandwidth_headroom.py\", line 254, in measure_config\n    output = run()\n             ^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/tests/kernel_profile/bench_decode.py\", line 273, in run_prequantized\n    return fp4_decode(\n           ^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/src/nvfp4_decode_kernel/interface.py\", line 96, in fp4_decode\n    return fp4_decode_impl(\n           ^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/src/nvfp4_decode_kernel/_kernel.py\", line 140, in fp4_decode_impl\n    return decode_fp4(\n           ^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/src/nvfp4_decode_kernel/_decode.py\", line 796, in decode_fp4\n    compiled = _compile_decode(\n               ^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/src/nvfp4_decode_kernel/_decode.py\", line 369, in _compile_decode\n    compiled = cute.compile(\n               ^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/compiler.py\", line 1250, in __call__\n    return self._compile(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/compiler.py\", line 1400, in _compile\n    return func._dsl_object._func(func, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py\", line 2680, in _func\n    return self._func_impl(funcBody, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py\", line 2693, in _func_impl\n    result = self.generate_mlir(\n             ^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py\", line 2223, in generate_mlir\n    module, module_hash, result = self.generate_original_ir(\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py\", line 1894, in generate_original_ir\n    module, result = build_ir_module()\n                     ^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py\", line 1855, in build_ir_module\n    result = funcBody(*ir_args, **ir_kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/nvfp4_attn_kernel/src/nvfp4_decode_kernel/fp4_decode_kernel.py\", line 1371, in __call__\n    assert total_smem_bytes <= 227 * 1024, (\n  File \"/apdcephfs_wzc1/share_303541817/hunyuan/dayoudu/dev/BitKV_nvfp4/_local/envs/vllm-nvfp4/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/ast_helpers.py\", line 455, in assert_executor\n    assert test, msg\n           ^^^^\nAssertionError: SharedStorage 238KB exceeds 227KB limit. Reduce kv_stage (currently 16).\n"
+      },
+      {
+        "config": "free_kv6",
+        "cfg": {
+          "kv_stage": 6
+        },
+        "status": "ok",
+        "smem_kb": [
+          148.0
+        ],
+        "setup": {
+          "q_stage": 2,
+          "kv_stage": 6,
+          "default_kv_stage": 13,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 512
+        },
+        "kernel_ms": 0.4877833500000001,
+        "decode_ms": 0.4877833500000001,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.4877833500000001
+        },
+        "tbps": 4.952852744973766,
+        "vs_fa4": 2.7124041851777014
+      },
+      {
+        "config": "free_kv10",
+        "cfg": {
+          "kv_stage": 10
+        },
+        "status": "ok",
+        "smem_kb": [
+          188.0
+        ],
+        "setup": {
+          "q_stage": 2,
+          "kv_stage": 10,
+          "default_kv_stage": 13,
+          "epi_stage": 2,
+          "n_block_size": 128,
+          "m_block_size": 128,
+          "tmem_total": 512
+        },
+        "kernel_ms": 0.4368771500000001,
+        "decode_ms": 0.4368771500000001,
+        "breakdown": {
+          "kernel_cutlass_kernel___main__BandwidthProbeConfigured_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8__0": 0.4368771500000001
+        },
+        "tbps": 5.529973595551975,
+        "vs_fa4": 3.0284614336089666
+      }
+    ]
+  }
+]

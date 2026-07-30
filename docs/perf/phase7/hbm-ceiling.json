@@ -1,0 +1,86 @@
+[
+  {
+    "pattern": "triton_stream_read_block2048",
+    "gib": 16.0,
+    "ms": 2.2699743270874024,
+    "tbps": 7.56830990509194
+  },
+  {
+    "pattern": "triton_stream_read_block4096",
+    "gib": 16.0,
+    "ms": 2.2653680801391602,
+    "tbps": 7.583698796949876
+  },
+  {
+    "pattern": "triton_stream_read_block8192",
+    "gib": 16.0,
+    "ms": 2.2650224685668947,
+    "tbps": 7.584855966073439
+  },
+  {
+    "pattern": "contiguous_f32_sum",
+    "gib": 16.0,
+    "ms": 2.635152053833008,
+    "tbps": 6.519498242619704
+  },
+  {
+    "pattern": "two_contiguous_f32_sums",
+    "gib": 16.0,
+    "ms": 2.6386159896850585,
+    "tbps": 6.510939542229699
+  },
+  {
+    "pattern": "fp4_k_all_heads",
+    "gib": 4.0,
+    "ms": 0.6594528198242188,
+    "tbps": 6.512925818021143
+  },
+  {
+    "pattern": "fp4_k_one_head_64B_of_512B",
+    "gib": 0.5,
+    "ms": 0.30638720989227297,
+    "tbps": 1.7522628055811014
+  },
+  {
+    "pattern": "control_contiguous_same_bytes_as_one_head",
+    "gib": 0.5,
+    "ms": 0.09427040219306945,
+    "tbps": 5.695010305572553
+  },
+  {
+    "pattern": "fp4_v_all_heads",
+    "gib": 4.0,
+    "ms": 0.6596479892730713,
+    "tbps": 6.5109988446004845
+  },
+  {
+    "pattern": "fp4_v_one_head_8KB_of_64KB",
+    "gib": 0.5,
+    "ms": 0.30880959033966066,
+    "tbps": 1.7385176134248095
+  },
+  {
+    "pattern": "scales_all_heads",
+    "gib": 0.5,
+    "ms": 0.09457119703292846,
+    "tbps": 5.67689665398936
+  },
+  {
+    "pattern": "scales_one_head_1KB_of_8KB",
+    "gib": 0.0625,
+    "ms": 0.04445280134677887,
+    "tbps": 1.5096655771248222
+  },
+  {
+    "pattern": "control_contiguous_same_bytes_as_scales_one_head",
+    "gib": 0.0625,
+    "ms": 0.014814400672912597,
+    "tbps": 4.529974953539988
+  },
+  {
+    "pattern": "decode_footprint_all_four_tensors",
+    "gib": 9.0,
+    "ms": 1.5068016052246094,
+    "tbps": 6.413370136116557
+  }
+]

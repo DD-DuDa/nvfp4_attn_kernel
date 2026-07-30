@@ -1,0 +1,58 @@
+kernel   kernel_cutlass_kernel___main__NonPersistentKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64div81i64div32i64div8_None__0
+grid     (1, 8, 1)  ->  8 CTAs, 8 traced
+spread   8 SMs used, max 1 CTA/SM
+wall     24.74us (first warp start to last warp end)
+
+WARP LIFETIME BY ROLE  (aggregate work, not critical path)
+  role    warps  total     mean     max      envelope  end timestamp
+  ------  -----  --------  -------  -------  --------  ------------------------
+  warp0   8      195.71us  24.46us  24.61us  24.70us   24.74us  <== launch tail
+  warp13  8      194.98us  24.37us  24.51us  24.61us   24.64us
+  warp12  8      169.47us  21.18us  21.31us  21.41us   21.44us
+  warp9   8      167.68us  20.96us  21.06us  21.22us   21.22us
+  warp8   8      167.55us  20.94us  21.06us  21.22us   21.22us
+  warp10  8      167.52us  20.94us  21.06us  21.18us   21.22us
+  warp11  8      167.36us  20.92us  21.06us  21.15us   21.18us
+  warp4   8      162.56us  20.32us  20.42us  20.54us   20.58us
+  warp5   8      162.27us  20.28us  20.35us  20.51us   20.54us
+  warp7   8      162.24us  20.28us  20.42us  20.58us   20.61us
+  warp6   8      162.14us  20.27us  20.35us  20.58us   20.61us
+  warp3   8      158.72us  19.84us  19.97us  20.06us   20.10us
+  warp2   8      158.66us  19.83us  19.94us  20.06us   20.10us
+  warp1   8      158.62us  19.83us  19.94us  20.06us   20.10us
+  warp14  8      40.26us   5.03us   5.09us   5.25us    5.28us
+  warp15  8      8.19us    1.02us   1.06us   1.25us    1.28us
+
+RANGE TIME  (pct is of that role's total warp lifetime)
+  role    range          count  total     mean     pct
+  ------  -------------  -----  --------  -------  -----
+  warp13  epi_life       8      186.94us  23.37us  95.9%
+  warp13  epi_main       8      186.56us  23.32us  95.7%
+  warp12  mma_life       8      161.15us  20.14us  95.1%
+  warp10  corr_life      8      159.65us  19.96us  95.3%
+  warp8   corr_life      8      159.52us  19.94us  95.2%
+  warp11  corr_life      8      159.49us  19.94us  95.3%
+  warp9   corr_life      8      159.46us  19.93us  95.1%
+  warp10  corr_main      8      159.14us  19.89us  95.0%
+  warp11  corr_main      8      159.07us  19.88us  95.0%
+  warp8   corr_main      8      158.98us  19.87us  94.9%
+  warp9   corr_main      8      158.98us  19.87us  94.8%
+  warp13  epi_wait_corr  16     155.42us  9.71us   79.7%
+
+Nested ranges overlap, so percentages may exceed 100%. A role whose wait
+range dominates its lifetime is starved by its producer; a producer that
+waits is blocked by slow consumers.
+
+launch 1 kernel_cutlass_kernel___main__NonPersistentKernel_object_at_ grid=(1,8,1)
+
+warp lifetimes on cta 0
+  warp13  sm146      0.032 ->    24.352 us   (  24.320 us)
+
+ranges in time order (us from first warp start)
+      0.800 ->    24.192  (  23.392)  warp13  epi_life
+      0.832 ->    24.160  (  23.328)  warp13  epi_life
+      0.832 ->    24.192  (  23.360)  warp13  epi_life
+      0.864 ->    24.160  (  23.296)  warp13  epi_main
+      0.864 ->    24.160  (  23.296)  warp13  epi_main
+      0.864 ->    24.224  (  23.360)  warp13  epi_life
+  ... 26 more

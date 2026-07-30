@@ -1,0 +1,124 @@
+[
+  {
+    "case": "gqa4_b1_s1024_hq32_hkv8",
+    "pages_per_row": 8,
+    "chosen_by_heuristic": 1,
+    "splits": {
+      "1": {
+        "graph_us": 42.13759899139404,
+        "error": "",
+        "cosine_vs_unsplit": 1.0
+      },
+      "2": {
+        "graph_us": 16.48319959640503,
+        "error": "",
+        "cosine_vs_unsplit": 0.9996116161346436
+      },
+      "4": {
+        "graph_us": 12.460800260305405,
+        "error": "",
+        "cosine_vs_unsplit": 0.9994040727615356
+      },
+      "8": {
+        "graph_us": 10.444799810647964,
+        "error": "",
+        "cosine_vs_unsplit": 0.9993039965629578
+      }
+    },
+    "fa4_graph_us": 12.39200010895729
+  },
+  {
+    "case": "gqa4_b4_s1024_hq32_hkv8",
+    "pages_per_row": 8,
+    "chosen_by_heuristic": 1,
+    "splits": {
+      "1": {
+        "graph_us": 43.25279891490936,
+        "error": "",
+        "cosine_vs_unsplit": 1.0
+      },
+      "2": {
+        "graph_us": 16.56160056591034,
+        "error": "",
+        "cosine_vs_unsplit": 0.9995409250259399
+      },
+      "4": {
+        "graph_us": 12.535999715328217,
+        "error": "",
+        "cosine_vs_unsplit": 0.9993504285812378
+      },
+      "8": {
+        "graph_us": 18.6831995844841,
+        "error": "",
+        "cosine_vs_unsplit": 0.9992271065711975
+      }
+    },
+    "fa4_graph_us": 14.43839967250824
+  },
+  {
+    "case": "gqa4_b16_s1024_hq32_hkv8",
+    "pages_per_row": 8,
+    "chosen_by_heuristic": 1,
+    "splits": {
+      "1": {
+        "graph_us": 43.84639859199524,
+        "error": "",
+        "cosine_vs_unsplit": 1.0
+      },
+      "2": {
+        "graph_us": 28.82080078125,
+        "error": "",
+        "cosine_vs_unsplit": 0.999567985534668
+      },
+      "4": {
+        "graph_us": 41.203200817108154,
+        "error": "",
+        "cosine_vs_unsplit": 0.9993589520454407
+      },
+      "8": {
+        "graph_us": 59.52640175819397,
+        "error": "",
+        "cosine_vs_unsplit": 0.9992338418960571
+      }
+    },
+    "fa4_graph_us": 18.353599309921265
+  },
+  {
+    "case": "gqa4_b1_s4096_hq32_hkv8",
+    "pages_per_row": 32,
+    "chosen_by_heuristic": 4,
+    "splits": {
+      "1": {
+        "graph_us": 90.42559862136841,
+        "error": "",
+        "cosine_vs_unsplit": 1.0
+      },
+      "2": {
+        "graph_us": 35.046398639678955,
+        "error": "",
+        "cosine_vs_unsplit": 0.9995322227478027
+      },
+      "4": {
+        "graph_us": 22.74080067873001,
+        "error": "",
+        "cosine_vs_unsplit": 0.9992769956588745
+      },
+      "8": {
+        "graph_us": 16.572800278663635,
+        "error": "",
+        "cosine_vs_unsplit": 0.9992243051528931
+      },
+      "16": {
+        "graph_us": 12.561599910259247,
+        "error": "",
+        "cosine_vs_unsplit": 0.9991567134857178
+      },
+      "32": {
+        "graph_us": 20.084799826145172,
+        "error": "",
+        "cosine_vs_unsplit": 0.9991324543952942
+      }
+    },
+    "fa4_graph_us": 16.067199409008026
+  }
+]

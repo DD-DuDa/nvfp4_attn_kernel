@@ -1,0 +1,98 @@
+kernel   kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP4DecodeKernel_object_at__tensor00000o41112101314_tensor0000o11101213_tensor0000o11101213_tensorptrbf16gmemalign16o4i64div8i64di_0
+grid     (8, 1, 1)  ->  8 CTAs, 8 traced
+spread   8 SMs used, max 1 CTA/SM
+wall     42.34us (first warp start to last warp end)
+
+WARP LIFETIME BY ROLE  (aggregate work, not critical path)
+  role    warps  total     mean     max      envelope  end timestamp
+  ------  -----  --------  -------  -------  --------  ------------------------
+  warp0   8      320.80us  40.10us  42.14us  42.34us   42.34us  <== launch tail
+  warp13  8      320.64us  40.08us  42.11us  42.30us   42.30us
+  warp12  8      172.19us  21.52us  21.66us  21.82us   21.82us
+  warp9   8      169.86us  21.23us  21.44us  21.54us   21.54us
+  warp10  8      169.60us  21.20us  21.44us  21.54us   21.54us
+  warp11  8      169.38us  21.17us  21.31us  21.50us   21.50us
+  warp8   8      169.09us  21.14us  21.28us  21.44us   21.44us
+  warp7   8      164.93us  20.62us  20.80us  20.90us   20.90us
+  warp4   8      164.86us  20.61us  20.77us  20.86us   20.86us
+  warp5   8      164.86us  20.61us  20.77us  20.86us   20.86us
+  warp6   8      164.86us  20.61us  20.74us  20.90us   20.90us
+  warp1   8      161.22us  20.15us  20.32us  20.51us   20.51us
+  warp3   8      161.06us  20.13us  20.26us  20.42us   20.45us
+  warp2   8      160.93us  20.12us  20.26us  20.38us   20.42us
+  warp14  8      43.42us   5.43us   5.54us   5.66us    5.66us
+  warp15  8      8.29us    1.04us   1.09us   1.28us    1.28us
+
+RANGE TIME  (pct is of that role's total warp lifetime)
+  role    range          count  total     mean     pct
+  ------  -------------  -----  --------  -------  -----
+  warp13  epi_life       8      311.49us  38.94us  97.1%
+  warp13  epi_main       8      310.98us  38.87us  97.0%
+  warp12  mma_life       8      163.81us  20.48us  95.1%
+  warp9   corr_life      8      161.66us  20.21us  95.2%
+  warp10  corr_life      8      161.63us  20.20us  95.3%
+  warp11  corr_life      8      161.54us  20.19us  95.4%
+  warp9   corr_main      8      161.25us  20.16us  94.9%
+  warp10  corr_main      8      161.25us  20.16us  95.1%
+  warp11  corr_main      8      161.06us  20.13us  95.1%
+  warp8   corr_life      8      160.93us  20.12us  95.2%
+  warp8   corr_main      8      160.64us  20.08us  95.0%
+  warp6   softmax_life   8      156.54us  19.57us  95.0%
+  warp7   softmax_life   8      156.54us  19.57us  94.9%
+  warp4   softmax_life   8      156.32us  19.54us  94.8%
+  warp5   softmax_life   8      156.32us  19.54us  94.8%
+  warp13  epi_wait_corr  16     155.90us  9.74us   48.6%
+  warp0   softmax_life   8      153.22us  19.15us  47.8%
+  warp3   softmax_life   8      152.83us  19.10us  94.9%
+  warp1   softmax_life   8      152.74us  19.09us  94.7%
+  warp2   softmax_life   8      152.61us  19.08us  94.8%
+  warp9   corr_wait_sm   136    137.60us  1.01us   81.0%
+  warp11  corr_wait_sm   136    137.54us  1.01us   81.2%
+  warp10  corr_wait_sm   136    137.50us  1.01us   81.1%
+  warp8   corr_wait_sm   136    136.58us  1.00us   80.8%
+  warp12  mma_wait_p     128    116.29us  908ns    67.5%
+
+Nested ranges overlap, so percentages may exceed 100%. A role whose wait
+range dominates its lifetime is starved by its producer; a producer that
+waits is blocked by slow consumers.
+
+launch 1 kernel_cutlass_kernel_nvfp4_decode_kernelfp4_decode_kernelFP grid=(8,1,1)
+
+warp lifetimes on cta 0
+  warp0   sm142      0.192 ->    39.488 us   (  39.296 us)
+  warp8   sm142      0.192 ->    21.440 us   (  21.248 us)
+  warp12  sm142      0.192 ->    21.824 us   (  21.632 us)
+  warp13  sm142      0.192 ->    39.456 us   (  39.264 us)
+  warp14  sm142      0.192 ->     5.664 us   (   5.472 us)
+  warp15  sm142      0.192 ->     1.280 us   (   1.088 us)
+
+ranges in time order (us from first warp start)
+  ... 139 more
+ranges in time order (us from first warp start)
+      1.024 ->    39.104  (  38.080)  warp13  epi_life
+      1.088 ->    39.072  (  37.984)  warp13  epi_main
+      1.120 ->    21.344  (  20.224)  warp8   corr_life
+      1.152 ->    21.312  (  20.160)  warp8   corr_main
+      1.408 ->     3.168  (   1.760)  warp8   corr_wait_sm
+      1.696 ->    20.992  (  19.296)  warp13  epi_wait_corr
+      3.232 ->     4.928  (   1.696)  warp8   corr_wait_sm
+      5.056 ->     5.376  (   0.320)  warp8   corr_wait_sm
+      5.568 ->     7.264  (   1.696)  warp8   corr_wait_sm
+      7.360 ->     7.680  (   0.320)  warp8   corr_wait_sm
+      7.808 ->     9.504  (   1.696)  warp8   corr_wait_sm
+      9.600 ->     9.920  (   0.320)  warp8   corr_wait_sm
+     10.016 ->    11.744  (   1.728)  warp8   corr_wait_sm
+     11.840 ->    12.160  (   0.320)  warp8   corr_wait_sm
+     12.256 ->    13.984  (   1.728)  warp8   corr_wait_sm
+     14.080 ->    14.400  (   0.320)  warp8   corr_wait_sm
+     14.528 ->    16.224  (   1.696)  warp8   corr_wait_sm
+     16.320 ->    16.640  (   0.320)  warp8   corr_wait_sm
+     16.768 ->    18.464  (   1.696)  warp8   corr_wait_sm
+     18.592 ->    18.912  (   0.320)  warp8   corr_wait_sm
+     19.072 ->    20.224  (   1.152)  warp8   corr_wait_sm
+     20.256 ->    20.320  (   0.064)  warp8   corr_wait_o
+     20.320 ->    20.544  (   0.224)  warp8   corr_wait_epi
+     20.896 ->    20.928  (   0.032)  warp8   corr_wait_sm
+     20.960 ->    20.992  (   0.032)  warp8   corr_wait_o
+     20.992 ->    21.024  (   0.032)  warp8   corr_wait_epi
+     32.256 ->    32.448  (   0.192)  warp13  epi_wait_corr
