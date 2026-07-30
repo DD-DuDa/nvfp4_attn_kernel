@@ -158,7 +158,6 @@ class FP4DecodeKernel:
         self.softmax_row_groups = 1
         self.softmax_rows_per_group = 0
         self.softmax_red_slots = 0
-        self.softmax_seed_offset = 0
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -649,9 +648,10 @@ class FP4DecodeKernel:
             # nothing to do. Handing it half the query rows halves the
             # butterfly, the exponentials and the packing every thread runs,
             # while the two groups write disjoint rows of P and of the scales.
-            # The residual block seeds the online softmax from a BF16 tile that
-            # is not transposed, and only one warpgroup may drive it, so the
-            # split stays off while a residual is fused.
+            # The residual block clears a P tile that both groups would write,
+            # and the per-group reduction barrier cannot order one group's
+            # clear against the other's stores, so the split stays off while a
+            # residual is fused.
             self.softmax_row_groups = (
                 2
                 if self.q_stage == 1
@@ -662,15 +662,11 @@ class FP4DecodeKernel:
             self.softmax_rows_per_group = (
                 self.transposed_query_rows // self.softmax_row_groups
             )
-            # Two buffers per warp per row for the row reductions, then, when a
-            # residual is fused, a maximum and a sum per row to carry the seed
-            # across the change of orientation.
+            # Two buffers per warp per row, so a single named barrier per KV
+            # block suffices for the row reductions.
             self.softmax_red_slots = (
                 2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
             )
-            self.softmax_seed_offset = self.softmax_red_slots
-            if const_expr(self.fused_residual_first_block):
-                self.softmax_red_slots += 2 * self.transposed_query_rows
 
         # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
@@ -1131,10 +1127,13 @@ class FP4DecodeKernel:
             res_v_dtype = mResV.element_type   # cutlass.BFloat16
             res_k_major = cutlass.utils.LayoutEnum.from_tensor(mResK).mma_major_mode()
             res_v_major = cutlass.utils.LayoutEnum.from_tensor(mResV).mma_major_mode()
+            # The residual follows the FP4 blocks' orientation so that both write
+            # the same tensor-memory tile the same way round and one softmax
+            # reads them. Transposed, K is the A operand and Q the B operand.
             tiled_mma_qk_bf16 = sm100_utils_basic.make_trivial_tiled_mma(
                 res_k_dtype,
-                self.q_major_mode,
-                res_k_major,
+                res_k_major if const_expr(self.transpose_s) else self.q_major_mode,
+                self.q_major_mode if const_expr(self.transpose_s) else res_k_major,
                 self.qk_acc_dtype,
                 self.cta_group,
                 self.mma_tiler_qk[:2],
@@ -1146,12 +1145,15 @@ class FP4DecodeKernel:
                 self.pv_acc_dtype,
                 self.cta_group,
                 self.mma_tiler_pv[:2],
-                # The residual block is not transposed, so its P is a register
-                # fragment staged through tensor memory whatever the FP4 P does.
-                tcgen05.OperandSource.TMEM,
+                p_source,
             )
             # SMEM layouts for BF16 residual K/V (single stage — block 0 only).
-            sK_bf16_layout = sm100_utils_basic.make_smem_layout_b(
+            make_k_bf16_smem_layout = (
+                sm100_utils_basic.make_smem_layout_a
+                if const_expr(self.transpose_s)
+                else sm100_utils_basic.make_smem_layout_b
+            )
+            sK_bf16_layout = make_k_bf16_smem_layout(
                 tiled_mma_qk_bf16,
                 self.mma_tiler_qk,
                 res_k_dtype,
@@ -1170,7 +1172,12 @@ class FP4DecodeKernel:
                 1,
             )
             # TMA atoms for BF16 residual K/V.
-            tma_atom_K_bf16, mResidualK_t = cute.nvgpu.make_tiled_tma_atom_B(
+            make_k_bf16_tma_atom = (
+                cute.nvgpu.make_tiled_tma_atom_A
+                if const_expr(self.transpose_s)
+                else cute.nvgpu.make_tiled_tma_atom_B
+            )
+            tma_atom_K_bf16, mResidualK_t = make_k_bf16_tma_atom(
                 tma_load_op,
                 mResK,
                 cute.select(sK_bf16_layout, mode=[0, 1, 2]),
@@ -1208,13 +1215,23 @@ class FP4DecodeKernel:
                     cute.make_layout(shape_ResQ_packed, stride=stride_ResQ_packed),
                 )
             res_q_dtype = mResQ.element_type   # cutlass.BFloat16
-            sQ_bf16_layout = sm100_utils_basic.make_smem_layout_a(
+            make_q_bf16_smem_layout = (
+                sm100_utils_basic.make_smem_layout_b
+                if const_expr(self.transpose_s)
+                else sm100_utils_basic.make_smem_layout_a
+            )
+            sQ_bf16_layout = make_q_bf16_smem_layout(
                 tiled_mma_qk_bf16,
                 self.mma_tiler_qk,
                 res_q_dtype,
                 1,
             )
-            tma_atom_Q_bf16, mResidualQ_t = cute.nvgpu.make_tiled_tma_atom_A(
+            make_q_bf16_tma_atom = (
+                cute.nvgpu.make_tiled_tma_atom_B
+                if const_expr(self.transpose_s)
+                else cute.nvgpu.make_tiled_tma_atom_A
+            )
+            tma_atom_Q_bf16, mResidualQ_t = make_q_bf16_tma_atom(
                 tma_load_op,
                 mResQ,
                 cute.select(sQ_bf16_layout, mode=[0, 1, 2]),
@@ -1502,8 +1519,14 @@ class FP4DecodeKernel:
         sV_bf16_smem_size = (
             cute.cosize(sV_bf16_layout) if const_expr(self.fused_residual_first_block) else 1
         )
+        # Transposed, the residual's P also reaches the tensor core from shared
+        # memory. It is the same 128x128 of bf16 as the residual Q tile and the
+        # QK GEMM, whose completion softmax waits on before writing P, is
+        # exactly when that tile dies, so the two share the bytes.
         sQ_bf16_smem_size = (
-            cute.cosize(sQ_bf16_layout) if const_expr(self.fused_residual_first_block) else 1
+            max(cute.cosize(sQ_bf16_layout), cute.cosize(tP_bf16_layout))
+            if const_expr(self.fused_residual_first_block)
+            else 1
         )
 
         @cute.struct
@@ -1998,10 +2021,23 @@ class FP4DecodeKernel:
 
         sK_bf16 = None
         sV_bf16 = None
+        sP_bf16 = None
+        sP_bf16_mk = None
         if const_expr(self.fused_residual_first_block):
             sK_bf16 = storage.sK_bf16.get_tensor(sK_bf16_layout.outer, swizzle=sK_bf16_layout.inner)
             sV_bf16 = storage.sV_bf16.get_tensor(sV_bf16_layout.outer, swizzle=sV_bf16_layout.inner)
             sQ_bf16 = storage.sQ_bf16.get_tensor(sQ_bf16_layout.outer, swizzle=sQ_bf16_layout.inner)
+            if const_expr(self.transpose_s):
+                sP_bf16 = storage.sQ_bf16.get_tensor(
+                    tP_bf16_layout.outer, swizzle=tP_bf16_layout.inner
+                )
+                # The softmax writes one query row at a time down its own kv
+                # column, so it wants the plain (query row, kv) view of the
+                # operand layout rather than its atom decomposition.
+                sP_bf16_mk = cute.composition(
+                    sP_bf16[None, None, None, 0],
+                    cute.make_layout((self.m_block_size, self.n_block_size)),
+                )
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_qk_bf16 = tiled_mma_qk_bf16.get_slice(0) if const_expr(self.bf16_q_input) else None
@@ -2073,17 +2109,21 @@ class FP4DecodeKernel:
         tOrPs_bf16 = (None, None)
         if const_expr(self.fused_residual_first_block):
             thr_mma_pv_bf16 = tiled_mma_pv_bf16.get_slice(0)
-            tP_bf16 = cute.make_tensor(tStS.iterator, tP_bf16_layout.outer)
-            tOrP_bf16 = thr_mma_pv_bf16.make_fragment_A(tP_bf16)[None, None, None, 0]
-            tOrPs_bf16 = tuple(
-                cute.make_tensor(
-                    tOrP_bf16.iterator
-                    + self.qk_acc_dtype.width // tOrP_bf16._dtype.width
-                    * self.tmem_p_bf16_offset[stage],
-                    tOrP_bf16.layout,
+            if const_expr(self.transpose_s):
+                tOrP_bf16 = thr_mma_pv_bf16.make_fragment_A(sP_bf16)[None, None, None, 0]
+                tOrPs_bf16 = (tOrP_bf16, tOrP_bf16)
+            else:
+                tP_bf16 = cute.make_tensor(tStS.iterator, tP_bf16_layout.outer)
+                tOrP_bf16 = thr_mma_pv_bf16.make_fragment_A(tP_bf16)[None, None, None, 0]
+                tOrPs_bf16 = tuple(
+                    cute.make_tensor(
+                        tOrP_bf16.iterator
+                        + self.qk_acc_dtype.width // tOrP_bf16._dtype.width
+                        * self.tmem_p_bf16_offset[stage],
+                        tOrP_bf16.layout,
+                    )
+                    for stage in range(2)
                 )
-                for stage in range(2)
-            )
         # Setup scale factor TMEM tensors and S2T copy operations
         # Use the TMEM region immediately following the accumulator (O tensor)
 
@@ -2314,6 +2354,7 @@ class FP4DecodeKernel:
                 mResidualSeqUsedK=mResidualSeqUsedK,
                 tOrPs_bf16=tOrPs_bf16,
                 sP=sP,
+                sP_bf16=sP_bf16,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -2381,6 +2422,8 @@ class FP4DecodeKernel:
                 mResidualSeqUsedK=mResidualSeqUsedK,
                 sP_uint8=sP_uint8,
                 sSoftmaxRed=sSoftmaxRed,
+                sP_bf16=sP_bf16,
+                sP_bf16_mk=sP_bf16_mk,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2963,11 +3006,16 @@ class FP4DecodeKernel:
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
         tOrPs_bf16: Tuple[Optional[cute.Tensor], Optional[cute.Tensor]] = (None, None),
         sP: Optional[cute.Tensor] = None,
+        sP_bf16: Optional[cute.Tensor] = None,
     ):
         if const_expr(self.fused_residual_first_block):
-            tSrK_bf16 = tiled_mma_qk_bf16.make_fragment_B(sK_bf16)
             tOrV_bf16 = tiled_mma_pv_bf16.make_fragment_B(sV_bf16)
-            tSrQ_bf16 = tiled_mma_qk_bf16.make_fragment_A(sQ_bf16)
+            if const_expr(self.transpose_s):
+                tSrK_bf16 = tiled_mma_qk_bf16.make_fragment_A(sK_bf16)
+                tSrQ_bf16 = tiled_mma_qk_bf16.make_fragment_B(sQ_bf16)
+            else:
+                tSrK_bf16 = tiled_mma_qk_bf16.make_fragment_B(sK_bf16)
+                tSrQ_bf16 = tiled_mma_qk_bf16.make_fragment_A(sQ_bf16)
             tSrQ_bf16_stages = (tSrQ_bf16[None, None, None, 0], tSrQ_bf16[None, None, None, 0])
         else:
             tSrK_bf16 = None
@@ -3062,8 +3110,19 @@ class FP4DecodeKernel:
         if const_expr(self.fused_residual_first_block):
             qk_mma_op_bf16 = tiled_mma_qk_bf16.op
             pv_mma_op_bf16 = tiled_mma_pv_bf16.op
-            gemm_Si_bf16 = [
-                partial(
+            def _make_gemm_si_bf16(stage):
+                # Q is bound here and K supplied at the call site, mirroring the
+                # FP4 builders; transposed, Q is the B operand.
+                if const_expr(self.transpose_s):
+                    return partial(
+                        sm100_utils.gemm_ptx_partial,
+                        qk_mma_op_bf16,
+                        self.tmem_s_offset[stage],
+                        tCrB=tSrQ_bf16_stages[stage],
+                        sB=sQ_bf16[None, None, None, 0],
+                        zero_init=True,
+                    )
+                return partial(
                     sm100_utils.gemm_ptx_partial,
                     qk_mma_op_bf16,
                     self.tmem_s_offset[stage],
@@ -3071,10 +3130,19 @@ class FP4DecodeKernel:
                     sA=sQ_bf16[None, None, None, 0],
                     zero_init=True,
                 )
-                for stage in range(self.q_stage)
-            ]
-            gemm_Pi_bf16 = [
-                partial(
+
+            gemm_Si_bf16 = [_make_gemm_si_bf16(stage) for stage in range(self.q_stage)]
+            def _make_gemm_pi_bf16(stage):
+                if const_expr(self.transpose_s):
+                    # A from shared memory: no split wait, as on the FP4 side.
+                    return partial(
+                        sm100_utils.gemm_ptx_partial,
+                        pv_mma_op_bf16,
+                        self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                        tOrPs_bf16[stage],
+                        sA=sP_bf16[None, None, None, 0],
+                    )
+                return partial(
                     sm100_utils.gemm_ptx_partial,
                     pv_mma_op_bf16,
                     self.tmem_o_offset[stage if self.q_stage == 2 else 0],
@@ -3082,8 +3150,8 @@ class FP4DecodeKernel:
                     sA=None,
                     pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs_bf16[stage].shape[2])),
                 )
-                for stage in range(self.q_stage)
-            ]
+
+            gemm_Pi_bf16 = [_make_gemm_pi_bf16(stage) for stage in range(self.q_stage)]
         else:
             gemm_Si_bf16 = None
             gemm_Pi_bf16 = None
@@ -3161,26 +3229,33 @@ class FP4DecodeKernel:
                 if const_expr(self.fused_residual_first_block):
                     # Wait for K and Q (V is consumed later in the PV phase, but
                     # the QK GEMM only needs K + Q here).
+                    iket.range_push("mma_res_wait_k")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_residual_kv_full_offset + 0,
                         residual_kv_full_phase,
                     )
+                    iket.range_pop()
+                    iket.range_push("mma_res_wait_q")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_residual_kv_full_offset + 2,
                         residual_kv_full_phase,
                     )
-                    tSrK_bf16_view = tSrK_bf16[None, None, None, 0]
-                    gemm_Si_bf16[0](
-                        tCrB=tSrK_bf16_view,
-                        sB=sK_bf16[None, None, None, 0],
+                    iket.range_pop()
+                    self.qk_gemm(
+                        gemm_Si_bf16[0],
+                        tSrK_bf16[None, None, None, 0],
+                        sK_bf16[None, None, None, 0],
                     )
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_bf16_S_full_offset)
                     # Wait for V (consumed in BF16 GEMM_PV below).
+                    iket.range_push("mma_res_wait_v")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_residual_kv_full_offset + 1,
                         residual_kv_full_phase,
                     )
+                    iket.range_pop()
+                    iket.range_push("mma_res_wait_p")
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_bf16_P_full_offset,
                         Int32(0),
@@ -3189,6 +3264,7 @@ class FP4DecodeKernel:
                         mbar_ptr + self.mbar_bf16_P_full_2_offset,
                         Int32(0),
                     )
+                    iket.range_pop()
                     # BF16 PV: P_BF16 (TMEM) × V_BF16 (SMEM) → O TMEM (zero_init=True).
                     gemm_Pi_bf16[0](
                         tCrB=tOrV_bf16[None, None, None, 0],
@@ -3534,48 +3610,6 @@ class FP4DecodeKernel:
         return has_work
 
     @cute.jit
-    def seed_transposed_from_residual(
-        self,
-        softmax: SoftmaxSm100,
-        row_max: cute.Tensor,
-        row_sum: cute.Tensor,
-        sSoftmaxRed: cute.Tensor,
-        tidx: Int32,
-    ):
-        """Turn the residual block's softmax state a quarter turn.
-
-        The residual block is a BF16 tile that is not transposed, so it leaves
-        thread ``tidx`` holding query row ``tidx``. The transposed loop wants
-        every thread to hold every row of its group, which is one publication
-        through shared memory. Only the rows a query occupies are live; the
-        maximum of the rest stays at minus infinity and contributes nothing.
-
-        The maximum is replicated, the sum is not. Transposed, a thread
-        accumulates only the kv positions it owns and the tile ends in a sum
-        across threads, so a replicated seed would be counted once per thread.
-
-        The scratch sits past the reduction buffers rather than sharing them,
-        because the first reduction of the tile writes buffer zero and there is
-        no barrier between that write and this read.
-        """
-        rows = const_expr(self.transposed_query_rows)
-        base = const_expr(self.softmax_seed_offset)
-        if tidx < rows:
-            sSoftmaxRed[base + tidx] = softmax.row_max[0]
-            sSoftmaxRed[base + rows + tidx] = (
-                softmax.row_sum[0] + softmax.row_sum_comp[0]
-            )
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.SoftmaxReduce),
-            number_of_threads=len(self.softmax0_warp_ids) * cute.arch.WARP_SIZE,
-        )
-        for j in cutlass.range_constexpr(const_expr(self.softmax_rows_per_group)):
-            row_max[j] = sSoftmaxRed[base + j]
-            row_sum[j] = Float32(0.0)
-            if tidx == 0:
-                row_sum[j] = sSoftmaxRed[base + rows + j]
-
-    @cute.jit
     def zero_transposed_p(self, sP_uint8: cute.Tensor, sSFP: cute.Tensor, tidx: Int32):
         """Zero the shared P tile and its scale factors once per CTA.
 
@@ -3602,6 +3636,116 @@ class FP4DecodeKernel:
                 sfp_flat[tidx + i * num_threads] = Int32(0)
 
     @cute.jit
+    def zero_transposed_p_bf16(self, sP_bf16: cute.Tensor, tidx: Int32):
+        """Zero the shared BF16 P tile of the residual block.
+
+        The FP4 tile is cleared once per CTA, but this one shares its bytes
+        with the residual Q tile and so cannot be cleared until the QK GEMM
+        has consumed it. As above the write is permutation invariant, so the
+        swizzle can be ignored and the buffer filled as flat words.
+        """
+        num_threads = const_expr(len(self.softmax0_warp_ids) * cute.arch.WARP_SIZE)
+        words = const_expr(self.m_block_size * self.n_block_size * 2 // 4)
+        flat = cute.make_tensor(
+            cute.recast_ptr(sP_bf16.iterator, dtype=Int32), cute.make_layout(words)
+        )
+        for i in cutlass.range_constexpr(words // num_threads):
+            flat[tidx + i * num_threads] = Int32(0)
+
+    @cute.jit
+    def softmax_residual_step_transposed(
+        self,
+        softmax_scale_log2: Float32,
+        mbar_ptr: cute.Pointer,
+        thr_tmem_load: cute.CopyAtom,
+        tStS_t2r: cute.Tensor,
+        frg_shape,
+        row_max: cute.Tensor,
+        row_sum: cute.Tensor,
+        sP_bf16: cute.Tensor,
+        sP_bf16_mk: cute.Tensor,
+        sSoftmaxRed: cute.Tensor,
+        red_buf: Int32,
+        tidx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        mResidualSeqUsedK: Optional[cute.Tensor],
+        row_group: cutlass.Constexpr[int] = 0,
+    ) -> Int32:
+        """The residual block in the same orientation as the FP4 blocks.
+
+        Structurally ``softmax_step_transposed`` with the quantization replaced
+        by a plain bf16 store, since P feeds a bf16 MMA and carries no scale
+        factors. It runs before any FP4 block and seeds the online softmax, so
+        ``row_max`` and ``row_sum`` leave here holding the residual's
+        contribution and the FP4 blocks merge onto them with is_first=False.
+        """
+        rows = const_expr(self.softmax_rows_per_group)
+        row_base = const_expr(row_group * rows)
+
+        iket.range_push("sm_res_wait_s")
+        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_bf16_S_full_offset, Int32(0))
+        iket.range_pop()
+
+        iket.range_push("sm_res_comp")
+        # Safe here and only here: the QK GEMM has just released the Q tile
+        # these bytes belong to, and the row-maximum exchange below carries the
+        # barrier that separates this clear from the stores at the end.
+        self.zero_transposed_p_bf16(sP_bf16, tidx)
+
+        tSrS = cute.make_rmem_tensor(frg_shape, self.qk_acc_dtype)
+        cute.copy(thr_tmem_load, tStS_t2r, tSrS)
+        cute.arch.fence_view_async_tmem_load()
+
+        # Transposed, thread ``tidx`` owns kv position ``tidx``, so the residual
+        # length is one predicate. A split that does not own the residual sees a
+        # length of zero, masks every position, and contributes nothing.
+        seqused_k = Int32(self.n_block_size)
+        if const_expr(mResidualSeqUsedK is not None):
+            seqused_k = mResidualSeqUsedK[batch_idx]
+            if const_expr(self.is_split_kv):
+                if split_idx != self.residual_split_idx:
+                    seqused_k = Int32(0)
+        if tidx >= seqused_k:
+            for j in cutlass.range_constexpr(rows):
+                tSrS[j] = -Float32.inf
+
+        block_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            block_max[j] = utils.warp_reduce(tSrS[j], cute.arch.fmax)
+        red_buf = self.softmax_warpgroup_reduce(
+            block_max,
+            sSoftmaxRed,
+            tidx,
+            red_buf,
+            cute.arch.fmax,
+            intra_warp=False,
+            row_group=row_group,
+        )
+        max_scaled = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            row_max[j] = block_max[j]
+            safe = block_max[j] if block_max[j] != -Float32.inf else 0.0
+            max_scaled[j] = safe * softmax_scale_log2
+
+        for j in cutlass.range_constexpr(rows):
+            tSrS[j] = cute.arch.exp2(tSrS[j] * softmax_scale_log2 - max_scaled[j])
+            row_sum[j] = tSrS[j]
+
+        tSrP = cute.make_rmem_tensor(frg_shape, cutlass.BFloat16)
+        tSrP.store(tSrS.load().to(cutlass.BFloat16))
+        for j in cutlass.range_constexpr(rows):
+            sP_bf16_mk[row_base + j, tidx] = tSrP[j]
+        # The MMA reads P through the async proxy while these are generic-proxy
+        # stores, so the mbarrier below needs the fence to make them visible.
+        cute.arch.fence_view_async_shared()
+        iket.range_pop()
+
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_bf16_P_full_offset)
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_bf16_P_full_2_offset)
+        return red_buf
+
+    @cute.jit
     def softmax_loop_transposed(
         self,
         stage: int | Int32,
@@ -3621,13 +3765,9 @@ class FP4DecodeKernel:
         sSoftmaxRed: cute.Tensor,
         tidx: Int32,
         row_group: cutlass.Constexpr[int] = 0,
-        softmax_scale: Optional[Float32] = None,
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
-        thr_tmem_load_full: Optional[cute.CopyAtom] = None,
-        thr_tmem_store_bf16: Optional[cute.CopyAtom] = None,
-        thr_tmem_store_scale: Optional[cute.CopyAtom] = None,
-        tStS_t2r_full: Optional[cute.Tensor] = None,
-        tStP_bf16_r2t: Optional[cute.Tensor] = None,
+        sP_bf16: Optional[cute.Tensor] = None,
+        sP_bf16_mk: Optional[cute.Tensor] = None,
     ):
         """Softmax over an S tile held as (kv position, query row).
 
@@ -3669,16 +3809,6 @@ class FP4DecodeKernel:
 
         row_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         row_sum = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
-
-        if const_expr(self.fused_residual_first_block):
-            residual_softmax = SoftmaxSm100.create(
-                softmax_scale_log2,
-                rescale_threshold=RESCALE_THRESHOLD,
-                softmax_scale=softmax_scale,
-                quant_pv=self.quant_pv,
-                compute_sp1=self.compute_sp1,
-                kahan=True,
-            )
 
         softmax_step = partial(
             self.softmax_step_transposed,
@@ -3724,31 +3854,23 @@ class FP4DecodeKernel:
 
                 seeded = const_expr(self.fused_residual_first_block)
                 if const_expr(self.fused_residual_first_block):
-                    residual_softmax.reset()
-                    mma_si_consumer_phase, si_corr_producer_phase, _ = (
-                        self.softmax_residual_step(
-                            mma_si_consumer_phase,
-                            si_corr_producer_phase,
-                            Int32(0),
-                            softmax=residual_softmax,
-                            mbar_ptr=mbar_ptr,
-                            thr_mma_qk=thr_mma_qk,
-                            thr_tmem_load=thr_tmem_load_full,
-                            thr_tmem_store_bf16=thr_tmem_store_bf16,
-                            thr_tmem_store_scale=thr_tmem_store_scale,
-                            tStS_t2r=tStS_t2r_full,
-                            tStP_bf16_r2t=tStP_bf16_r2t,
-                            sScale=sScale,
-                            stage=stage,
-                            batch_idx=batch_idx,
-                            m_block=self.q_stage * m_block + stage,
-                            mResidualSeqUsedK=mResidualSeqUsedK,
-                            thread_idx=tidx,
-                            split_idx=split_idx,
-                        )
-                    )
-                    self.seed_transposed_from_residual(
-                        residual_softmax, row_max, row_sum, sSoftmaxRed, tidx
+                    red_buf = self.softmax_residual_step_transposed(
+                        softmax_scale_log2=softmax_scale_log2,
+                        mbar_ptr=mbar_ptr,
+                        thr_tmem_load=thr_tmem_load,
+                        tStS_t2r=tStS_t2r,
+                        frg_shape=frg_shape,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        sP_bf16=sP_bf16,
+                        sP_bf16_mk=sP_bf16_mk,
+                        sSoftmaxRed=sSoftmaxRed,
+                        red_buf=red_buf,
+                        tidx=tidx,
+                        batch_idx=batch_idx,
+                        split_idx=split_idx,
+                        mResidualSeqUsedK=mResidualSeqUsedK,
+                        row_group=row_group,
                     )
 
                 mma_si_consumer_phase, si_corr_producer_phase, red_buf = softmax_step(
@@ -4007,6 +4129,8 @@ class FP4DecodeKernel:
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
         sP_uint8: Optional[cute.Tensor] = None,
         sSoftmaxRed: Optional[cute.Tensor] = None,
+        sP_bf16: Optional[cute.Tensor] = None,
+        sP_bf16_mk: Optional[cute.Tensor] = None,
         row_group: cutlass.Constexpr[int] = 0,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
@@ -4056,6 +4180,31 @@ class FP4DecodeKernel:
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
 
+        if const_expr(self.transpose_s):
+            self.softmax_loop_transposed(
+                stage=stage,
+                softmax_scale_log2=softmax_scale_log2,
+                thr_mma_qk=thr_mma_qk,
+                tStSi=tStSi,
+                sScale=sScale,
+                mLSE=mLSE,
+                learnable_sink=learnable_sink,
+                mbar_ptr=mbar_ptr,
+                block_info=block_info,
+                num_splits=num_splits,
+                SeqlenInfoCls=SeqlenInfoCls,
+                TileSchedulerCls=TileSchedulerCls,
+                sSFP=sSFP,
+                sP_uint8=sP_uint8,
+                sSoftmaxRed=sSoftmaxRed,
+                tidx=tidx,
+                row_group=row_group,
+                mResidualSeqUsedK=mResidualSeqUsedK,
+                sP_bf16=sP_bf16,
+                sP_bf16_mk=sP_bf16_mk,
+            )
+            return
+
         thr_tmem_store_bf16 = thr_tmem_store
         tStP_bf16_r2t = tStP_r2t
         if const_expr(self.fused_residual_first_block):
@@ -4074,37 +4223,6 @@ class FP4DecodeKernel:
                 tmem_store_bf16_atom, tStP_bf16
             ).get_slice(tidx)
             tStP_bf16_r2t = thr_tmem_store_bf16.partition_D(tStP_bf16)
-
-        if const_expr(self.transpose_s):
-            # The residual block stays untransposed, so it needs the copies
-            # built above; the transposed loop only forwards them.
-            self.softmax_loop_transposed(
-                stage=stage,
-                softmax_scale_log2=softmax_scale_log2,
-                softmax_scale=softmax_scale,
-                thr_mma_qk=thr_mma_qk,
-                tStSi=tStSi,
-                sScale=sScale,
-                mLSE=mLSE,
-                learnable_sink=learnable_sink,
-                mbar_ptr=mbar_ptr,
-                block_info=block_info,
-                num_splits=num_splits,
-                SeqlenInfoCls=SeqlenInfoCls,
-                TileSchedulerCls=TileSchedulerCls,
-                sSFP=sSFP,
-                sP_uint8=sP_uint8,
-                sSoftmaxRed=sSoftmaxRed,
-                tidx=tidx,
-                row_group=row_group,
-                mResidualSeqUsedK=mResidualSeqUsedK,
-                thr_tmem_load_full=thr_tmem_load,
-                thr_tmem_store_bf16=thr_tmem_store_bf16,
-                thr_tmem_store_scale=thr_tmem_store_scale,
-                tStS_t2r_full=tStS_t2r,
-                tStP_bf16_r2t=tStP_bf16_r2t,
-            )
-            return
 
         mma_si_consumer_phase = Int32(0)
         si_corr_producer_phase = Int32(1)
@@ -4637,7 +4755,10 @@ class FP4DecodeKernel:
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScP_bf16 = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32_bf16)))
 
+        iket.range_push("sm_res_wait_s")
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_bf16_S_full_offset, Int32(0))
+        iket.range_pop()
+        iket.range_push("sm_res_comp")
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         cute.arch.fence_view_async_tmem_load()
@@ -4706,6 +4827,7 @@ class FP4DecodeKernel:
             cute.copy(thr_tmem_store_bf16, tSrP_bf16_r2t_view[None, None, i], tStP_bf16_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_bf16_P_full_2_offset)
+        iket.range_pop()
 
 
         # Phase tracking: mma_si_consumer_phase is unchanged because we
