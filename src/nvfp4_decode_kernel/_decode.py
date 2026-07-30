@@ -413,14 +413,21 @@ def _compile_split_decode(
     lse_partial: torch.Tensor,
     softmax_scale: float,
     num_splits: int,
+    query_padded_bf16: torch.Tensor | None = None,
+    residual_key_pages_bf16: torch.Tensor | None = None,
+    residual_value_pages_bf16: torch.Tensor | None = None,
+    residual_page_ids: torch.Tensor | None = None,
+    seqused_residual: torch.Tensor | None = None,
 ) -> Any:
     heads_q = query_fp4.shape[2]
     heads_kv = key_pages_fp4.shape[2]
+    has_residual = residual_key_pages_bf16 is not None
     cache_key = (
         query_fp4.device.index,
         heads_q,
         heads_kv,
         num_splits,
+        has_residual,
     )
     compiled = _split_decode_compile_cache.get(cache_key)
     if compiled is not None:
@@ -445,7 +452,7 @@ def _compile_split_decode(
         sf_dtype=cutlass.Float8E4M3FN,
         sf_vec_size=16,
         bf16_q_input=False,
-        fused_residual_first_block=False,
+        fused_residual_first_block=has_residual,
         residual_source="paged_bf16",
         use_out_indices=False,
         seqlen_q_static_one=True,
@@ -484,13 +491,40 @@ def _compile_split_decode(
         tuple(Int32(0) for _ in key_pages_fp4.shape),
         tuple(Int32(0) for _ in value_pages_fp4.shape),
     )
+    compile_kwargs: dict[str, Any] = {
+        "k_page_stride": Int32(0),
+        "v_page_stride": Int32(0),
+        "k_sf_page_stride": Int32(0),
+        "v_sf_page_stride": Int32(0),
+        "mOutIndices": None,
+    }
+    if has_residual:
+        assert residual_value_pages_bf16 is not None
+        assert residual_page_ids is not None
+        assert seqused_residual is not None
+        assert query_padded_bf16 is not None
+        compile_kwargs.update(
+            mResidualQ=_to_cute_tensor(
+                query_padded_bf16, assumed_align=16, leading_dim=3
+            ),
+            mResidualK=None,
+            mResidualV=None,
+            mResidualSeqUsedK=_to_cute_tensor(
+                seqused_residual, assumed_align=4, leading_dim=0
+            ),
+            mResidualKCache=_to_cute_tensor(
+                residual_key_pages_bf16, assumed_align=16, leading_dim=3
+            ),
+            mResidualVCache=_to_cute_tensor(
+                residual_value_pages_bf16, assumed_align=16, leading_dim=3
+            ),
+            mResidualBlockIds=_to_cute_tensor(
+                residual_page_ids, assumed_align=4, leading_dim=0
+            ),
+        )
     compiled = cute.compile(
         *compile_args,
-        k_page_stride=Int32(0),
-        v_page_stride=Int32(0),
-        k_sf_page_stride=Int32(0),
-        v_sf_page_stride=Int32(0),
-        mOutIndices=None,
+        **compile_kwargs,
         options="--enable-tvm-ffi",
     )
     _split_decode_compile_cache[cache_key] = compiled
@@ -939,19 +973,30 @@ def decode_fp4_split(
     seqused_fp4: torch.Tensor,
     softmax_scale: float,
     num_splits: int,
+    query_padded_bf16: torch.Tensor | None = None,
+    residual_key_pages_bf16: torch.Tensor | None = None,
+    residual_value_pages_bf16: torch.Tensor | None = None,
+    residual_page_ids: torch.Tensor | None = None,
+    seqused_residual: torch.Tensor | None = None,
+    has_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run pure FP4 split-K decode and combine partial O/LSE."""
+    """Run split-K decode, with an optional residual tail, and combine partials."""
     if num_splits <= 1:
         return decode_fp4(
             query_fp4=query_fp4,
             query_scales=query_scales,
-            query_padded_bf16=None,
+            query_padded_bf16=query_padded_bf16,
             key_pages_fp4=key_pages_fp4,
             key_scales=key_scales,
             value_pages_fp4=value_pages_fp4,
             value_scales=value_scales,
             fp4_page_table=fp4_page_table,
             seqused_fp4=seqused_fp4,
+            residual_key_pages_bf16=residual_key_pages_bf16,
+            residual_value_pages_bf16=residual_value_pages_bf16,
+            residual_page_ids=residual_page_ids,
+            seqused_residual=seqused_residual,
+            has_bf16=has_bf16,
             softmax_scale=softmax_scale,
         )
 
@@ -1013,6 +1058,11 @@ def decode_fp4_split(
             lse_partial=lse_partial,
             softmax_scale=softmax_scale,
             num_splits=num_splits,
+            query_padded_bf16=query_padded_bf16,
+            residual_key_pages_bf16=residual_key_pages_bf16,
+            residual_value_pages_bf16=residual_value_pages_bf16,
+            residual_page_ids=residual_page_ids,
+            seqused_residual=seqused_residual,
         )
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         fp4_ptr = lambda tensor: make_ptr(
@@ -1021,6 +1071,17 @@ def decode_fp4_split(
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
+        residual_kwargs: dict[str, Any] = {}
+        if residual_key_pages_bf16 is not None:
+            residual_kwargs = dict(
+                mResidualQ=query_padded_bf16,
+                mResidualK=None,
+                mResidualV=None,
+                mResidualSeqUsedK=seqused_residual,
+                mResidualKCache=residual_key_pages_bf16,
+                mResidualVCache=residual_value_pages_bf16,
+                mResidualBlockIds=residual_page_ids,
+            )
         compiled(
             fp4_ptr(query_fp4),
             fp4_ptr(key_pages_fp4),
@@ -1065,6 +1126,7 @@ def decode_fp4_split(
             k_sf_page_stride=key_scales_kernel.stride()[-1],
             v_sf_page_stride=value_scales_kernel.stride()[-1],
             mOutIndices=None,
+            **residual_kwargs,
         )
     from .split_k_combine import flash_attn_combine
 

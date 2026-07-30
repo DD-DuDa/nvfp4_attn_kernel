@@ -82,23 +82,26 @@ def fp4_decode_impl(
             softmax_scale = 128**-0.5
         query_padded_bf16 = None
 
-    # Any residual-related argument disqualifies the split path, which carries
-    # no residual support. Keying off a single argument would let a partially
-    # supplied residual reach split-K and be dropped instead of raising the
-    # all-or-none error that the non-split path enforces.
-    pure_fp4 = all(
-        argument is None
-        for argument in (
-            residual_key_pages_bf16,
-            residual_value_pages_bf16,
-            residual_page_ids,
-            seqused_residual,
-            has_bf16,
-        )
+    # A residual reaches split-K only when every one of its arguments is
+    # present. Keying off a single argument would let a partially supplied
+    # residual be dropped there instead of raising the all-or-none error that
+    # the non-split path enforces.
+    residual_arguments = (
+        residual_key_pages_bf16,
+        residual_value_pages_bf16,
+        residual_page_ids,
+        seqused_residual,
     )
+    complete_residual = all(
+        argument is not None for argument in residual_arguments
+    )
+    splittable = (
+        all(argument is None for argument in residual_arguments)
+        and has_bf16 is None
+    ) or (complete_residual and query_padded_bf16 is not None)
     direct_scatter = out is not None or out_indices is not None
     num_splits = 1
-    if pure_fp4 and not direct_scatter:
+    if splittable and not direct_scatter:
         device = query_fp4.device
         num_splits = split_k_heuristic(
             query_fp4.shape[0],
@@ -113,13 +116,18 @@ def fp4_decode_impl(
         decode_fp4(
             query_fp4=query_fp4,
             query_scales=query_scales,
-            query_padded_bf16=None,
+            query_padded_bf16=query_padded_bf16,
             key_pages_fp4=key_pages_fp4,
             key_scales=key_scales,
             value_pages_fp4=value_pages_fp4,
             value_scales=value_scales,
             fp4_page_table=fp4_page_table,
             seqused_fp4=seqused_fp4,
+            residual_key_pages_bf16=residual_key_pages_bf16,
+            residual_value_pages_bf16=residual_value_pages_bf16,
+            residual_page_ids=residual_page_ids,
+            seqused_residual=seqused_residual,
+            has_bf16=has_bf16,
             softmax_scale=softmax_scale,
             trusted_metadata=trusted_metadata,
             validate_only=True,
@@ -135,6 +143,12 @@ def fp4_decode_impl(
             seqused_fp4=seqused_fp4,
             softmax_scale=softmax_scale,
             num_splits=num_splits,
+            query_padded_bf16=query_padded_bf16,
+            residual_key_pages_bf16=residual_key_pages_bf16,
+            residual_value_pages_bf16=residual_value_pages_bf16,
+            residual_page_ids=residual_page_ids,
+            seqused_residual=seqused_residual,
+            has_bf16=has_bf16,
         )
 
     return decode_fp4(

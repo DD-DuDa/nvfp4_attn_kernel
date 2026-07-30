@@ -133,6 +133,11 @@ class FP4DecodeKernel:
         assert sf_vec_size == 16 and sf_dtype == cutlass.Float8E4M3FN, "Only support NVFP4 for now"
         self.bf16_q_input = bf16_q_input
         self.fused_residual_first_block = fused_residual_first_block
+        # The residual is a single block, so under split-k exactly one split may
+        # count it. The others run the block with a length of zero, which the
+        # zero-residual contract already makes contribute nothing, rather than
+        # branching around a pipeline stage.
+        self.residual_split_idx = 0
         assert residual_source in ("contiguous", "paged_bf16"), (
             f"unknown residual_source={residual_source!r}; "
             f"expected 'contiguous' or 'paged_bf16'"
@@ -346,7 +351,11 @@ class FP4DecodeKernel:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
         self.acc_stage = 1
-        self.epi_stage = 2
+        # The epilogue indexes sO by q tile, so a deeper ring than there are q
+        # tiles is memory no one can name. Decode runs a single q tile, where
+        # the second buffer was costing 32KB of output, or 64KB once the split
+        # path widens it to fp32 partials.
+        self.epi_stage = self.q_stage
         # Compute kv_stage from SMEM budget.
         # Blackwell: 228KB per SM, 227KB optin per block.
         # K and V alias when same dtype or when K is smaller (FP4 K in BF16 V).
@@ -363,8 +372,20 @@ class FP4DecodeKernel:
         )
         smem_q_per_stage = self.m_block_size * self.head_dim_padded * q_smem_dtype_width // 8
         smem_o_per_stage = self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_sO = align_up(smem_o_per_stage * self.epi_stage, align) if not self.overlap_sO_sQ else 0
-        smem_sQ = align_up(smem_q_per_stage * self.q_stage, align)
+        # When the two overlap, sQ is widened to cover sO rather than sO being
+        # dropped, so the budget has to charge the wider of the two.
+        if self.overlap_sO_sQ:
+            smem_sO = 0
+            smem_sQ = align_up(
+                max(
+                    smem_q_per_stage * self.q_stage,
+                    smem_o_per_stage * self.epi_stage,
+                ),
+                align,
+            )
+        else:
+            smem_sO = align_up(smem_o_per_stage * self.epi_stage, align)
+            smem_sQ = align_up(smem_q_per_stage * self.q_stage, align)
         # SFQ/SFP are per q_stage, SF layout cosize: m_block * head_dim / sf_vec_size
         sfq_per_stage = self.m_block_size * self.head_dim_padded // self.sf_vec_size
         sfp_per_stage = self.m_block_size * self.head_dim_v_padded // self.sf_vec_size
@@ -2810,7 +2831,7 @@ class FP4DecodeKernel:
                             tma_bar_ptr=bf16_full_mbar + 2,
                         )
                     residual_kv_empty_producer_phase ^= 1
-                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                if self.tile_has_work(n_block_min, n_block_max, split_idx):
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                         load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0 + SFQ0
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -3134,10 +3155,7 @@ class FP4DecodeKernel:
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
                 block_iter_count = n_block_max - n_block_min
-                if const_expr(not self.is_split_kv):
-                    process_tile = True
-                else:
-                    process_tile = n_block_min < n_block_max
+                process_tile = self.tile_has_work(n_block_min, n_block_max, split_idx)
 
             if process_tile:
                 if const_expr(self.fused_residual_first_block):
@@ -3493,6 +3511,29 @@ class FP4DecodeKernel:
         return red_buf ^ 1
 
     @cute.jit
+    def tile_has_work(
+        self, n_block_min: Int32, n_block_max: Int32, split_idx: Int32
+    ):
+        """Whether a work tile has anything for the pipeline to do.
+
+        Without split-k every tile runs, including one whose fp4 length is
+        zero: its single mainloop step is fully masked and the epilogue still
+        owes an output row. Split-k drops empty splits instead, except for the
+        one that owns the residual block, which has work whether or not any fp4
+        block landed in it.
+
+        Every warp asks this question separately and they have to agree, so
+        they all ask it here.
+        """
+        if const_expr(not self.is_split_kv):
+            return True
+        has_work = n_block_min < n_block_max
+        if const_expr(self.fused_residual_first_block):
+            if split_idx == self.residual_split_idx:
+                has_work = cutlass.Boolean(True)
+        return has_work
+
+    @cute.jit
     def seed_transposed_from_residual(
         self,
         softmax: SoftmaxSm100,
@@ -3668,7 +3709,7 @@ class FP4DecodeKernel:
             # A split can be handed no kv block at all. Such a tile must stay out
             # of the correction handshake entirely, as on the untransposed path,
             # or the two warp groups fall out of step.
-            has_work = const_expr(not self.is_split_kv) or n_block_max > n_block_min
+            has_work = self.tile_has_work(n_block_min, n_block_max, split_idx)
             if has_work:
                 row_max.fill(-Float32.inf)
                 row_sum.fill(0.0)
@@ -3703,6 +3744,7 @@ class FP4DecodeKernel:
                             m_block=self.q_stage * m_block + stage,
                             mResidualSeqUsedK=mResidualSeqUsedK,
                             thread_idx=tidx,
+                            split_idx=split_idx,
                         )
                     )
                     self.seed_transposed_from_residual(
@@ -4128,7 +4170,7 @@ class FP4DecodeKernel:
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
-                has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
+                has_work = self.tile_has_work(n_block_min, n_block_max, split_idx)
 
             softmax_step = partial(
                 self.softmax_step,
@@ -4184,6 +4226,7 @@ class FP4DecodeKernel:
                         m_block=self.q_stage * m_block + stage,
                         mResidualSeqUsedK=mResidualSeqUsedK,
                         thread_idx=tidx,
+                        split_idx=split_idx,
                     )
                 )
 
@@ -4226,7 +4269,7 @@ class FP4DecodeKernel:
                         ] = softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
             else:
-                if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
+                if has_work:
                     if const_expr(self.fused_residual_first_block) and stage == 0:
                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                             mma_si_consumer_phase,
@@ -4575,6 +4618,7 @@ class FP4DecodeKernel:
         m_block: Int32,
         mResidualSeqUsedK: cute.Tensor,
         thread_idx: Int32,
+        split_idx: Int32 = Int32(0),
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Compute the BF16 residual softmax step.
 
@@ -4606,6 +4650,12 @@ class FP4DecodeKernel:
         seqused_k = Int32(self.n_block_size)
         if const_expr(mResidualSeqUsedK is not None):
             seqused_k = mResidualSeqUsedK[batch_idx]
+            if const_expr(self.is_split_kv):
+                # One block, one owner: the other splits run the same pipeline
+                # over a length of zero and contribute nothing, so the combine
+                # sees the residual exactly once.
+                if split_idx != self.residual_split_idx:
+                    seqused_k = Int32(0)
             tScS_t2r = thr_tmem_load.partition_D(tScS)
             for i in cutlass.range_constexpr(cute.size(tSrS_t2r)):
                 n_coord = tScS_t2r[i][1]  # N coordinate
@@ -4732,7 +4782,7 @@ class FP4DecodeKernel:
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min
-                has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
+                has_work = self.tile_has_work(n_block_min, n_block_max, split_idx)
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
@@ -5237,7 +5287,7 @@ class FP4DecodeKernel:
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
-            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+            if self.tile_has_work(n_block_min, n_block_max, split_idx):
                 if const_expr(self.use_out_indices):
                     mO_cur = seqlen.offset_batch_O_via_indices(
                         mO, batch_idx, mOutIndices, dim=3,
