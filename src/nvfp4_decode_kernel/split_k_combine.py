@@ -473,7 +473,6 @@ class FlashAttentionForwardCombine:
                 tOpO = cute.make_rmem_tensor(cute.size(tOcO, mode=[2]), Boolean)
                 for k in cutlass.range(cute.size(tOpO), unroll_full=True):
                     tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
-                # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
 
             load_O_partial = partial(
                 self.load_O_partial,
@@ -499,11 +498,6 @@ class FlashAttentionForwardCombine:
             # Wait for LSE and initial O partial stages to complete
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.sync_threads()
-            # if cute.arch.thread_idx()[0] == 0:
-            #     # cute.print_tensor(sLSE)
-            #     for i in range(64):
-            #         cute.printf("sLSE[%d, 0] = %f", i, sLSE[i, 0])
-            # cute.arch.sync_threads()
 
             s2r_thr_copy_LSE = s2r_tiled_copy_LSE.get_slice(tidx)
             ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE)
@@ -529,13 +523,11 @@ class FlashAttentionForwardCombine:
                     .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
                     threads_in_group=threads_per_col,
                 )
-                # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
                 # Find max valid split index
                 max_valid_idx = -1
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
                     if ts2rrLSE[0, s, m] != -Float32.inf:
                         max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
-                # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
                 max_valid_split[m] = cute.arch.warp_reduction_max(
                     max_valid_idx, threads_in_group=threads_per_col
                 )

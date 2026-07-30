@@ -3572,7 +3572,9 @@ class FP4DecodeKernel:
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block) 
 
+        iket.range_push("sm_rowmax")
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        iket.range_pop()
         tSrPSF_f32 = None
         tSrPSF = None
 
@@ -3600,6 +3602,7 @@ class FP4DecodeKernel:
 
 
         if const_expr(self.quant_pv):
+            iket.range_push("sm_exp")
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
@@ -3608,6 +3611,13 @@ class FP4DecodeKernel:
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+            iket.range_pop()
+            # Everything below is the FP4-only P re-quantization: a segmented
+            # group max, a groupwise rescale, the FP4 convert, and the scale
+            # factor R2S. The BF16 path reaches the TMEM store directly from
+            # apply_exp2_convert, so this range is the extra cost FP4 pays on
+            # the softmax critical path.
+            iket.range_push("sm_pquant")
             tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
             tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
             softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
@@ -3630,6 +3640,7 @@ class FP4DecodeKernel:
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
                 tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+            iket.range_pop()
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             softmax.apply_exp2_convert(

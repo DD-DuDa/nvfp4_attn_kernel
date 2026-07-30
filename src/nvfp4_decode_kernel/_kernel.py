@@ -82,7 +82,20 @@ def fp4_decode_impl(
             softmax_scale = 128**-0.5
         query_padded_bf16 = None
 
-    pure_fp4 = residual_key_pages_bf16 is None
+    # Any residual-related argument disqualifies the split path, which carries
+    # no residual support. Keying off a single argument would let a partially
+    # supplied residual reach split-K and be dropped instead of raising the
+    # all-or-none error that the non-split path enforces.
+    pure_fp4 = all(
+        argument is None
+        for argument in (
+            residual_key_pages_bf16,
+            residual_value_pages_bf16,
+            residual_page_ids,
+            seqused_residual,
+            has_bf16,
+        )
+    )
     direct_scatter = out is not None or out_indices is not None
     num_splits = 1
     if pure_fp4 and not direct_scatter:

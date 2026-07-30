@@ -38,16 +38,17 @@ def split_k_heuristic(
     """
     if rows < 1 or heads_kv < 1 or max_pages_per_row < 2 or sms < 1:
         return 1
-    # The private combine is a fixed launch whose overhead dominates very
-    # short contexts; the split main kernel does not amortize it below 16K.
-    if max_pages_per_row < 128:
-        return 1
     unsplit_ctas = rows * heads_kv
     if unsplit_ctas >= sms:
         return 1
     target = max(2, math.ceil(sms / unsplit_ctas))
-    for splits in (8, 4, 2):
-        if splits <= target and splits <= max_pages_per_row:
+    # Splitting adds a second, fixed-cost combine launch, so it only pays once
+    # each split's own main loop is long enough to dominate it. Eight page
+    # blocks per split is the smallest ratio measured to not regress: at one
+    # block per split a 1K context lost 1.7x to the combine overhead alone.
+    min_pages_per_split = 8
+    for splits in (32, 16, 8, 4, 2):
+        if splits <= target and splits * min_pages_per_split <= max_pages_per_row:
             return splits
     return 1
 
@@ -953,6 +954,10 @@ def decode_fp4_split(
         dtype=torch.float32,
         device=device,
     )
+    # Both accepted query-scale dtypes must collapse to one tensor signature
+    # before compiling, because the compile cache is not keyed on dtype and
+    # would otherwise hand back a kernel built for the other one.
+    query_scales = _as_scale_bytes(query_scales, "query_scales")
     key_scales_kernel = _page_scales_for_kernel(
         _as_e4m3(key_scales, "key_scales"), "key_scales"
     )

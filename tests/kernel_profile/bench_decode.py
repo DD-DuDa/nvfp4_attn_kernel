@@ -334,19 +334,32 @@ def measure_wall_ms(run: Callable[[], object], iters: int, warmup: int) -> float
 
 
 def measure_event_gpu_ms(
-    run: Callable[[], object], iters: int, warmup: int
-) -> float:
+    run: Callable[[], object], iters: int, warmup: int, repeats: int = 5
+) -> tuple[float, float]:
+    """Return the median per-iteration GPU time and the observed spread.
+
+    One timing region is a single sample however many iterations it averages,
+    so any one-off host stall or driver interruption inside it inflates the
+    result with nothing to reveal that it happened. Independent repeats let the
+    median reject those, and the returned spread lets a caller tell a real
+    change from a noisy measurement.
+    """
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        run()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iters
+    samples = []
+    for _ in range(repeats):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            run()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / iters)
+    samples.sort()
+    median = samples[len(samples) // 2]
+    return median, (samples[-1] - samples[0]) / median if median > 0 else 0.0
 
 
 def measure_kernel_breakdown(
@@ -452,6 +465,7 @@ def run_case(
                     "unavailable_reason": unavailable_reason,
                     "num_splits": num_splits,
                     "gpu_ms": None,
+                    "gpu_ms_spread": None,
                     "wall_ms": None,
                     "kv_gib": kv_bytes(case, name) / 2**30,
                     "kv_gbps": None,
@@ -465,8 +479,8 @@ def run_case(
             continue
 
         out = _output(run()).reshape(case.batch, case.heads_q, HEAD_DIM)
-        gpu_ms = (
-            None
+        gpu_ms, gpu_ms_spread = (
+            (None, None)
             if structural_only
             else measure_event_gpu_ms(run, iters, warmup)
         )
@@ -494,6 +508,7 @@ def run_case(
                 "unavailable_reason": None,
                 "num_splits": num_splits,
                 "gpu_ms": gpu_ms,
+                "gpu_ms_spread": gpu_ms_spread,
                 "wall_ms": wall_ms,
                 "kv_gib": moved / 2**30,
                 "kv_gbps": (
