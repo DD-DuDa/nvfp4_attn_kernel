@@ -356,9 +356,17 @@ class FP4DecodeKernel:
             num_kv_staged_fields += 1  # sSFV
         smem_kv_per_stage += num_kv_staged_fields * 128
         self.kv_stage = (smem_budget - smem_fixed) // smem_kv_per_stage
-        if self.is_split_kv and self.quant_qk and self.quant_pv:
-            KV_STAGE_FP4_SPLITK_CAP = 4
-            self.kv_stage = min(self.kv_stage, KV_STAGE_FP4_SPLITK_CAP)
+        if self.quant_qk and self.quant_pv:
+            # Depth buys latency hiding only until the mainloop stops waiting on
+            # KV. Past that the extra buffers cost cosize and issue slots: on the
+            # non-split path a depth sweep is flat from 8 to 10 and 1% worse at
+            # 12 and beyond, so spending the whole SMEM budget (which lands at
+            # 14) is a loss. The split path carries an FP32 partial-output buffer
+            # and cannot fit more than 9 stages anyway.
+            KV_STAGE_FP4_SPLITK_CAP = 8
+            KV_STAGE_FP4_CAP = 10
+            cap = KV_STAGE_FP4_SPLITK_CAP if self.is_split_kv else KV_STAGE_FP4_CAP
+            self.kv_stage = min(self.kv_stage, cap)
         assert self.kv_stage >= 2, (
             f"kv_stage={self.kv_stage} < 2: FP4 mainloop requires K/V double-buffer"
         )

@@ -29,38 +29,58 @@ def split_k_heuristic(
     *,
     sms: int,
 ) -> int:
-    """Select a conservative fixed split count for pure FP4 decode.
+    """Select a fixed split count for pure FP4 decode by predicted makespan.
 
-    Fill the machine when the unsplit grid is too small, but never create more
-    splits than there are page blocks. Power-of-two candidates keep one
-    compiled kernel per useful occupancy tier and match the combine kernel's
-    fixed workspace contract.
+    Every CTA runs one row-head pair over its share of the page blocks, so the
+    time the launch takes is the number of scheduling rounds times the blocks
+    one CTA walks in a round. Splitting divides the second factor and multiplies
+    the first, which is why it is not monotonically good: at 128 unsplit CTAs on
+    148 SMs, two splits turn one round of 128 blocks into two rounds of 64 and
+    the makespan does not move at all, while the split path still pays for its
+    capped pipeline depth, its FP32 partials, its lost persistent scheduler and
+    a second launch. Only accept a split count that beats the unsplit makespan
+    by more than that overhead, and among equals take the fewest splits.
+
+    Power-of-two candidates keep one compiled kernel per useful occupancy tier
+    and match the combine kernel's fixed workspace contract.
 
     ``max_pages_per_row`` is the page table's second extent, not the pages the
     rows actually consume, because the real lengths live in ``seqused_fp4`` on
     the device and reading them here would force a synchronization on every
     decode. Callers must therefore size the page table to the batch's own
-    longest row. A table left at some global capacity makes short batches look
-    long, and splitting a short context is not free: at one page block per
-    split a 1K context measured 1.7x slower purely from the combine launch.
-    Choosing too few splits only forfeits occupancy, so the ratio below is set
-    to err in that direction.
+    longest row; a table left at some global capacity makes short batches look
+    long.
     """
     if rows < 1 or heads_kv < 1 or max_pages_per_row < 2 or sms < 1:
         return 1
     unsplit_ctas = rows * heads_kv
-    if unsplit_ctas >= sms:
+
+    # Filling and draining the KV pipeline costs a CTA roughly this many block
+    # times on top of the blocks it actually walks, and it is paid once per
+    # scheduling round. Without it the model would keep splitting until every
+    # CTA held one block, because it would see shortening the main loop as free.
+    prologue_blocks = 8
+
+    def makespan(splits: int) -> int:
+        rounds = math.ceil(unsplit_ctas * splits / sms)
+        return rounds * (math.ceil(max_pages_per_row / splits) + prologue_blocks)
+
+    # Residual cost of the split path once its depth cap is lifted, as a
+    # fraction so the comparison stays in integer arithmetic.
+    overhead_num, overhead_den = 6, 5
+    # A split whose main loop is a single page block is all prologue and combine.
+    min_pages_per_split = 2
+
+    best_splits, best_cost = 1, None
+    for splits in (2, 4, 8, 16, 32):
+        if splits * min_pages_per_split > max_pages_per_row:
+            break
+        cost = makespan(splits)
+        if best_cost is None or cost < best_cost:
+            best_splits, best_cost = splits, cost
+    if best_cost is None or best_cost * overhead_num >= makespan(1) * overhead_den:
         return 1
-    target = max(2, math.ceil(sms / unsplit_ctas))
-    # Splitting adds a second, fixed-cost combine launch, so it only pays once
-    # each split's own main loop is long enough to dominate it. Eight page
-    # blocks per split is the smallest ratio measured to not regress: at one
-    # block per split a 1K context lost 1.7x to the combine overhead alone.
-    min_pages_per_split = 8
-    for splits in (32, 16, 8, 4, 2):
-        if splits <= target and splits * min_pages_per_split <= max_pages_per_row:
-            return splits
-    return 1
+    return best_splits
 
 
 def _to_cute_tensor(
