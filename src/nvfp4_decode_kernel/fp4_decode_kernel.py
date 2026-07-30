@@ -183,6 +183,25 @@ class FP4DecodeKernel:
             assert m_block_size % self.qhead_per_kvhead_O == 0, (
                 "For PackGQA with separate O-axis, m_block_size must be divisible by qhead_per_kvhead_O"
             )
+        # The MMA fixes the M extent at 128 rows while decode fills only
+        # qhead_per_kvhead of them, and a softmax thread owns one row, so the
+        # rows that carry no query still cost a full row of exp2. Repeating each
+        # query row across the tile puts a real row under every thread, which is
+        # what lets the column range a thread owns shrink by this factor. The
+        # copies of one query row are consecutive, so a group of them lands
+        # inside a single warp and the row reductions stay warp-local.
+        # The split path writes FP32 partials and an LSE per row for the combine
+        # kernel to consume, both keyed by the unreplicated row order, so it is
+        # left alone until those two writers learn the same row selection the
+        # unsplit epilogue uses.
+        self.q_replicate = 1
+        if (
+            pack_gqa
+            and seqlen_q_static_one
+            and not is_split_kv
+            and getattr(type(self), "_enable_q_replicate", False)
+        ):
+            self.q_replicate = m_block_size // self.qhead_per_kvhead
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
@@ -1715,6 +1734,9 @@ class FP4DecodeKernel:
                 cute.recast_ptr(sQ.iterator, sQ_bf16_layout.inner, cutlass.BFloat16),
                 sQ_bf16_layout.outer,
             )
+        # Byte view of the FP4 Q tile. Quantizing from BF16 needs it to place
+        # nibble pairs; replicating a pre-quantized Q needs it to move rows.
+        if const_expr(self.bf16_q_input or self.q_replicate > 1):
             uint8_swizzle = cute.make_swizzle(2, 4, 3)
             # FP4 atom_K (per kH) = head_dim_padded//2 elements; Uint8
             # atom_K_byte = atom_K_FP4 // 2 = head_dim_padded // 4.
@@ -2403,6 +2425,19 @@ class FP4DecodeKernel:
                     phase=q_producer_phase ^ 1,  # waits for the just-issued TMA
                     tidx=tidx,
                 )
+            elif const_expr(self.q_replicate > 1):
+                # A pre-quantized Q has no in-kernel transform to fold the
+                # replication into, so it gets its own pass over the tile. It
+                # signals the same barrier the quantizing path does.
+                quantize_Q = partial(
+                    self.replicate_Q_fp4_rows,
+                    sQ_uint8,
+                    sSFQ,
+                    mbar_ptr + self.mbar_load_q_full_offset,
+                    mbar_ptr + self.mbar_q_fp4_ready_offset,
+                    phase=q_producer_phase ^ 1,  # waits for the just-issued TMA
+                    tidx=tidx,
+                )
             # We have to use mbarrier directly in the load for KV instead of replying on
             # pipeline_kv, because we could have different number of TMA bytes for K and V
             load_K = partial(
@@ -2559,7 +2594,7 @@ class FP4DecodeKernel:
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
                         load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1 + SFQ1
-                    if const_expr(self.bf16_q_input):
+                    if const_expr(self.bf16_q_input or self.q_replicate > 1):
                         for qs in cutlass.range_constexpr(self.q_stage):
                             quantize_Q(stage=qs)
                     q_producer_phase ^= 1
@@ -2851,7 +2886,7 @@ class FP4DecodeKernel:
                     residual_kv_full_phase ^= 1
                 for stage in cutlass.range_constexpr(self.q_stage):
                     iket.range_push("mma_wait_qk")
-                    if const_expr(self.bf16_q_input):
+                    if const_expr(self.bf16_q_input or self.q_replicate > 1):
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_q_fp4_ready_offset + stage,
                             mma_q_consumer_phase,
@@ -4407,7 +4442,10 @@ class FP4DecodeKernel:
                     reachable_rows = None
                     if const_expr(self.pack_gqa and self.seqlen_q_static_one):
                         assert self.qhead_per_kvhead <= self.m_block_size
-                        reachable_rows = self.qhead_per_kvhead
+                        # Replication spreads the same heads over the whole tile,
+                        # one every q_replicate rows, so the last reachable row
+                        # moves to the end of the tile.
+                        reachable_rows = self.qhead_per_kvhead * self.q_replicate
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
@@ -4468,6 +4506,7 @@ class FP4DecodeKernel:
                                     effective_seqlen_q,
                                     max_rows=reachable_rows,
                                     stage_from_smem=True,
+                                    row_stride=self.q_replicate,
                                 )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
 
@@ -4582,6 +4621,13 @@ class FP4DecodeKernel:
             cell = tidx + c * num_threads
             m = cell // sf_groups_per_row
             sf_group = cell % sf_groups_per_row
+            # Under Q replication the destination row m carries query row
+            # m // q_replicate. Reading the source row here is the whole cost of
+            # replicating on this path: the tile is quantized row by row anyway,
+            # and rows that used to be an out-of-range TMA's zeros now repeat a
+            # real query. Phase 1 reads every source row before phase 2 writes
+            # any FP4 byte, so the aliasing between the two views is unaffected.
+            m_src = m // const_expr(self.q_replicate)
 
             # Read 16 BF16 lanes for this (m, sf_group) into FP32 register file.
             vals_f32 = cute.make_rmem_tensor(
@@ -4594,7 +4640,7 @@ class FP4DecodeKernel:
                 kQ = (k // sf_vec) % 4
                 kH = k // (sf_vec * 4)
                 v = Float32(
-                    sQ_bf16_stg[(m, k_in_atom_bf16), 0, (kQ, kH)]
+                    sQ_bf16_stg[(m_src, k_in_atom_bf16), 0, (kQ, kH)]
                 )
                 vals_f32[j] = v
                 a = cute.arch.fmax(v, -v)
@@ -4683,6 +4729,67 @@ class FP4DecodeKernel:
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
 
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(mbar_ready_ptr + stage)
+
+    @cute.jit
+    def replicate_Q_fp4_rows(
+        self,
+        sQ_uint8: cute.Tensor,
+        sSFQ: cute.Tensor,
+        mbar_full_ptr: cute.Pointer,   # mbar_load_q_full (FP4 TMA arrival)
+        mbar_ready_ptr: cute.Pointer,  # mbar_q_fp4_ready
+        stage: int,
+        phase: Int32,
+        tidx: Int32,
+    ):
+        """Repeat each query row across its block of the Q tile, in place.
+
+        The TMA lands ``qhead_per_kvhead`` real rows and zero-fills the rest.
+        This rewrites row ``m`` from row ``m // q_replicate`` so every row of the
+        tile carries a query, which is what lets a softmax thread own a short
+        column range instead of a whole row.
+
+        Source rows are also destinations — row 1 feeds the second block and is
+        itself overwritten from row 0 — so the order matters. Each thread owns a
+        fixed set of byte columns for the whole tile, which removes any
+        cross-thread hazard, and writes block 0 last, after every other block
+        has consumed the source rows that live inside it.
+        """
+        cute.arch.mbarrier_wait(mbar_full_ptr + stage, phase)
+
+        replicate = const_expr(self.q_replicate)
+        real_rows = const_expr(self.m_block_size // replicate)
+        bytes_per_row = const_expr(self.head_dim_padded // 2)  # two FP4 per byte
+        sf_groups_per_row = const_expr(self.head_dim_padded // self.sf_vec_size)
+        num_threads = const_expr(len(self.load_warp_ids) * cute.arch.WARP_SIZE)
+        assert bytes_per_row % num_threads == 0
+
+        sQ_u8_stg = sQ_uint8[None, None, None, stage]
+        sSFQ_u8_stg = cute.recast_tensor(sSFQ[None, None, None, stage], cutlass.Uint8)
+        cols_per_thread = const_expr(bytes_per_row // num_threads)
+
+        # Descending so that block 0, the one holding every source row, is
+        # written after all of them have been read.
+        for r_rev in cutlass.range_constexpr(real_rows):
+            r = const_expr(real_rows - 1 - r_rev)
+            for c in cutlass.range_constexpr(cols_per_thread):
+                k_byte = tidx * cols_per_thread + c
+                atom_k = k_byte % 32
+                kH = k_byte // 32
+                val = sQ_u8_stg[(r, atom_k), 0, kH]
+                for i in cutlass.range_constexpr(replicate):
+                    sQ_u8_stg[(r * replicate + i, atom_k), 0, kH] = val
+            if tidx < sf_groups_per_row:
+                mma_k = tidx // 4
+                k_inst = tidx % 4
+                sf_val = sSFQ_u8_stg[(((r % 32, r // 32), 0), (0, k_inst)), 0, mma_k]
+                for i in cutlass.range_constexpr(replicate):
+                    m = r * replicate + i
+                    sSFQ_u8_stg[(((m % 32, m // 32), 0), (0, k_inst)), 0, mma_k] = sf_val
+
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(mbar_ready_ptr + stage)
 

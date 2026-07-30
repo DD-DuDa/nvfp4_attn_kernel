@@ -31,14 +31,26 @@ class PackGQA:
         block: cutlass.Int32,
         threads_per_row: cutlass.Constexpr[int],
         num_threads: cutlass.Constexpr[int],
+        row_stride: cutlass.Constexpr[int] = 1,
     ):
+        """Address of each row this thread will move.
+
+        ``row_stride`` describes a tile whose query rows have been repeated, so
+        that row ``r * row_stride`` carries head ``r``. It is only meaningful
+        with a single query position, where the block index is zero and the
+        sequence coordinate is always zero.
+        """
         num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
         tPrPtr = cute.make_rmem_tensor(num_ptr_per_thread, cutlass.Int64)
         for i in cutlass.range_constexpr(num_ptr_per_thread):
             row = i * num_threads + cRows[tidx % threads_per_row][0]
-            idx = block * self.m_block_size + row
-            m_idx = idx // self.qhead_per_kvhead
-            h_idx = idx - m_idx * self.qhead_per_kvhead
+            if cutlass.const_expr(row_stride > 1):
+                h_idx = row // row_stride
+                m_idx = 0
+            else:
+                idx = block * self.m_block_size + row
+                m_idx = idx // self.qhead_per_kvhead
+                h_idx = idx - m_idx * self.qhead_per_kvhead
             tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
         return tPrPtr
 
@@ -133,6 +145,7 @@ class PackGQA:
         seqlen: cutlass.Int32,
         max_rows: cutlass.Constexpr = None,
         stage_from_smem: cutlass.Constexpr[bool] = False,
+        row_stride: cutlass.Constexpr[int] = 1,
     ):
         """Store one output tile, one row-step at a time.
 
@@ -146,6 +159,11 @@ class PackGQA:
         one row-step at a time. Materializing the whole tile up front costs 256
         registers per thread, which spills when this runs on a single warp that
         has already dropped to a small register budget.
+
+        ``row_stride`` says the tile's query rows were repeated on the way in,
+        so head ``r`` is at row ``r * row_stride`` and the rows in between are
+        duplicates that must not be stored. Every row of the tile is then
+        reachable, so the caller's ``max_rows`` must cover the whole tile.
         """
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
@@ -156,7 +174,9 @@ class PackGQA:
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
-        tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
+        tPrOPtr = self.compute_ptr(
+            mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads, row_stride
+        )
         num_row_steps = cute.size(tOrO.shape[1])
         if cutlass.const_expr(max_rows is not None):
             rows_per_step = num_threads // threads_per_row
@@ -173,10 +193,14 @@ class PackGQA:
                 cute.autovec_copy(tOrO[None, m, None], tOrO_m)
             else:
                 tOrO_m = tOrO[None, m, None]
-            if (
-                t0OcO[0, m, 0][0]
-                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]
-            ):
+            if cutlass.const_expr(row_stride > 1):
+                row_is_live = (t0OcO[0, m, 0][0] + tOcO_row[0][0]) % row_stride == 0
+            else:
+                row_is_live = (
+                    t0OcO[0, m, 0][0]
+                    < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]
+                )
+            if row_is_live:
                 mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tOrO.shape[0][0])
                 mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))
