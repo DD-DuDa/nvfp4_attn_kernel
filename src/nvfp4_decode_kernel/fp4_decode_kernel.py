@@ -3413,6 +3413,7 @@ class FP4DecodeKernel:
         tidx: Int32,
         red_buf: Int32,
         op: Callable,
+        intra_warp: cutlass.Constexpr[bool] = True,
     ) -> Int32:
         """Reduce one value per query row across all softmax threads, in place.
 
@@ -3421,11 +3422,15 @@ class FP4DecodeKernel:
         The scratch is double buffered by ``red_buf`` so a single named barrier
         per call is enough: a warp can only overwrite the buffer it read two
         calls ago, and the intervening barrier already ordered that read.
+
+        ``intra_warp`` is for callers that already hold the warp-wide result
+        because they needed one of the butterfly's intermediate stages anyway.
         """
         num_warps = const_expr(len(self.softmax0_warp_ids))
         rows = const_expr(self.transposed_query_rows)
-        for j in cutlass.range_constexpr(rows):
-            vals[j] = utils.warp_reduce(vals[j], op)
+        if const_expr(intra_warp):
+            for j in cutlass.range_constexpr(rows):
+                vals[j] = utils.warp_reduce(vals[j], op)
         base = red_buf * (num_warps * rows)
         if tidx % cute.arch.WARP_SIZE == 0:
             warp = tidx // cute.arch.WARP_SIZE
@@ -3655,11 +3660,27 @@ class FP4DecodeKernel:
                     tSrS[j] = -Float32.inf
 
         iket.range_push("sm_rowmax")
+        # A scale group is sf_vec_size consecutive kv positions, hence that many
+        # consecutive lanes, so the butterfly passes through the group maximum
+        # on its way to the warp maximum. That intermediate is what the FP4
+        # packing below needs, because exp2 is monotonic: the largest
+        # exponential of a group is the exponential of the group's largest
+        # score. Carrying it out costs one exp2 per row and removes a second
+        # butterfly of the same depth.
+        group_steps = const_expr(self.sf_vec_size.bit_length() - 1)
+        warp_steps = const_expr(cute.arch.WARP_SIZE.bit_length() - 1)
         block_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        group_max_score = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         for j in cutlass.range_constexpr(rows):
-            block_max[j] = tSrS[j]
+            val = tSrS[j]
+            for i in cutlass.range_constexpr(group_steps):
+                val = cute.arch.fmax(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+            group_max_score[j] = val
+            for i in cutlass.range_constexpr(group_steps, warp_steps):
+                val = cute.arch.fmax(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+            block_max[j] = val
         red_buf = self.softmax_warpgroup_reduce(
-            block_max, sSoftmaxRed, tidx, red_buf, cute.arch.fmax
+            block_max, sSoftmaxRed, tidx, red_buf, cute.arch.fmax, intra_warp=False
         )
         acc_scale = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         row_max_safe = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
@@ -3684,6 +3705,11 @@ class FP4DecodeKernel:
                 row_max_safe[j] = safe
                 acc_scale[j] = scale
             row_max[j] = row_max_new
+        # The shift is the same for every score of a row, so scaling it once
+        # leaves each exponential a single fused multiply-add.
+        max_scaled = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            max_scaled[j] = row_max_safe[j] * softmax_scale_log2
         iket.range_pop()
 
         # Every thread holds the same correction factors, so one publishes them.
@@ -3695,9 +3721,7 @@ class FP4DecodeKernel:
 
         iket.range_push("sm_exp")
         for j in cutlass.range_constexpr(rows):
-            tSrS[j] = cute.arch.exp2(
-                tSrS[j] * softmax_scale_log2 - row_max_safe[j] * softmax_scale_log2
-            )
+            tSrS[j] = cute.arch.exp2(tSrS[j] * softmax_scale_log2 - max_scaled[j])
             if const_expr(is_first):
                 row_sum[j] = tSrS[j]
             else:
@@ -3708,13 +3732,16 @@ class FP4DecodeKernel:
         inv6 = Float32(1.0 / 6.0)
         group_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         for j in cutlass.range_constexpr(rows):
-            # A scale group is sf_vec_size consecutive kv positions, hence that
-            # many consecutive lanes of one warp.
+            # Same expression as the exponentials above, so this is the value
+            # the largest lane of the group holds, to the bit.
             group_max[j] = (
-                utils.warp_reduce(tSrS[j], cute.arch.fmax, width=self.sf_vec_size) * inv6
+                cute.arch.exp2(group_max_score[j] * softmax_scale_log2 - max_scaled[j])
+                * inv6
             )
         for j in cutlass.range_constexpr(rows):
-            tSrS[j] = tSrS[j] * (Float32(1.0) / cute.arch.fmax(group_max[j], 1e-20))
+            # An approximate reciprocal is one instruction where the exact
+            # division is a sequence, and P carries three mantissa bits.
+            tSrS[j] = tSrS[j] * cute.arch.rcp_approx(cute.arch.fmax(group_max[j], 1e-20))
 
         # K-major P wants kv contiguous, so the nibbles for kv = tidx and
         # tidx + 1 share a byte. One butterfly per query row brings the odd
