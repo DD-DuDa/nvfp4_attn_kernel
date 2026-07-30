@@ -65,11 +65,12 @@ def build_inputs(heads_q: int, heads_kv: int, rows: int, pages_per_row: int):
         dtype=torch.int32,
         device=device,
     )
-    query_row_indices = torch.tensor(
-        [(i * 2 + 1) % (rows + 2) for i in range(rows)],
-        dtype=torch.int32,
-        device=device,
-    )
+    # Both index maps must be injective. Duplicate out_indices would make two
+    # decode rows race for one output row, which is nondeterministic and would
+    # look exactly like a numerical regression.
+    perm = torch.randperm(rows + 2, generator=torch.Generator().manual_seed(7))
+    query_row_indices = perm[:rows].to(device=device, dtype=torch.int32)
+    out_indices = perm.flip(0)[:rows].to(device=device, dtype=torch.int32)
     return {
         "query": query,
         "key_pages_bf16": key_pages_bf16,
@@ -83,6 +84,7 @@ def build_inputs(heads_q: int, heads_kv: int, rows: int, pages_per_row: int):
         "residual_page_ids": residual_page_ids,
         "seqused_residual": seqused_residual,
         "query_row_indices": query_row_indices,
+        "out_indices": out_indices,
     }
 
 
@@ -118,18 +120,13 @@ def run_shapes(inputs, rows: int) -> dict[str, torch.Tensor]:
             query_row_indices=inputs["query_row_indices"],
         )
         scatter_out = torch.full_like(inputs["query"], 17.0)
-        out_indices = torch.tensor(
-            [(i * 3 + 2) % (rows + 2) for i in range(rows)],
-            dtype=torch.int32,
-            device=compact_query.device,
-        )
         fp4_decode(
             inputs["query"],
             **base,
             **residual,
             query_row_indices=inputs["query_row_indices"],
             out=scatter_out,
-            out_indices=out_indices,
+            out_indices=inputs["out_indices"],
         )
         results["direct_scatter"] = scatter_out
     torch.cuda.synchronize()
@@ -139,9 +136,11 @@ def run_shapes(inputs, rows: int) -> dict[str, torch.Tensor]:
 def collect() -> dict[str, torch.Tensor]:
     outputs: dict[str, torch.Tensor] = {}
     # pages_per_row 2 stays on the unsplit path; 64 crosses into split-K, where
-    # the epilogue runs under a different scheduler and q_stage.
+    # the epilogue runs under a different scheduler and q_stage. rows 64 is the
+    # unsplit path with a main loop long enough to matter, which is where the
+    # high-batch decode launches land.
     for heads_q, heads_kv in HEAD_CONFIGS:
-        for rows, pages_per_row in ((3, 2), (1, 64), (5, 64)):
+        for rows, pages_per_row in ((3, 2), (64, 8), (1, 64), (5, 64)):
             inputs = build_inputs(heads_q, heads_kv, rows, pages_per_row)
             tag = f"h{heads_q}x{heads_kv}_r{rows}_p{pages_per_row}"
             for name, tensor in run_shapes(inputs, rows).items():
@@ -177,14 +176,57 @@ def compare(before_path: Path, after_path: Path) -> int:
     return 0
 
 
+def determinism(shapes: str, repeat: int) -> int:
+    """Run the same inputs repeatedly in one process and diff the outputs.
+
+    Staying in one process keeps the compiled kernel and the allocator state
+    fixed, so a difference here is the kernel itself rather than anything about
+    how the run was set up.
+    """
+    failures = 0
+    for spec in shapes.split(","):
+        heads_q, heads_kv, rows, pages = (int(x) for x in spec.split("x"))
+        inputs = build_inputs(heads_q, heads_kv, rows, pages)
+        ctas = rows * heads_kv
+        reference = run_shapes(inputs, rows)
+        worst: dict[str, float] = {}
+        for _ in range(repeat - 1):
+            for name, tensor in run_shapes(inputs, rows).items():
+                diff = (tensor.float() - reference[name].float()).abs().max().item()
+                worst[name] = max(worst.get(name, 0.0), diff)
+        bad = {name: d for name, d in worst.items() if d > 0}
+        label = f"h{heads_q}x{heads_kv} rows {rows} pages {pages} ({ctas} CTAs)"
+        if bad:
+            failures += 1
+            print(f"  NONDETERMINISTIC  {label}")
+            for name, diff in sorted(bad.items()):
+                print(f"      {name:<16} max_abs_diff {diff:.6g}")
+        else:
+            print(f"  stable            {label}")
+        del inputs, reference
+        torch.cuda.empty_cache()
+    return 1 if failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--compare", type=str, nargs=2, default=None)
+    parser.add_argument(
+        "--determinism",
+        type=str,
+        default=None,
+        help="comma separated headsQxheadsKVxrowsxpages specs",
+    )
+    parser.add_argument("--repeat", type=int, default=8)
     args = parser.parse_args()
 
     if args.compare:
         return compare(Path(args.compare[0]), Path(args.compare[1]))
+
+    if args.determinism:
+        torch.cuda.set_device(0)
+        return determinism(args.determinism, args.repeat)
 
     if not args.out:
         parser.error("one of --out or --compare is required")
