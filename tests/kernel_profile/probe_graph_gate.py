@@ -109,9 +109,21 @@ def graph_us(run, warmup: int, iters: int, repeats: int) -> tuple[float, str]:
     return samples[len(samples) // 2], ""
 
 
-def run_case(case: bd.Case, device, iters: int, warmup: int, repeats: int) -> dict:
+def run_case(
+    case: bd.Case,
+    device,
+    iters: int,
+    warmup: int,
+    repeats: int,
+    hybrid: bool = False,
+    bf16_query: bool = False,
+) -> dict:
     inputs = bd.build_inputs(case, device, quantize_chunk_pages=4096)
-    fp4_run = bd.make_fp4(inputs, hybrid=False, prequantized_query=True)
+    # A fused residual page has no pre-quantized-query benchmark, so it implies
+    # the bf16-query entry point. The two are separable otherwise.
+    fp4_run = bd.make_fp4(
+        inputs, hybrid=hybrid, prequantized_query=not (hybrid or bf16_query)
+    )
 
     record: dict[str, object] = {
         "case": case.label,
@@ -172,6 +184,16 @@ def main() -> None:
             "which was calibrated against eager-mode host overhead"
         ),
     )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="fuse a bf16 residual page, which the transposed softmax excludes",
+    )
+    parser.add_argument(
+        "--bf16-query",
+        action="store_true",
+        help="quantize the query inside the call instead of passing it as fp4",
+    )
     parser.add_argument("--out", type=str, default=None)
     args = parser.parse_args()
 
@@ -192,7 +214,15 @@ def main() -> None:
                 heads_q=args.heads_q,
                 heads_kv=args.heads_kv,
             )
-            record = run_case(case, device, args.iters, args.warmup, args.repeats)
+            record = run_case(
+                case,
+                device,
+                args.iters,
+                args.warmup,
+                args.repeats,
+                args.hybrid,
+                args.bf16_query,
+            )
             rows.append(record)
             print(
                 f"{case.label:<30}"
