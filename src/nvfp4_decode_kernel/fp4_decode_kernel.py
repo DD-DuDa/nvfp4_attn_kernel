@@ -87,8 +87,11 @@ RESCALE_THRESHOLD = 8.0
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
     # Publishes the per-warp partial row maxima between the four softmax warps
-    # once per KV block when S is transposed.
+    # of one warpgroup, once per KV block when S is transposed. The two
+    # warpgroups own disjoint query rows and must not synchronise with each
+    # other, so each takes its own barrier.
     SoftmaxReduce = enum.auto()
+    SoftmaxReduce1 = enum.auto()
 #     WarpSchedulerWG1 = enum.auto()
 #     WarpSchedulerWG2 = enum.auto()
 #     WarpSchedulerWG3 = enum.auto()
@@ -147,6 +150,8 @@ class FP4DecodeKernel:
         self.transpose_s_requested = transpose_s
         self.transpose_s = False
         self.transposed_query_rows = 0
+        self.softmax_row_groups = 1
+        self.softmax_rows_per_group = 0
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -618,6 +623,16 @@ class FP4DecodeKernel:
             # rows of the M tile; transposed, they are the only live columns of
             # S and the only rows of O the epilogue can reach.
             self.transposed_query_rows = self.qhead_per_kvhead
+            # A decode carries one Q tile, so the second softmax warpgroup has
+            # nothing to do. Handing it half the query rows halves the
+            # butterfly, the exponentials and the packing every thread runs,
+            # while the two groups write disjoint rows of P and of the scales.
+            self.softmax_row_groups = (
+                2 if self.q_stage == 1 and self.transposed_query_rows % 2 == 0 else 1
+            )
+            self.softmax_rows_per_group = (
+                self.transposed_query_rows // self.softmax_row_groups
+            )
 
         # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
@@ -1779,7 +1794,8 @@ class FP4DecodeKernel:
                     mbar_ptr + self.mbar_softmax_corr_empty_offset + i, cute.arch.WARP_SIZE * 4
                 )
                 cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_softmax_corr_full_offset + i, cute.arch.WARP_SIZE * 4
+                    mbar_ptr + self.mbar_softmax_corr_full_offset + i,
+                    cute.arch.WARP_SIZE * 4 * self.softmax_row_groups,
                 )
         if warp_idx == 3:
             if const_expr(self.s0_s1_barrier):
@@ -1802,7 +1818,10 @@ class FP4DecodeKernel:
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_P_full_O_rescaled_offset + i,
                     cute.arch.WARP_SIZE
-                    * (len(self.softmax0_warp_ids) + len(self.correction_warp_ids)),
+                    * (
+                        len(self.softmax0_warp_ids) * self.softmax_row_groups
+                        + len(self.correction_warp_ids)
+                    ),
                 )
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_S_full_offset + i, len([self.mma_warp_id])
@@ -1832,7 +1851,9 @@ class FP4DecodeKernel:
             for i in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_sfqk_load_offset + i,
-                    cute.arch.WARP_SIZE * len(self.softmax0_warp_ids)
+                    cute.arch.WARP_SIZE
+                    * len(self.softmax0_warp_ids)
+                    * self.softmax_row_groups,
                 )
             if const_expr(self.fused_residual_first_block):
                 for i in cutlass.range_constexpr(3):
@@ -2342,7 +2363,15 @@ class FP4DecodeKernel:
                 else:
                     s_off = self.tmem_s_offset[0]
                 tStSi_local = cute.make_tensor(tStS.iterator + s_off, tStS.layout)
-                if const_expr(self.q_stage == 2) or stage == 0:
+                if const_expr(self.softmax_row_groups == 2):
+                    # Both warpgroups drive the single Q stage; specialising on
+                    # the group keeps its row offset, its scratch and its
+                    # barrier compile-time constants.
+                    if warp_idx < self.softmax1_warp_ids[0]:
+                        softmax_loop(stage=0, tStSi=tStSi_local, tCtSFP=tCtSFP, row_group=0)
+                    else:
+                        softmax_loop(stage=0, tStSi=tStSi_local, tCtSFP=tCtSFP, row_group=1)
+                elif const_expr(self.q_stage == 2) or stage == 0:
                     softmax_loop(
                         stage=stage,
                         tStSi=tStSi_local,
@@ -3414,6 +3443,7 @@ class FP4DecodeKernel:
         red_buf: Int32,
         op: Callable,
         intra_warp: cutlass.Constexpr[bool] = True,
+        row_group: cutlass.Constexpr[int] = 0,
     ) -> Int32:
         """Reduce one value per query row across all softmax threads, in place.
 
@@ -3427,17 +3457,17 @@ class FP4DecodeKernel:
         because they needed one of the butterfly's intermediate stages anyway.
         """
         num_warps = const_expr(len(self.softmax0_warp_ids))
-        rows = const_expr(self.transposed_query_rows)
+        rows = const_expr(self.softmax_rows_per_group)
         if const_expr(intra_warp):
             for j in cutlass.range_constexpr(rows):
                 vals[j] = utils.warp_reduce(vals[j], op)
-        base = red_buf * (num_warps * rows)
+        base = const_expr(row_group * 2 * num_warps * rows) + red_buf * (num_warps * rows)
         if tidx % cute.arch.WARP_SIZE == 0:
             warp = tidx // cute.arch.WARP_SIZE
             for j in cutlass.range_constexpr(rows):
                 sSoftmaxRed[base + warp * rows + j] = vals[j]
         cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.SoftmaxReduce),
+            barrier_id=int(NamedBarrierFwd.SoftmaxReduce) + row_group,
             number_of_threads=num_warps * cute.arch.WARP_SIZE,
         )
         for j in cutlass.range_constexpr(rows):
@@ -3492,6 +3522,7 @@ class FP4DecodeKernel:
         sP_uint8: cute.Tensor,
         sSoftmaxRed: cute.Tensor,
         tidx: Int32,
+        row_group: cutlass.Constexpr[int] = 0,
     ):
         """Softmax over an S tile held as (kv position, query row).
 
@@ -3502,10 +3533,14 @@ class FP4DecodeKernel:
         end of the tile because the running correction factor is the same in
         every thread and factors out of the accumulation.
         """
-        rows = const_expr(self.transposed_query_rows)
+        rows = const_expr(self.softmax_rows_per_group)
+        row_base = const_expr(row_group * rows)
         # Only the leading columns of S carry a query; the rest of the MMA tile
-        # is padding that the tensor-memory load simply never reads.
-        tStS_live = cute.composition(tStSi, cute.make_layout((self.m_block_size, rows)))
+        # is padding that the tensor-memory load simply never reads. A column of
+        # S is a tensor-memory column, so a warpgroup reaches its own rows by
+        # advancing the iterator past the group before it.
+        tStS_group = cute.make_tensor(tStSi.iterator + row_base, tStSi.layout)
+        tStS_live = cute.composition(tStS_group, cute.make_layout((self.m_block_size, rows)))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScS_live = cute.composition(tScS, cute.make_layout((self.m_block_size, rows)))
         tmem_load_atom = cute.make_copy_atom(
@@ -3545,6 +3580,7 @@ class FP4DecodeKernel:
             sSoftmaxRed=sSoftmaxRed,
             stage=stage,
             tidx=tidx,
+            row_group=row_group,
         )
 
         tile_scheduler = TileSchedulerCls()
@@ -3592,15 +3628,20 @@ class FP4DecodeKernel:
                     )
 
                 red_buf = self.softmax_warpgroup_reduce(
-                    row_sum, sSoftmaxRed, tidx, red_buf, lambda a, b: a + b
+                    row_sum,
+                    sSoftmaxRed,
+                    tidx,
+                    red_buf,
+                    lambda a, b: a + b,
+                    row_group=row_group,
                 )
                 if tidx == 0:
                     for j in cutlass.range_constexpr(rows):
-                        sScale[j + stage * self.m_block_size] = row_sum[j]
+                        sScale[row_base + j + stage * self.m_block_size] = row_sum[j]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         for j in cutlass.range_constexpr(rows):
                             sScale[
-                                j + stage * self.m_block_size + self.m_block_size * 2
+                                row_base + j + stage * self.m_block_size + self.m_block_size * 2
                             ] = row_max[j]
                 cute.arch.mbarrier_arrive(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + stage
@@ -3632,6 +3673,7 @@ class FP4DecodeKernel:
         seqlen_k: Int32,
         is_first: cutlass.Constexpr[bool],
         mask_seqlen: cutlass.Constexpr[bool],
+        row_group: cutlass.Constexpr[int] = 0,
     ) -> Tuple[Int32, Int32, Int32]:
         """One KV block of the transposed softmax.
 
@@ -3640,7 +3682,8 @@ class FP4DecodeKernel:
         scale group of 16 kv positions is 16 lanes of one warp, and the two FP4
         nibbles that share a byte sit in neighbouring lanes.
         """
-        rows = const_expr(self.transposed_query_rows)
+        rows = const_expr(self.softmax_rows_per_group)
+        row_base = const_expr(row_group * rows)
         bytes_per_row = const_expr(self.n_block_size // 2)
         atom_k_bytes = const_expr(self.n_block_size // 4)
 
@@ -3680,7 +3723,13 @@ class FP4DecodeKernel:
                 val = cute.arch.fmax(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
             block_max[j] = val
         red_buf = self.softmax_warpgroup_reduce(
-            block_max, sSoftmaxRed, tidx, red_buf, cute.arch.fmax, intra_warp=False
+            block_max,
+            sSoftmaxRed,
+            tidx,
+            red_buf,
+            cute.arch.fmax,
+            intra_warp=False,
+            row_group=row_group,
         )
         acc_scale = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         row_max_safe = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
@@ -3716,7 +3765,7 @@ class FP4DecodeKernel:
         if const_expr(not is_first):
             if tidx == 0:
                 for j in cutlass.range_constexpr(rows):
-                    sScale[j + stage * self.m_block_size] = acc_scale[j]
+                    sScale[row_base + j + stage * self.m_block_size] = acc_scale[j]
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
         iket.range_push("sm_exp")
@@ -3748,10 +3797,11 @@ class FP4DecodeKernel:
         # lane's value over and the even lane stores the merged byte.
         k_byte = tidx // 2
         for j in cutlass.range_constexpr(rows):
+            row = row_base + j
             partner = cute.arch.shuffle_sync_bfly(tSrS[j], offset=1)
             if tidx % 2 == 0:
                 packed = sm100_utils.packed_float_to_e2m1x2(partner, tSrS[j])
-                sP_uint8[(j, k_byte % atom_k_bytes), 0, k_byte // atom_k_bytes, 0] = (
+                sP_uint8[(row, k_byte % atom_k_bytes), 0, k_byte // atom_k_bytes, 0] = (
                     cutlass.Uint8(packed & 0xFF)
                 )
 
@@ -3759,11 +3809,12 @@ class FP4DecodeKernel:
         if tidx % self.sf_vec_size == 0:
             k_group = tidx // self.sf_vec_size
             for j in cutlass.range_constexpr(rows):
+                row = row_base + j
                 sf_byte = packed_float_to_ue4m3(
                     group_max[j], Float32(0.0), Float32(0.0), Float32(0.0)
                 )
                 sSFP_u8[
-                    (((j % 32, j // 32), 0), (0, k_group % 4)), 0, k_group // 4
+                    (((row % 32, row // 32), 0), (0, k_group % 4)), 0, k_group // 4
                 ] = cutlass.Uint8(sf_byte & 0xFF)
         # The MMA reads P and its scale factors through the async proxy while
         # these are generic-proxy stores; the mbarrier below only orders generic
@@ -3805,6 +3856,7 @@ class FP4DecodeKernel:
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
         sP_uint8: Optional[cute.Tensor] = None,
         sSoftmaxRed: Optional[cute.Tensor] = None,
+        row_group: cutlass.Constexpr[int] = 0,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3841,6 +3893,7 @@ class FP4DecodeKernel:
                 sP_uint8=sP_uint8,
                 sSoftmaxRed=sSoftmaxRed,
                 tidx=tidx,
+                row_group=row_group,
             )
             return
 
