@@ -763,6 +763,121 @@ def test_prequantized_query_matches_bf16_query_exactly(
     assert torch.equal(fp4_query_output, bf16_query_output)
 
 
+@pytest.mark.parametrize(
+    ("heads_q", "heads_kv", "num_splits"),
+    [
+        (16, 16, 2),
+        (32, 8, 4),
+        (16, 1, 8),
+    ],
+)
+def test_split_k_matches_unsplit_pure_fp4(
+    heads_q: int,
+    heads_kv: int,
+    num_splits: int,
+) -> None:
+    """Pure FP4 split-K keeps the existing numerical gate for MHA/GQA/MQA."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    from nvfp4_decode_kernel._decode import decode_fp4, decode_fp4_split
+
+    torch.manual_seed(0x5A17 + heads_kv)
+    pages = 8
+    head_dim = 128
+    query = torch.randn(
+        1, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        pages,
+        128,
+        heads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    query_fp4, query_scales = _quantize.quantize_query(
+        query, heads_kv=heads_kv
+    )
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    page_table = torch.arange(
+        pages, device="cuda", dtype=torch.int32
+    ).reshape(1, pages)
+    seqused_fp4 = torch.full(
+        (1,), pages * 128, device="cuda", dtype=torch.int32
+    )
+    common = dict(
+        query_fp4=query_fp4,
+        query_scales=query_scales,
+        key_pages_fp4=key_pages_fp4,
+        key_scales=key_scales,
+        value_pages_fp4=value_pages_fp4,
+        value_scales=value_scales,
+        fp4_page_table=page_table,
+        seqused_fp4=seqused_fp4,
+        softmax_scale=head_dim**-0.5,
+    )
+
+    with torch.no_grad():
+        unsplit = decode_fp4(query_padded_bf16=None, **common)
+        split = decode_fp4_split(num_splits=num_splits, **common)
+    torch.cuda.synchronize()
+
+    cosine = _cosine(split, unsplit)
+    max_abs = (split.float() - unsplit.float()).abs().max().item()
+    assert cosine >= FP4_MIN_COSINE
+    assert max_abs <= FP4_MAX_ABS_ERROR
+
+
+def test_split_k_empty_partitions_are_ignored() -> None:
+    """Unused split CTAs must contribute LSE=-inf and no output weight."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    from nvfp4_decode_kernel._decode import decode_fp4, decode_fp4_split
+
+    torch.manual_seed(0xE117)
+    heads_q, heads_kv, head_dim = 16, 1, 128
+    query = torch.randn(
+        1, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        1, 128, heads_kv, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    query_fp4, query_scales = _quantize.quantize_query(
+        query, heads_kv=heads_kv
+    )
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    common = dict(
+        query_fp4=query_fp4,
+        query_scales=query_scales,
+        key_pages_fp4=key_pages_fp4,
+        key_scales=key_scales,
+        value_pages_fp4=value_pages_fp4,
+        value_scales=value_scales,
+        fp4_page_table=torch.zeros(
+            1, 1, device="cuda", dtype=torch.int32
+        ),
+        seqused_fp4=torch.full(
+            (1,), 128, device="cuda", dtype=torch.int32
+        ),
+        softmax_scale=head_dim**-0.5,
+    )
+    with torch.no_grad():
+        unsplit = decode_fp4(query_padded_bf16=None, **common)
+        split = decode_fp4_split(num_splits=8, **common)
+    torch.cuda.synchronize()
+    assert torch.equal(split, unsplit)
+
+
 def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
     contract_decode_inputs: ContractDecodeInputs,
 ) -> None:

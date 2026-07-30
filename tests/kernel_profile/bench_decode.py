@@ -27,7 +27,11 @@ import torch
 from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.interface import num_splits_heuristic
 from nvfp4_decode_kernel import _quantize, fp4_decode
-from nvfp4_decode_kernel._decode import _decode_compile_cache
+from nvfp4_decode_kernel._decode import (
+    _decode_compile_cache,
+    _split_decode_compile_cache,
+    split_k_heuristic,
+)
 
 
 PAGE_SIZE = 128
@@ -244,6 +248,7 @@ def make_fp4(
             fp4_page_table=inputs.page_table,
             seqused_fp4=inputs.seqused_fp4_full,
             softmax_scale=inputs.softmax_scale,
+            trusted_metadata=True,
         )
 
     def run_hybrid():
@@ -261,6 +266,7 @@ def make_fp4(
             seqused_residual=inputs.seqused_residual,
             has_bf16=inputs.has_bf16,
             softmax_scale=inputs.softmax_scale,
+            trusted_metadata=True,
         )
 
     def run_prequantized():
@@ -274,6 +280,7 @@ def make_fp4(
             query_fp4=inputs.query_fp4,
             query_scales=inputs.query_scales,
             softmax_scale=inputs.softmax_scale,
+            trusted_metadata=True,
         )
 
     if prequantized_query:
@@ -288,6 +295,7 @@ def make_fp4(
 def clear_fp4_compile_caches() -> None:
     """Force the next FP4 call in this process to compile under IKET."""
     _decode_compile_cache.clear()
+    _split_decode_compile_cache.clear()
 
 
 def kv_bytes(case: Case, variant: str) -> int:
@@ -392,9 +400,15 @@ def variant_factory(
             inputs, hybrid=True, prequantized_query=False
         ), 1, None
     if name == "fp4_pure_fp4q":
+        splits = split_k_heuristic(
+            inputs.case.batch,
+            inputs.case.heads_kv,
+            inputs.case.seqlen // PAGE_SIZE,
+            sms=torch.cuda.get_device_properties(device).multi_processor_count,
+        )
         return make_fp4(
             inputs, hybrid=False, prequantized_query=True
-        ), 1, None
+        ), splits, None
     raise KeyError(name)
 
 

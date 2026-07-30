@@ -19,6 +19,37 @@ from .fp4_decode_kernel import FP4DecodeKernel
 PAGE_SIZE = 128
 HEAD_DIM = 128
 _decode_compile_cache: dict[tuple[Any, ...], Any] = {}
+_split_decode_compile_cache: dict[tuple[Any, ...], Any] = {}
+
+
+def split_k_heuristic(
+    rows: int,
+    heads_kv: int,
+    max_pages_per_row: int,
+    *,
+    sms: int,
+) -> int:
+    """Select a conservative fixed split count for pure FP4 decode.
+
+    Fill the machine when the unsplit grid is too small, but never create more
+    splits than there are page blocks. Power-of-two candidates keep one
+    compiled kernel per useful occupancy tier and match the combine kernel's
+    fixed workspace contract.
+    """
+    if rows < 1 or heads_kv < 1 or max_pages_per_row < 2 or sms < 1:
+        return 1
+    # The private combine is a fixed launch whose overhead dominates very
+    # short contexts; the split main kernel does not amortize it below 16K.
+    if max_pages_per_row < 128:
+        return 1
+    unsplit_ctas = rows * heads_kv
+    if unsplit_ctas >= sms:
+        return 1
+    target = max(2, math.ceil(sms / unsplit_ctas))
+    for splits in (8, 4, 2):
+        if splits <= target and splits <= max_pages_per_row:
+            return splits
+    return 1
 
 
 def _to_cute_tensor(
@@ -333,6 +364,103 @@ def _compile_decode(
     return compiled
 
 
+def _compile_split_decode(
+    *,
+    query_fp4: torch.Tensor,
+    query_scales: torch.Tensor,
+    key_pages_fp4: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_pages_fp4: torch.Tensor,
+    value_scales: torch.Tensor,
+    fp4_page_table: torch.Tensor,
+    seqused_fp4: torch.Tensor,
+    output_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+) -> Any:
+    heads_q = query_fp4.shape[2]
+    heads_kv = key_pages_fp4.shape[2]
+    cache_key = (
+        query_fp4.device.index,
+        heads_q,
+        heads_kv,
+        num_splits,
+    )
+    compiled = _split_decode_compile_cache.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    operation = FP4DecodeKernel(
+        HEAD_DIM,
+        HEAD_DIM,
+        qhead_per_kvhead=heads_q // heads_kv,
+        is_causal=False,
+        is_local=False,
+        is_split_kv=True,
+        pack_gqa=True,
+        m_block_size=PAGE_SIZE,
+        n_block_size=PAGE_SIZE,
+        is_persistent=False,
+        score_mod=None,
+        mask_mod=None,
+        has_aux_tensors=False,
+        paged_kv_non_tma=False,
+        is_varlen_q=False,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        bf16_q_input=False,
+        fused_residual_first_block=False,
+        residual_source="paged_bf16",
+        use_out_indices=False,
+        seqlen_q_static_one=True,
+    )
+    fake_stream = cute.runtime.make_fake_stream()
+    fp4_pointer = lambda: make_ptr(
+        cutlass.Float4E2M1FN,
+        0,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    compile_args = (
+        operation,
+        fp4_pointer(),
+        fp4_pointer(),
+        fp4_pointer(),
+        _to_cute_tensor(output_partial, assumed_align=16, leading_dim=4),
+        _to_cute_tensor(lse_partial, assumed_align=4, leading_dim=3),
+        Float32(softmax_scale),
+        fake_stream,
+        None,
+        None,
+        None,
+        _to_cute_tensor(seqused_fp4, assumed_align=4, leading_dim=0),
+        _to_cute_tensor(fp4_page_table, assumed_align=4, leading_dim=1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        _to_cute_tensor(query_scales, assumed_align=16, leading_dim=3),
+        _to_cute_tensor(key_scales, assumed_align=16, leading_dim=3),
+        _to_cute_tensor(value_scales, assumed_align=16, leading_dim=3),
+        tuple(Int32(0) for _ in query_fp4.shape),
+        tuple(Int32(0) for _ in key_pages_fp4.shape),
+        tuple(Int32(0) for _ in value_pages_fp4.shape),
+    )
+    compiled = cute.compile(
+        *compile_args,
+        k_page_stride=Int32(0),
+        v_page_stride=Int32(0),
+        k_sf_page_stride=Int32(0),
+        v_sf_page_stride=Int32(0),
+        mOutIndices=None,
+        options="--enable-tvm-ffi",
+    )
+    _split_decode_compile_cache[cache_key] = compiled
+    return compiled
+
+
 def decode_fp4(
     *,
     query_fp4: torch.Tensor,
@@ -353,7 +481,8 @@ def decode_fp4(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
-) -> torch.Tensor:
+    validate_only: bool = False,
+) -> torch.Tensor | None:
     """Validate, compile/cache, and launch FP4 paged decode on SM100."""
     if not torch.cuda.is_available():
         raise RuntimeError("decode_fp4 requires CUDA")
@@ -609,6 +738,9 @@ def decode_fp4(
             "has_bf16 requires the BF16 residual cache arguments"
         )
 
+    if validate_only:
+        return None
+
     packed_query_scales = query_scales
     use_out_indices = out is not None or out_indices is not None
     if use_out_indices and (out is None or out_indices is None):
@@ -757,3 +889,149 @@ def decode_fp4(
     if out is not None:
         return out
     return output_4d[:, 0]
+
+
+def decode_fp4_split(
+    *,
+    query_fp4: torch.Tensor,
+    query_scales: torch.Tensor,
+    key_pages_fp4: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_pages_fp4: torch.Tensor,
+    value_scales: torch.Tensor,
+    fp4_page_table: torch.Tensor,
+    seqused_fp4: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+) -> torch.Tensor:
+    """Run pure FP4 split-K decode and combine partial O/LSE."""
+    if num_splits <= 1:
+        return decode_fp4(
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            query_padded_bf16=None,
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales,
+            fp4_page_table=fp4_page_table,
+            seqused_fp4=seqused_fp4,
+            softmax_scale=softmax_scale,
+        )
+
+    # Reuse the core validator before allocating the split workspace.
+    rows, _, heads_q, _ = query_fp4.shape
+    device = query_fp4.device
+    heads_kv = key_pages_fp4.shape[2]
+    if heads_q % heads_kv:
+        raise ValueError("heads_q must be divisible by heads_kv")
+    for tensor, name in (
+        (query_fp4, "query_fp4"),
+        (query_scales, "query_scales"),
+        (key_pages_fp4, "key_pages_fp4"),
+        (key_scales, "key_scales"),
+        (value_pages_fp4, "value_pages_fp4"),
+        (value_scales, "value_scales"),
+        (fp4_page_table, "fp4_page_table"),
+        (seqused_fp4, "seqused_fp4"),
+    ):
+        _require_cuda_tensor(tensor, name, device=device)
+    output_partial = torch.empty(
+        num_splits,
+        rows,
+        1,
+        heads_q,
+        HEAD_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
+    lse_partial = torch.empty(
+        num_splits,
+        rows,
+        heads_q,
+        1,
+        dtype=torch.float32,
+        device=device,
+    )
+    key_scales_kernel = _page_scales_for_kernel(
+        _as_e4m3(key_scales, "key_scales"), "key_scales"
+    )
+    value_scales_kernel = _page_scales_for_kernel(
+        _as_e4m3(value_scales, "value_scales"), "value_scales"
+    )
+    with torch.cuda.device(device):
+        compiled = _compile_split_decode(
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales_kernel,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales_kernel,
+            fp4_page_table=fp4_page_table,
+            seqused_fp4=seqused_fp4,
+            output_partial=output_partial,
+            lse_partial=lse_partial,
+            softmax_scale=softmax_scale,
+            num_splits=num_splits,
+        )
+        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+        fp4_ptr = lambda tensor: make_ptr(
+            cutlass.Float4E2M1FN,
+            tensor.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        compiled(
+            fp4_ptr(query_fp4),
+            fp4_ptr(key_pages_fp4),
+            fp4_ptr(value_pages_fp4),
+            output_partial,
+            lse_partial,
+            softmax_scale,
+            stream,
+            None,
+            None,
+            None,
+            seqused_fp4,
+            fp4_page_table,
+            None,
+            None,
+            None,
+            None,
+            None,
+            query_scales,
+            key_scales_kernel,
+            value_scales_kernel,
+            (
+                rows,
+                1,
+                heads_q,
+                HEAD_DIM,
+            ),
+            (
+                key_pages_fp4.shape[0],
+                PAGE_SIZE,
+                heads_kv,
+                HEAD_DIM,
+            ),
+            (
+                key_pages_fp4.shape[0],
+                PAGE_SIZE,
+                heads_kv,
+                HEAD_DIM,
+            ),
+            k_page_stride=_page_stride_bytes(key_pages_fp4, "key_pages_fp4") * 2,
+            v_page_stride=_page_stride_bytes(value_pages_fp4, "value_pages_fp4") * 2,
+            k_sf_page_stride=key_scales_kernel.stride()[-1],
+            v_sf_page_stride=value_scales_kernel.stride()[-1],
+            mOutIndices=None,
+        )
+    from .split_k_combine import flash_attn_combine
+
+    output, _ = flash_attn_combine(
+        output_partial,
+        lse_partial.transpose(-1, -2),
+        out_dtype=torch.bfloat16,
+        return_lse=False,
+    )
+    return output[:, 0]

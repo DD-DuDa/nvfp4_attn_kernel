@@ -28,7 +28,7 @@ def fp4_decode_impl(
     trusted_metadata: bool = False,
 ) -> torch.Tensor:
     """Prepare either query contract and run the shared decode core."""
-    from ._decode import decode_fp4
+    from ._decode import decode_fp4, decode_fp4_split, split_k_heuristic
     from ._quantize import quantize_query
 
     has_bf16_query = query is not None
@@ -81,6 +81,48 @@ def fp4_decode_impl(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         query_padded_bf16 = None
+
+    pure_fp4 = residual_key_pages_bf16 is None
+    direct_scatter = out is not None or out_indices is not None
+    num_splits = 1
+    if pure_fp4 and not direct_scatter:
+        device = query_fp4.device
+        num_splits = split_k_heuristic(
+            query_fp4.shape[0],
+            key_pages_fp4.shape[2],
+            fp4_page_table.shape[1],
+            sms=torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+    if num_splits > 1:
+        # Keep the single public entry's full contract checks when dispatching
+        # to the split implementation. Trusted metadata skips only the
+        # intentional device-value scans, not host shape/dtype validation.
+        decode_fp4(
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            query_padded_bf16=None,
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales,
+            fp4_page_table=fp4_page_table,
+            seqused_fp4=seqused_fp4,
+            softmax_scale=softmax_scale,
+            trusted_metadata=trusted_metadata,
+            validate_only=True,
+        )
+        return decode_fp4_split(
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales,
+            fp4_page_table=fp4_page_table,
+            seqused_fp4=seqused_fp4,
+            softmax_scale=softmax_scale,
+            num_splits=num_splits,
+        )
 
     return decode_fp4(
         query_fp4=query_fp4,

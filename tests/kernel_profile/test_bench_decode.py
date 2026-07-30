@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from nvfp4_decode_kernel._decode import split_k_heuristic
 from tests.kernel_profile.bench_decode import quantize_pages_chunked, summarize
 
 
@@ -86,6 +87,36 @@ def test_summary_reports_fp4_q_unavailable_without_fabricating_data() -> None:
         "diagnostic_cross_head_geomean": None,
         "worst_point": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("rows", "heads_kv", "pages", "expected"),
+    [
+        (1, 1, 128, 8),
+        (1, 8, 128, 8),
+        (4, 8, 128, 4),
+        (8, 8, 128, 2),
+        (16, 8, 128, 2),
+        (32, 8, 128, 1),
+        (1, 8, 127, 1),
+        (1, 8, 1, 1),
+    ],
+)
+def test_split_k_heuristic_fills_low_batch_without_splitting_high_batch(
+    rows: int,
+    heads_kv: int,
+    pages: int,
+    expected: int,
+) -> None:
+    assert (
+        split_k_heuristic(
+            rows,
+            heads_kv,
+            pages,
+            sms=148,
+        )
+        == expected
+    )
 
 
 def test_summary_keeps_head_config_gates_separate() -> None:
