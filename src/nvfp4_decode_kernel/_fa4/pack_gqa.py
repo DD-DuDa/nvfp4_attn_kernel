@@ -131,7 +131,22 @@ class PackGQA:
         tidx: cutlass.Int32,
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
+        max_rows: cutlass.Constexpr = None,
+        stage_from_smem: cutlass.Constexpr[bool] = False,
     ):
+        """Store one output tile, one row-step at a time.
+
+        ``max_rows`` bounds, at compile time, how many rows of this tile the
+        runtime predicate below can admit; the caller must guarantee
+        ``seqlen * qhead_per_kvhead - block * m_block_size <= max_rows``. Row
+        steps past that bound would store nothing, so the loop simply stops.
+
+        ``stage_from_smem`` makes ``tOrO`` a shared-memory tensor of the same
+        partitioned shape instead of a register fragment, staged into registers
+        one row-step at a time. Materializing the whole tile up front costs 256
+        registers per thread, which spills when this runs on a single warp that
+        has already dropped to a small register budget.
+        """
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tOcO = gmem_thr_copy.partition_S(cO)
@@ -142,13 +157,22 @@ class PackGQA:
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
         tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
-        for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+        num_row_steps = cute.size(tOrO.shape[1])
+        if cutlass.const_expr(max_rows is not None):
+            rows_per_step = num_threads // threads_per_row
+            num_row_steps = min(num_row_steps, -(-max_rows // rows_per_step))
+        for m in cutlass.range_constexpr(num_row_steps):
             o_ptr_i64 = utils.shuffle_sync(
                 tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
             )
             o_gmem_ptr = cute.make_ptr(
                 mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
+            if cutlass.const_expr(stage_from_smem):
+                tOrO_m = cute.make_fragment_like(tOrO[None, m, None], mO.element_type)
+                cute.autovec_copy(tOrO[None, m, None], tOrO_m)
+            else:
+                tOrO_m = tOrO[None, m, None]
             if (
                 t0OcO[0, m, 0][0]
                 < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]
@@ -160,7 +184,7 @@ class PackGQA:
                     ki = tOcO[0, 0, k][1] // elems_per_load
                     cute.copy(
                         gmem_thr_copy,
-                        tOrO[None, m, k],
+                        tOrO_m[None, k],
                         mO_cur_copy[None, ki],
                         pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )

@@ -4378,6 +4378,15 @@ class FP4DecodeKernel:
                         self.check_hdim_v_oob,
                         self.qhead_per_kvhead,
                     )
+                    # With seqlen_q statically one, PackGQA folds exactly
+                    # qhead_per_kvhead rows, and since that is at most one
+                    # m_block_size there is a single m_block and every reachable
+                    # row lives in Q stage 0. Both the row bound and the dead
+                    # stage are therefore compile-time constants.
+                    reachable_rows = None
+                    if const_expr(self.pack_gqa and self.seqlen_q_static_one):
+                        assert self.qhead_per_kvhead <= self.m_block_size
+                        reachable_rows = self.qhead_per_kvhead
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
@@ -4387,44 +4396,58 @@ class FP4DecodeKernel:
                         )
                         iket.range_pop()
                         # 2. copy O0 / O1 to gmem
-                        # load acc O from smem to rmem for wider vectorization
-                        tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
-                        cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
-                        if const_expr(not self.pack_gqa):
-                            effective_seqlen_q_nonpack = (
-                                Int32(1)
-                                if const_expr(self.seqlen_q_static_one)
-                                else seqlen.seqlen_q
-                            )
-                            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                                if (
-                                    t0OcO[0, rest_m, 0][0]
-                                    < effective_seqlen_q_nonpack
-                                    - (self.q_stage * m_block + stage) * self.m_block_size
-                                    - tOcO[0][0]
-                                ):
-                                    cute.copy(
-                                        gmem_tiled_copy_O,
-                                        tOrO[None, rest_m, None],
-                                        tOgO[None, rest_m, None, self.q_stage * m_block + stage],
-                                        pred=tOpO[None, rest_m, None]
-                                        if const_expr(self.check_hdim_v_oob)
-                                        else None,
-                                    )
-                        else:
-                            effective_seqlen_q = (
-                                Int32(1)
-                                if const_expr(self.use_out_indices or self.seqlen_q_static_one)
-                                else seqlen.seqlen_q
-                            )
-                            pack_gqa.store_O(
-                                mO_cur,
-                                tOrO,
-                                gmem_tiled_copy_O,
-                                tidx,
-                                self.q_stage * m_block + stage,
-                                effective_seqlen_q,
-                            )
+                        stage_is_live = (
+                            reachable_rows is None
+                            or stage * self.m_block_size < reachable_rows
+                        )
+                        if const_expr(stage_is_live):
+                            if const_expr(not self.pack_gqa):
+                                # load acc O from smem to rmem for wider vectorization
+                                tOrO = cute.make_fragment_like(
+                                    tOsO[None, None, None, 0], self.o_dtype
+                                )
+                                cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
+                                effective_seqlen_q_nonpack = (
+                                    Int32(1)
+                                    if const_expr(self.seqlen_q_static_one)
+                                    else seqlen.seqlen_q
+                                )
+                                for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                                    if (
+                                        t0OcO[0, rest_m, 0][0]
+                                        < effective_seqlen_q_nonpack
+                                        - (self.q_stage * m_block + stage) * self.m_block_size
+                                        - tOcO[0][0]
+                                    ):
+                                        cute.copy(
+                                            gmem_tiled_copy_O,
+                                            tOrO[None, rest_m, None],
+                                            tOgO[
+                                                None,
+                                                rest_m,
+                                                None,
+                                                self.q_stage * m_block + stage,
+                                            ],
+                                            pred=tOpO[None, rest_m, None]
+                                            if const_expr(self.check_hdim_v_oob)
+                                            else None,
+                                        )
+                            else:
+                                effective_seqlen_q = (
+                                    Int32(1)
+                                    if const_expr(self.use_out_indices or self.seqlen_q_static_one)
+                                    else seqlen.seqlen_q
+                                )
+                                pack_gqa.store_O(
+                                    mO_cur,
+                                    tOsO[None, None, None, stage],
+                                    gmem_tiled_copy_O,
+                                    tidx,
+                                    self.q_stage * m_block + stage,
+                                    effective_seqlen_q,
+                                    max_rows=reachable_rows,
+                                    stage_from_smem=True,
+                                )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
 
                 epi_consumer_phase ^= 1
