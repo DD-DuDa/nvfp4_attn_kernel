@@ -152,6 +152,8 @@ class FP4DecodeKernel:
         self.transposed_query_rows = 0
         self.softmax_row_groups = 1
         self.softmax_rows_per_group = 0
+        self.softmax_red_slots = 0
+        self.softmax_seed_offset = 0
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -375,7 +377,7 @@ class FP4DecodeKernel:
             smem_sP = align_up(
                 self.m_block_size * self.n_block_size * self.v_dtype.width // 8, align
             )
-            smem_sRed = align_up(2 * 4 * self.transposed_query_rows * 4, align)
+            smem_sRed = align_up(self.softmax_red_slots * 4, align)
         else:
             smem_sP = 0
             smem_sRed = 0
@@ -597,7 +599,6 @@ class FP4DecodeKernel:
                     self.seqlen_q_static_one,
                     not self.bf16_q_input,
                     not self.compute_sp1,
-                    not self.fused_residual_first_block,
                     not self.is_causal,
                     not self.is_local,
                     # self.use_block_sparsity is not derived until much later in
@@ -627,12 +628,28 @@ class FP4DecodeKernel:
             # nothing to do. Handing it half the query rows halves the
             # butterfly, the exponentials and the packing every thread runs,
             # while the two groups write disjoint rows of P and of the scales.
+            # The residual block seeds the online softmax from a BF16 tile that
+            # is not transposed, and only one warpgroup may drive it, so the
+            # split stays off while a residual is fused.
             self.softmax_row_groups = (
-                2 if self.q_stage == 1 and self.transposed_query_rows % 2 == 0 else 1
+                2
+                if self.q_stage == 1
+                and self.transposed_query_rows % 2 == 0
+                and not self.fused_residual_first_block
+                else 1
             )
             self.softmax_rows_per_group = (
                 self.transposed_query_rows // self.softmax_row_groups
             )
+            # Two buffers per warp per row for the row reductions, then, when a
+            # residual is fused, a maximum and a sum per row to carry the seed
+            # across the change of orientation.
+            self.softmax_red_slots = (
+                2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
+            )
+            self.softmax_seed_offset = self.softmax_red_slots
+            if const_expr(self.fused_residual_first_block):
+                self.softmax_red_slots += 2 * self.transposed_query_rows
 
         # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
@@ -1108,7 +1125,9 @@ class FP4DecodeKernel:
                 self.pv_acc_dtype,
                 self.cta_group,
                 self.mma_tiler_pv[:2],
-                p_source,
+                # The residual block is not transposed, so its P is a register
+                # fragment staged through tensor memory whatever the FP4 P does.
+                tcgen05.OperandSource.TMEM,
             )
             # SMEM layouts for BF16 residual K/V (single stage — block 0 only).
             sK_bf16_layout = sm100_utils_basic.make_smem_layout_b(
@@ -1453,9 +1472,7 @@ class FP4DecodeKernel:
         # the per-warp partial row maxima between the four softmax warps.
         sP_smem_size = cute.cosize(tP_layout) if const_expr(self.transpose_s) else 1
         softmax_red_size = (
-            2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
-            if const_expr(self.transpose_s)
-            else 1
+            self.softmax_red_slots if const_expr(self.transpose_s) else 1
         )
 
         sK_bf16_smem_size = (
@@ -2012,9 +2029,7 @@ class FP4DecodeKernel:
                 ),
             )
             sSoftmaxRed = storage.sSoftmaxRed.get_tensor(
-                cute.make_layout(
-                    2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
-                )
+                cute.make_layout(self.softmax_red_slots)
             )
         else:
             sSoftmaxRed = None
@@ -3478,6 +3493,48 @@ class FP4DecodeKernel:
         return red_buf ^ 1
 
     @cute.jit
+    def seed_transposed_from_residual(
+        self,
+        softmax: SoftmaxSm100,
+        row_max: cute.Tensor,
+        row_sum: cute.Tensor,
+        sSoftmaxRed: cute.Tensor,
+        tidx: Int32,
+    ):
+        """Turn the residual block's softmax state a quarter turn.
+
+        The residual block is a BF16 tile that is not transposed, so it leaves
+        thread ``tidx`` holding query row ``tidx``. The transposed loop wants
+        every thread to hold every row of its group, which is one publication
+        through shared memory. Only the rows a query occupies are live; the
+        maximum of the rest stays at minus infinity and contributes nothing.
+
+        The maximum is replicated, the sum is not. Transposed, a thread
+        accumulates only the kv positions it owns and the tile ends in a sum
+        across threads, so a replicated seed would be counted once per thread.
+
+        The scratch sits past the reduction buffers rather than sharing them,
+        because the first reduction of the tile writes buffer zero and there is
+        no barrier between that write and this read.
+        """
+        rows = const_expr(self.transposed_query_rows)
+        base = const_expr(self.softmax_seed_offset)
+        if tidx < rows:
+            sSoftmaxRed[base + tidx] = softmax.row_max[0]
+            sSoftmaxRed[base + rows + tidx] = (
+                softmax.row_sum[0] + softmax.row_sum_comp[0]
+            )
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.SoftmaxReduce),
+            number_of_threads=len(self.softmax0_warp_ids) * cute.arch.WARP_SIZE,
+        )
+        for j in cutlass.range_constexpr(const_expr(self.softmax_rows_per_group)):
+            row_max[j] = sSoftmaxRed[base + j]
+            row_sum[j] = Float32(0.0)
+            if tidx == 0:
+                row_sum[j] = sSoftmaxRed[base + rows + j]
+
+    @cute.jit
     def zero_transposed_p(self, sP_uint8: cute.Tensor, sSFP: cute.Tensor, tidx: Int32):
         """Zero the shared P tile and its scale factors once per CTA.
 
@@ -3523,6 +3580,13 @@ class FP4DecodeKernel:
         sSoftmaxRed: cute.Tensor,
         tidx: Int32,
         row_group: cutlass.Constexpr[int] = 0,
+        softmax_scale: Optional[Float32] = None,
+        mResidualSeqUsedK: Optional[cute.Tensor] = None,
+        thr_tmem_load_full: Optional[cute.CopyAtom] = None,
+        thr_tmem_store_bf16: Optional[cute.CopyAtom] = None,
+        thr_tmem_store_scale: Optional[cute.CopyAtom] = None,
+        tStS_t2r_full: Optional[cute.Tensor] = None,
+        tStP_bf16_r2t: Optional[cute.Tensor] = None,
     ):
         """Softmax over an S tile held as (kv position, query row).
 
@@ -3564,6 +3628,16 @@ class FP4DecodeKernel:
 
         row_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
         row_sum = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+
+        if const_expr(self.fused_residual_first_block):
+            residual_softmax = SoftmaxSm100.create(
+                softmax_scale_log2,
+                rescale_threshold=RESCALE_THRESHOLD,
+                softmax_scale=softmax_scale,
+                quant_pv=self.quant_pv,
+                compute_sp1=self.compute_sp1,
+                kahan=True,
+            )
 
         softmax_step = partial(
             self.softmax_step_transposed,
@@ -3607,13 +3681,41 @@ class FP4DecodeKernel:
                 iket.range_pop()
                 si_corr_producer_phase ^= 1
 
+                seeded = const_expr(self.fused_residual_first_block)
+                if const_expr(self.fused_residual_first_block):
+                    residual_softmax.reset()
+                    mma_si_consumer_phase, si_corr_producer_phase, _ = (
+                        self.softmax_residual_step(
+                            mma_si_consumer_phase,
+                            si_corr_producer_phase,
+                            Int32(0),
+                            softmax=residual_softmax,
+                            mbar_ptr=mbar_ptr,
+                            thr_mma_qk=thr_mma_qk,
+                            thr_tmem_load=thr_tmem_load_full,
+                            thr_tmem_store_bf16=thr_tmem_store_bf16,
+                            thr_tmem_store_scale=thr_tmem_store_scale,
+                            tStS_t2r=tStS_t2r_full,
+                            tStP_bf16_r2t=tStP_bf16_r2t,
+                            sScale=sScale,
+                            stage=stage,
+                            batch_idx=batch_idx,
+                            m_block=self.q_stage * m_block + stage,
+                            mResidualSeqUsedK=mResidualSeqUsedK,
+                            thread_idx=tidx,
+                        )
+                    )
+                    self.seed_transposed_from_residual(
+                        residual_softmax, row_max, row_sum, sSoftmaxRed, tidx
+                    )
+
                 mma_si_consumer_phase, si_corr_producer_phase, red_buf = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
                     red_buf,
                     n_block_max - 1,
                     seqlen_k=seqlen.seqlen_k,
-                    is_first=True,
+                    is_first=not seeded,
                     mask_seqlen=True,
                 )
                 for n_tile in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
@@ -3698,7 +3800,14 @@ class FP4DecodeKernel:
         )
 
         if const_expr(mask_seqlen):
-            if n_block * self.n_block_size + tidx >= seqlen_k:
+            # A row whose fp4 length is zero still runs one step, at block -1.
+            # Folding that back onto block 0 puts the limit at the start of the
+            # sequence, so every position is masked, as the untransposed mask
+            # does for the same edge.
+            n_block_masked = n_block
+            if n_block_masked < 0:
+                n_block_masked = Int32(0)
+            if n_block_masked * self.n_block_size + tidx >= seqlen_k:
                 for j in cutlass.range_constexpr(rows):
                     tSrS[j] = -Float32.inf
 
@@ -3875,28 +3984,6 @@ class FP4DecodeKernel:
             * (len(self.softmax0_warp_ids))
         )
 
-        if const_expr(self.transpose_s):
-            self.softmax_loop_transposed(
-                stage=stage,
-                softmax_scale_log2=softmax_scale_log2,
-                thr_mma_qk=thr_mma_qk,
-                tStSi=tStSi,
-                sScale=sScale,
-                mLSE=mLSE,
-                learnable_sink=learnable_sink,
-                mbar_ptr=mbar_ptr,
-                block_info=block_info,
-                num_splits=num_splits,
-                SeqlenInfoCls=SeqlenInfoCls,
-                TileSchedulerCls=TileSchedulerCls,
-                sSFP=sSFP,
-                sP_uint8=sP_uint8,
-                sSoftmaxRed=sSoftmaxRed,
-                tidx=tidx,
-                row_group=row_group,
-            )
-            return
-
         tStScale = cute.composition(tStSi, cute.make_layout((self.m_block_size, 1)))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
@@ -3945,6 +4032,37 @@ class FP4DecodeKernel:
                 tmem_store_bf16_atom, tStP_bf16
             ).get_slice(tidx)
             tStP_bf16_r2t = thr_tmem_store_bf16.partition_D(tStP_bf16)
+
+        if const_expr(self.transpose_s):
+            # The residual block stays untransposed, so it needs the copies
+            # built above; the transposed loop only forwards them.
+            self.softmax_loop_transposed(
+                stage=stage,
+                softmax_scale_log2=softmax_scale_log2,
+                softmax_scale=softmax_scale,
+                thr_mma_qk=thr_mma_qk,
+                tStSi=tStSi,
+                sScale=sScale,
+                mLSE=mLSE,
+                learnable_sink=learnable_sink,
+                mbar_ptr=mbar_ptr,
+                block_info=block_info,
+                num_splits=num_splits,
+                SeqlenInfoCls=SeqlenInfoCls,
+                TileSchedulerCls=TileSchedulerCls,
+                sSFP=sSFP,
+                sP_uint8=sP_uint8,
+                sSoftmaxRed=sSoftmaxRed,
+                tidx=tidx,
+                row_group=row_group,
+                mResidualSeqUsedK=mResidualSeqUsedK,
+                thr_tmem_load_full=thr_tmem_load,
+                thr_tmem_store_bf16=thr_tmem_store_bf16,
+                thr_tmem_store_scale=thr_tmem_store_scale,
+                tStS_t2r_full=tStS_t2r,
+                tStP_bf16_r2t=tStP_bf16_r2t,
+            )
+            return
 
         mma_si_consumer_phase = Int32(0)
         si_corr_producer_phase = Int32(1)
