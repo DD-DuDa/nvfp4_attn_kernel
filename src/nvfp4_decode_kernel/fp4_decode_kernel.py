@@ -154,6 +154,7 @@ class FP4DecodeKernel:
         # in exchange. Resolved against the quantization flags in __call__.
         self.transpose_s_requested = transpose_s
         self.transpose_s = False
+        self.tmem_sfpv_offset = None
         self.transposed_query_rows = 0
         self.softmax_row_groups = 1
         self.softmax_rows_per_group = 0
@@ -667,6 +668,15 @@ class FP4DecodeKernel:
             self.softmax_red_slots = (
                 2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
             )
+            # P and its scale factors normally alias the tensor memory S was
+            # read out of, which is why the QK of the next block has to wait
+            # behind this block's PV. Transposed, P lives in shared memory, so
+            # only the scale factors still alias, and a decode leaves 128
+            # tensor-memory columns free above O to move them into. Once they
+            # are out of the way the only thing the next QK waits on is the
+            # softmax having drained S, which it signals as soon as the load
+            # completes rather than at the end of the step.
+            self.tmem_sfpv_offset = self.tmem_total
 
         # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
@@ -2178,13 +2188,19 @@ class FP4DecodeKernel:
             )
             tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout) for stage in range(self.q_stage)]
         
-        # Setup SFP and SFV TMEM tensors
-        # Reuse the TMEM of S
+        # Setup SFP and SFV TMEM tensors. These normally sit in the columns S
+        # was read out of, which costs the next QK a wait on this block's PV.
+        # Where tmem_sfpv_offset says there is room, they get their own columns
+        # instead and the two GEMMs stop contending.
         tCtSFPs = [None] * self.q_stage
         tCtSFVs = [None] * self.q_stage
         if const_expr(self.quant_pv):
+            if const_expr(self.tmem_sfpv_offset is not None):
+                sfpv_col_offsets = [self.tmem_sfpv_offset] * self.q_stage
+            else:
+                sfpv_col_offsets = [self.tmem_s_offset[stage] for stage in range(self.q_stage)]
             sfp_tmem_ptrs = [cute.recast_ptr(
-                            cute.make_ptr(Float32, self.tmem_s_offset[stage],
+                            cute.make_ptr(Float32, sfpv_col_offsets[stage],
                             mem_space=cute.AddressSpace.tmem, assumed_align=align),
                             dtype=self.sf_dtype) for stage in range(self.q_stage)]
             # (MMA, MMA_M, MMA_K) 
@@ -2208,6 +2224,15 @@ class FP4DecodeKernel:
                 cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)]
+            if const_expr(self.tmem_sfpv_offset is not None):
+                sfpv_cols = math.ceil(
+                    (sfp_offset + tcgen05.find_tmem_tensor_col_offset(tCtSFVs[0]) * sf_dtype_per_u32)
+                    / sf_dtype_per_u32
+                )
+                assert self.tmem_sfpv_offset + sfpv_cols <= self.tmem_alloc_cols, (
+                    f"SFP/SFV need {sfpv_cols} columns at {self.tmem_sfpv_offset}, "
+                    f"past the {self.tmem_alloc_cols}-column capacity"
+                )
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -3365,101 +3390,116 @@ class FP4DecodeKernel:
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # 2. acquire corrected O0/O1_partial and P0 / P1
-                        # For the first iteration in this work tile, waiting for O0/O1_partial
-                        # means that the correction warps has finished reading tO during
-                        # the last iteration of the previous work tile has finished.
-                        iket.range_push("mma_wait_p")
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
-                            P_full_O_rescaled_phase,
-                        )
-                        iket.range_pop()
-                        # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                        
-                        # No need for mbar.wait because it depends on the same Si as the prev qk mma
-                        if const_expr(self.quant_pv):
-                            # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
-                            _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
-                            tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
-                            cute.copy(
-                                tiled_copy_s2t_sfp,
-                                tCsSFP_compact_s2t_cur,
-                                tCtSFP_compact_s2t,
+                        def issue_pv():
+                            # 2. acquire corrected O0/O1_partial and P0 / P1
+                            # For the first iteration in this work tile, waiting for O0/O1_partial
+                            # means that the correction warps has finished reading tO during
+                            # the last iteration of the previous work tile has finished.
+                            iket.range_push("mma_wait_p")
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
+                                P_full_O_rescaled_phase,
                             )
-                            # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
-                            _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
-                            tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
-                            cute.copy(
-                                tiled_copy_s2t_sfv,
-                                tCsSFV_compact_s2t_staged,
-                                tCtSFV_compact_s2t,
-                            )
-
-                        sV_cur = sV[None, None, None, Vi_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-
-                        self.pv_gemm(
-                            gemm_Pi[stage],
-                            tOrVi,
-                            sV_cur,
-                            not O_should_accumulate,
-                            mbar_ptr,
-                            stage,
-                            P_full_O_rescaled_phase,
-                        )
-
-                        if const_expr(stage == self.q_stage - 1):
-                            pipeline_kv.consumer_release(mma_kv_release_state)
-                            mma_kv_release_state.advance()
-                        # End of GEMM_PV00 (P0 * V0 -> O0_partial)
-
-                        # GEMM_QK0i (Q0 * Ki -> S0)
-                        # 1. wait for Ki
-                        if const_expr(stage == 0):
-                            mma_kv_consumer_state.advance()
-                            iket.range_push("mma_wait_k")
-                            pipeline_kv.consumer_wait(mma_kv_consumer_state)
                             iket.range_pop()
-                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        # 2. gemm
-                        # Don't need to wait for the softmax warp to have finished reading the previous
-                        # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
-                        # has been read and Pi has been written.
-                        # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
+                            # No need for mbar.wait because it depends on the same Si as the prev qk mma
+                            if const_expr(self.quant_pv):
+                                # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
+                                _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
+                                tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
+                                cute.copy(
+                                    tiled_copy_s2t_sfp,
+                                    tCsSFP_compact_s2t_cur,
+                                    tCtSFP_compact_s2t,
+                                )
+                                # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
+                                _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                                tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                                cute.copy(
+                                    tiled_copy_s2t_sfv,
+                                    tCsSFV_compact_s2t_staged,
+                                    tCtSFV_compact_s2t,
+                                )
 
-                        if const_expr(self.quant_qk):
-                            _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
-                            tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
-                            sm100_utils.tcgen05_after_thread_sync()
-                            iket.range_push("mma_wait_sf")
-                            cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
-                            iket.range_pop()
-                            cute.copy(
-                                tiled_copy_s2t_sfq,
-                                tCsSFQ_compact_s2t_staged,
-                                tCtSFQ_compact_s2t,
+                            sV_cur = sV[None, None, None, Vi_index]
+                            if const_expr(self.uneven_kv_smem):
+                                sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+
+                            self.pv_gemm(
+                                gemm_Pi[stage],
+                                tOrVi,
+                                sV_cur,
+                                not O_should_accumulate,
+                                mbar_ptr,
+                                stage,
+                                P_full_O_rescaled_phase,
                             )
-                            _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
-                            tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
-                            cute.copy(
-                                tiled_copy_s2t_sfk,
-                                tCsSFK_compact_s2t_staged,
-                                tCtSFK_compact_s2t,
-                            )
 
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                            if const_expr(stage == self.q_stage - 1):
+                                pipeline_kv.consumer_release(mma_kv_release_state)
+                                mma_kv_release_state.advance()
+                            # End of GEMM_PV00 (P0 * V0 -> O0_partial)
 
-                        self.qk_gemm(gemm_Si[stage], tSrK[None, None, None, Ki_index], sK_cur)
-                        # 3. release S0
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
-                        # End of GEMM_QK0i (Q0 * Ki -> S0)
+                        def issue_qk():
+                            # GEMM_QK0i (Q0 * Ki -> S0)
+                            # 1. wait for Ki
+                            if const_expr(stage == 0):
+                                mma_kv_consumer_state.advance()
+                                iket.range_push("mma_wait_k")
+                                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                                iket.range_pop()
+                            Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                            # The wait below is what makes overwriting Si safe: the
+                            # softmax arrives on it once its tensor-memory load has
+                            # retired, which also implies the previous QK finished.
+                            if const_expr(self.quant_qk):
+                                _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
+                                tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
+                                sm100_utils.tcgen05_after_thread_sync()
+                                iket.range_push("mma_wait_sf")
+                                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                                iket.range_pop()
+                                cute.copy(
+                                    tiled_copy_s2t_sfq,
+                                    tCsSFQ_compact_s2t_staged,
+                                    tCtSFQ_compact_s2t,
+                                )
+                                _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
+                                tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
+                                cute.copy(
+                                    tiled_copy_s2t_sfk,
+                                    tCsSFK_compact_s2t_staged,
+                                    tCtSFK_compact_s2t,
+                                )
+
+                            sK_cur = sK[None, None, None, Ki_index]
+                            if const_expr(self.uneven_kv_smem):
+                                sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+
+                            self.qk_gemm(gemm_Si[stage], tSrK[None, None, None, Ki_index], sK_cur)
+                            # Release Si. The commit fires once every MMA this
+                            # warp issued before it has retired, so it belongs
+                            # next to the QK: leaving it after the PV would make
+                            # the softmax wait for a GEMM it does not read.
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+
+                        if const_expr(self.tmem_sfpv_offset is not None):
+                            # Nothing the next QK overwrites is still live. P is in
+                            # shared memory here and its scale factors have tensor
+                            # memory of their own, so S is the only thing left in
+                            # these columns and the softmax released it at the top
+                            # of its step. Issuing the QK before waiting on P is
+                            # what lets it run underneath the softmax instead of
+                            # after it, which is the whole of the block's exposed
+                            # GEMM latency.
+                            issue_qk()
+                            issue_pv()
+                        else:
+                            # P and its scale factors share S's columns, so the
+                            # next QK cannot be issued until this PV has consumed
+                            # them.
+                            issue_pv()
+                            issue_qk()
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
