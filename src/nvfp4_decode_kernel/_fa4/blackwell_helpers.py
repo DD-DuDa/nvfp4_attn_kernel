@@ -982,6 +982,32 @@ def gemm_ptx_partial1(
         )
 
 
+@cute.jit
+def packed_float_to_e2m1x2(f_hi: Float32, f_lo: Float32, *, loc=None, ip=None) -> Int32:
+    """Convert two FP32 values to a single byte of E2M1 nibbles.
+
+    ``f_lo`` occupies the low nibble, which is where the even element of a
+    K-major pair lives. The byte is replicated across the returned word; the
+    caller masks it down. Used where a thread owns one element of the pair and
+    the other arrives by shuffle, so the eight-wide packer would waste seven
+    conversions.
+    """
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(f_hi).ir_value(loc=loc, ip=ip), Float32(f_lo).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, $1, $2;\n\t"
+        "mov.b32 $0, {byte0, byte0, byte0, byte0};\n\t"
+        "}\n",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)
+
+
 # FP4 Quantization helper functions
 @cute.jit
 def packed_float_to_ue4m3(f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None) -> Int32:

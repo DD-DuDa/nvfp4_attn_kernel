@@ -79,8 +79,16 @@ def _sf_layout_with_page_stride(layout, page_stride):
     )
 
 
+# A rescale whose factor is within 2**-RESCALE_THRESHOLD of one is skipped:
+# the correction pass over O costs more than the exponent headroom it buys.
+RESCALE_THRESHOLD = 8.0
+
+
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
+    # Publishes the per-warp partial row maxima between the four softmax warps
+    # once per KV block when S is transposed.
+    SoftmaxReduce = enum.auto()
 #     WarpSchedulerWG1 = enum.auto()
 #     WarpSchedulerWG2 = enum.auto()
 #     WarpSchedulerWG3 = enum.auto()
@@ -117,6 +125,7 @@ class FP4DecodeKernel:
         use_out_indices: bool = False,
         qhead_per_kvhead_O: cutlass.Constexpr[int] = None,
         seqlen_q_static_one: bool = False,
+        transpose_s: bool = False,
     ):
         assert sf_vec_size == 16 and sf_dtype == cutlass.Float8E4M3FN, "Only support NVFP4 for now"
         self.bf16_q_input = bf16_q_input
@@ -128,6 +137,16 @@ class FP4DecodeKernel:
         self.residual_source = residual_source
         self.use_out_indices = use_out_indices
         self.seqlen_q_static_one = seqlen_q_static_one
+        # Hold S as (kv position, query row) instead of (query row, kv position).
+        # A tensor-memory load hands a thread one row and the same columns as
+        # every other lane, so only the row axis can be narrowed per thread.
+        # Decode leaves almost all of the query axis empty, and putting it in
+        # the columns is what lets a thread exponentiate qhead_per_kvhead values
+        # instead of a whole row of keys. The row reductions become cross-thread
+        # in exchange. Resolved against the quantization flags in __call__.
+        self.transpose_s_requested = transpose_s
+        self.transpose_s = False
+        self.transposed_query_rows = 0
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -344,6 +363,17 @@ class FP4DecodeKernel:
         sfp_per_stage = self.m_block_size * self.head_dim_v_padded // self.sf_vec_size
         smem_sSFQ = align_up(sfq_per_stage * self.q_stage, align) if self.quant_qk else 0
         smem_sSFP = align_up(sfp_per_stage * self.q_stage, align) if self.quant_pv else 0
+        # A transposed P reaches the tensor core from shared memory, and the
+        # cross-warp row maximum needs one float per softmax warp per query row,
+        # double buffered so a single named barrier per KV block suffices.
+        if self.transpose_s:
+            smem_sP = align_up(
+                self.m_block_size * self.n_block_size * self.v_dtype.width // 8, align
+            )
+            smem_sRed = align_up(2 * 4 * self.transposed_query_rows * 4, align)
+        else:
+            smem_sP = 0
+            smem_sRed = 0
         if self.fused_residual_first_block:
             smem_sK_bf16 = align_up(self.m_block_size * self.head_dim_padded * 2, align)
             smem_sV_bf16 = align_up(self.m_block_size * self.head_dim_v_padded * 2, align)
@@ -352,7 +382,7 @@ class FP4DecodeKernel:
             smem_sK_bf16 = 0
             smem_sV_bf16 = 0
             smem_sQ_bf16 = 0
-        smem_fixed = smem_mbar + smem_tmem + smem_sScale + smem_sO + smem_sQ + smem_sSFQ + smem_sSFP + smem_sK_bf16 + smem_sV_bf16 + smem_sQ_bf16
+        smem_fixed = smem_mbar + smem_tmem + smem_sScale + smem_sO + smem_sQ + smem_sSFQ + smem_sSFP + smem_sK_bf16 + smem_sV_bf16 + smem_sQ_bf16 + smem_sP + smem_sRed
         # Per-kv_stage fields: sK (or aliased), sV, SFK, SFV
         smem_k_per_stage = self.m_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_v_per_stage = self.m_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
@@ -540,6 +570,55 @@ class FP4DecodeKernel:
         self.quant_pv = const_expr(mSFV is not None)
         assert not (not self.quant_qk and self.quant_pv)
 
+        # The transposed layout only pays off where the query axis is short and
+        # statically known, and it reroutes P through shared memory, so it is
+        # confined to the pure FP4 decode shape. Everything else keeps the
+        # untransposed path. The query count must be a power of two because it
+        # becomes the repetition count of a single tcgen05 load.
+        # The conditions are combined with all() over a list rather than a chain
+        # of `and`. Preprocessing rewrites each short-circuit operator into a
+        # nested conditional that carries a copy of the continuation, so an
+        # n-term chain in a traced function grows the transformed AST by 2**n;
+        # sixteen terms here took this function from 14k nodes to over 4M and
+        # its preprocessing from 0.01s to more than ten minutes. Every term is a
+        # plain attribute read, so evaluating all of them eagerly is free.
+        self.transpose_s = const_expr(
+            all(
+                [
+                    self.transpose_s_requested,
+                    self.quant_qk,
+                    self.quant_pv,
+                    self.pack_gqa,
+                    self.seqlen_q_static_one,
+                    not self.bf16_q_input,
+                    not self.compute_sp1,
+                    not self.fused_residual_first_block,
+                    not self.is_causal,
+                    not self.is_local,
+                    # self.use_block_sparsity is not derived until much later in
+                    # this function, so read its source argument directly.
+                    blocksparse_tensors is None,
+                    self.score_mod is None,
+                    self.qhead_per_kvhead & (self.qhead_per_kvhead - 1) == 0,
+                    self.qhead_per_kvhead <= 128,
+                ]
+            )
+        )
+        if const_expr(self.transpose_s):
+            # Replication addresses the same padding by repeating rows, which
+            # the transposed layout makes pointless.
+            self.q_replicate = 1
+            # Transposing swaps the two leading modes of the QK tiler. Requiring
+            # them equal keeps that tuple, and every partition derived from it,
+            # unchanged, so only the operand roles move.
+            assert self.m_block_size == self.n_block_size, (
+                "transpose_s requires a square QK tile"
+            )
+            # PackGQA with a statically-one query length fills exactly this many
+            # rows of the M tile; transposed, they are the only live columns of
+            # S and the only rows of O the epilogue can reach.
+            self.transposed_query_rows = self.qhead_per_kvhead
+
         # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
             divby = 128 // t.element_type.width
@@ -629,16 +708,27 @@ class FP4DecodeKernel:
         self.cta_group = (
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        # the intermediate tensor p is from tmem & mK-major
-        p_source = tcgen05.OperandSource.TMEM
+        # the intermediate tensor p is from tmem & mK-major. Transposed, softmax
+        # holds P in registers rather than tensor memory, and OperandSource only
+        # selects the source of A, so P has to travel through shared memory.
+        p_source = (
+            tcgen05.OperandSource.SMEM
+            if const_expr(self.transpose_s)
+            else tcgen05.OperandSource.TMEM
+        )
         p_major_mode = tcgen05.OperandMajorMode.K
         
+        # Transposing S makes K the A operand and Q the B operand; both are
+        # K-major over the head dimension either way, so only the roles move.
+        qk_a_major = self.k_major_mode if const_expr(self.transpose_s) else self.q_major_mode
+        qk_b_major = self.q_major_mode if const_expr(self.transpose_s) else self.k_major_mode
+
         # Use block-scaled MMA for PV only if V is being quantized (mSFV is provided)
         if const_expr(self.quant_qk):
             tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.q_dtype,
-                self.q_major_mode,
-                self.k_major_mode,
+                qk_a_major,
+                qk_b_major,
                 self.sf_dtype,
                 self.sf_vec_size,
                 self.cta_group,
@@ -647,8 +737,8 @@ class FP4DecodeKernel:
         else:
             tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
                 self.q_dtype,
-                self.q_major_mode,
-                self.k_major_mode,
+                qk_a_major,
+                qk_b_major,
                 self.qk_acc_dtype,
                 self.cta_group,
                 self.mma_tiler_qk[:2],
@@ -684,8 +774,26 @@ class FP4DecodeKernel:
 
         self.epi_tile = self.mma_tiler_pv[:2]
         
+        # Which builder a tensor uses follows its operand role, not its name.
+        make_q_smem_layout = (
+            sm100_utils_basic.make_smem_layout_b
+            if const_expr(self.transpose_s)
+            else sm100_utils_basic.make_smem_layout_a
+        )
+        make_k_smem_layout = (
+            sm100_utils_basic.make_smem_layout_a
+            if const_expr(self.transpose_s)
+            else sm100_utils_basic.make_smem_layout_b
+        )
+        make_sfq_smem_layout = (
+            make_smem_layout_sfb if const_expr(self.transpose_s) else make_smem_layout_sfa
+        )
+        make_sfk_smem_layout = (
+            make_smem_layout_sfa if const_expr(self.transpose_s) else make_smem_layout_sfb
+        )
+
         # ((Atom_Inst_M, Atom_Inst_K), MMA_M, MMA_K, STAGE)
-        sQ_layout = sm100_utils_basic.make_smem_layout_a(
+        sQ_layout = make_q_smem_layout(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.q_dtype,
@@ -708,7 +816,7 @@ class FP4DecodeKernel:
                 cutlass.BFloat16,
                 self.q_stage,
             )
-        sK_layout = sm100_utils_basic.make_smem_layout_b(
+        sK_layout = make_k_smem_layout(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.k_dtype,
@@ -736,14 +844,14 @@ class FP4DecodeKernel:
         sfv_smem_layout_staged = None
         sfp_smem_layout_staged = None
         # # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K, STAGE)
-        sfq_smem_layout_staged = make_smem_layout_sfa(
+        sfq_smem_layout_staged = make_sfq_smem_layout(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
             self.q_stage,
             mma_tile_inst_k=self.mma_inst_tile_k,
         )
-        sfk_smem_layout_staged = make_smem_layout_sfb(
+        sfk_smem_layout_staged = make_sfk_smem_layout(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
@@ -882,7 +990,15 @@ class FP4DecodeKernel:
                 self.cluster_layout_vmnk.shape,
             )
         else:
-            tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
+            # The FP4 Q tile is the B operand once S is transposed. The BF16
+            # staging buffer above keeps its own untransposed MMA because it
+            # only feeds the quantizer, never the tensor core.
+            make_q_tma_atom = (
+                cute.nvgpu.make_tiled_tma_atom_B
+                if const_expr(self.transpose_s)
+                else cute.nvgpu.make_tiled_tma_atom_A
+            )
+            tma_atom_Q, mQ = make_q_tma_atom(
                 tma_load_op,
                 mQ,
                 cute.select(sQ_layout, mode=[0, 1, 2]),
@@ -896,8 +1012,13 @@ class FP4DecodeKernel:
         mK_shape = mK.shape
         mV_shape = mV.shape
         if const_expr(self.use_tma_KV):
-            # TMA load for K
-            tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
+            # TMA load for K — the A operand once S is transposed.
+            make_k_tma_atom = (
+                cute.nvgpu.make_tiled_tma_atom_A
+                if const_expr(self.transpose_s)
+                else cute.nvgpu.make_tiled_tma_atom_B
+            )
+            tma_atom_K, mK = make_k_tma_atom(
                 tma_load_op,
                 mK,
                 cute.select(sK_layout, mode=[0, 1, 2]),
@@ -1312,6 +1433,16 @@ class FP4DecodeKernel:
         sfp_smem_size = cute.cosize(sfp_smem_layout_staged) if const_expr(self.quant_pv) else 1
         sfv_smem_size = cute.cosize(sfv_smem_layout_staged) if const_expr(self.quant_pv) else 1
 
+        # P leaves tensor memory under the transposed layout, so the same tile
+        # the MMA reads as its A operand needs real storage. sSoftmaxRed carries
+        # the per-warp partial row maxima between the four softmax warps.
+        sP_smem_size = cute.cosize(tP_layout) if const_expr(self.transpose_s) else 1
+        softmax_red_size = (
+            2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
+            if const_expr(self.transpose_s)
+            else 1
+        )
+
         sK_bf16_smem_size = (
             cute.cosize(sK_bf16_layout) if const_expr(self.fused_residual_first_block) else 1
         )
@@ -1363,6 +1494,14 @@ class FP4DecodeKernel:
             sSFV: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfv_smem_size],
                 self.buffer_align_bytes,
+            ]
+            sP: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, sP_smem_size],
+                self.buffer_align_bytes if const_expr(self.transpose_s) else 1,
+            ]
+            sSoftmaxRed: cute.struct.Align[
+                cute.struct.MemRange[Float32, softmax_red_size],
+                self.buffer_align_bytes if const_expr(self.transpose_s) else 1,
             ]
             sK_bf16: cute.struct.Align[
                 cute.struct.MemRange[cutlass.BFloat16, sK_bf16_smem_size],
@@ -1828,17 +1967,52 @@ class FP4DecodeKernel:
             for stage in range(self.q_stage)
         )
 
-        tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
-        tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
-
-        tOrPs = [
-            cute.make_tensor(
-                tOrP.iterator
-                + self.qk_acc_dtype.width // tOrP._dtype.width * self.tmem_p_offset[stage],
-                tOrP.layout,
+        # P in shared memory: the MMA A-operand tile, plus a byte view for the
+        # softmax warps, which own single nibbles and can only store whole bytes.
+        sP = None
+        sP_uint8 = None
+        if const_expr(self.transpose_s):
+            sP = storage.sP.get_tensor(tP_layout.outer, swizzle=tP_layout.inner)
+            sP_uint8 = cute.make_tensor(
+                cute.recast_ptr(sP.iterator, cute.make_swizzle(2, 4, 3), cutlass.Uint8),
+                cute.make_layout(
+                    (
+                        (self.m_block_size, self.n_block_size // 4),
+                        1,
+                        2,
+                        self.acc_stage,
+                    ),
+                    stride=(
+                        (self.n_block_size // 2, 1),
+                        0,
+                        self.n_block_size // 4,
+                        self.m_block_size * self.n_block_size // 2,
+                    ),
+                ),
             )
-            for stage in range(2)
-        ]
+            sSoftmaxRed = storage.sSoftmaxRed.get_tensor(
+                cute.make_layout(
+                    2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
+                )
+            )
+        else:
+            sSoftmaxRed = None
+
+        if const_expr(self.transpose_s):
+            tOrP = thr_mma_pv.make_fragment_A(sP)[None, None, None, 0]
+            tOrPs = [tOrP, tOrP]
+        else:
+            tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
+            tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
+
+            tOrPs = [
+                cute.make_tensor(
+                    tOrP.iterator
+                    + self.qk_acc_dtype.width // tOrP._dtype.width * self.tmem_p_offset[stage],
+                    tOrP.layout,
+                )
+                for stage in range(2)
+            ]
         tOrPs_bf16 = (None, None)
         if const_expr(self.fused_residual_first_block):
             thr_mma_pv_bf16 = tiled_mma_pv_bf16.get_slice(0)
@@ -1874,8 +2048,18 @@ class FP4DecodeKernel:
                             dtype=self.sf_dtype) for stage in range(self.q_stage)
                             ]
 
-            # (MMA, MMA_M, MMA_K)
-            tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
+            # (MMA, MMA_M, MMA_K) — Q is the B operand once S is transposed.
+            make_tmem_layout_sfq = (
+                blockscaled_utils.make_tmem_layout_sfb
+                if const_expr(self.transpose_s)
+                else blockscaled_utils.make_tmem_layout_sfa
+            )
+            make_tmem_layout_sfk = (
+                blockscaled_utils.make_tmem_layout_sfa
+                if const_expr(self.transpose_s)
+                else blockscaled_utils.make_tmem_layout_sfb
+            )
+            tCtSFQ_layout = make_tmem_layout_sfq(
                 tiled_mma_qk,
                 self.mma_tiler_qk,
                 self.sf_vec_size,
@@ -1889,7 +2073,7 @@ class FP4DecodeKernel:
             sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
 
             # (MMA, MMA_N, MMA_K)
-            tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
+            tCtSFK_layout = make_tmem_layout_sfk(
                 tiled_mma_qk,
                 self.mma_tiler_qk,
                 self.sf_vec_size,
@@ -2072,6 +2256,7 @@ class FP4DecodeKernel:
                 sQ_bf16=sQ_bf16,
                 mResidualSeqUsedK=mResidualSeqUsedK,
                 tOrPs_bf16=tOrPs_bf16,
+                sP=sP,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -2137,6 +2322,8 @@ class FP4DecodeKernel:
                 blocksparse_tensors=blocksparse_tensors,
                 sSFP=sSFP,
                 mResidualSeqUsedK=mResidualSeqUsedK,
+                sP_uint8=sP_uint8,
+                sSoftmaxRed=sSoftmaxRed,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2635,6 +2822,46 @@ class FP4DecodeKernel:
             work_tile = tile_scheduler.get_current_work()
             # End of persistent scheduler loop
 
+    def qk_gemm(self, gemm, tCrK: cute.Tensor, sK_cur: cute.Tensor):
+        """Issue one QK GEMM with the K tile in whichever operand slot it holds.
+
+        K is the B operand normally and the A operand once S is transposed. The
+        Q side is already bound into ``gemm``.
+        """
+        if const_expr(self.transpose_s):
+            gemm(tCrA=tCrK, sA=sK_cur)
+        else:
+            gemm(tCrB=tCrK, sB=sK_cur)
+
+    def pv_gemm(
+        self,
+        gemm,
+        tOrVi: cute.Tensor,
+        sV_cur: cute.Tensor,
+        zero_init,
+        mbar_ptr: cute.Pointer,
+        stage: int,
+        phase: Int32,
+    ):
+        """Issue one PV GEMM, splitting the wait on P only where P is in TMEM.
+
+        With P in tensor memory the instruction can start on its first half and
+        wait for the rest mid-flight. A shared-memory A operand has no such
+        entry point, so the whole tile must already be published; the caller's
+        wait on ``mbar_P_full_O_rescaled`` covers it and the second-half barrier
+        is unused.
+        """
+        if const_expr(self.transpose_s):
+            gemm(tCrB=tOrVi, sB=sV_cur, zero_init=zero_init)
+        else:
+            gemm(
+                tCrB=tOrVi,
+                sB=sV_cur,
+                zero_init=zero_init,
+                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                mbar_phase=phase,
+            )
+
     @cute.jit
     def mma(
         self,
@@ -2670,6 +2897,7 @@ class FP4DecodeKernel:
         sQ_bf16: Optional[cute.Tensor] = None,
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
         tOrPs_bf16: Tuple[Optional[cute.Tensor], Optional[cute.Tensor]] = (None, None),
+        sP: Optional[cute.Tensor] = None,
     ):
         if const_expr(self.fused_residual_first_block):
             tSrK_bf16 = tiled_mma_qk_bf16.make_fragment_B(sK_bf16)
@@ -2681,8 +2909,12 @@ class FP4DecodeKernel:
             tOrV_bf16 = None
             tSrQ_bf16 = None
             tSrQ_bf16_stages = (None, None)
-        tSrQ = tiled_mma_qk.make_fragment_A(sQ)
-        tSrK = tiled_mma_qk.make_fragment_B(sK)
+        if const_expr(self.transpose_s):
+            tSrQ = tiled_mma_qk.make_fragment_B(sQ)
+            tSrK = tiled_mma_qk.make_fragment_A(sK)
+        else:
+            tSrQ = tiled_mma_qk.make_fragment_A(sQ)
+            tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
         if const_expr(self.q_stage == 2):
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
@@ -2690,50 +2922,78 @@ class FP4DecodeKernel:
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        gemm_Si = [
-            partial(
-                sm100_utils.gemm_ptx_partial_fp4,
-                # sm100_utils.gemm_ptx_partial,
-                qk_mma_op,
-                self.tmem_s_offset[stage],
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
-                zero_init=True,
-                tScaleA=tCtSFQs[stage],
-                tScaleB=tCtSFKs[stage],
-            ) if const_expr(self.quant_qk) else 
-            partial(
+        # Q is bound here because it is fixed for the whole tile; K arrives per
+        # KV stage and is supplied at the call site through ``qk_gemm``. Which
+        # operand each one is depends on whether S is transposed, so bind Q by
+        # keyword and let the caller name the K side the same way either way.
+        def _qk_scales(stage):
+            if const_expr(self.transpose_s):
+                return dict(tScaleA=tCtSFKs[stage], tScaleB=tCtSFQs[stage])
+            return dict(tScaleA=tCtSFQs[stage], tScaleB=tCtSFKs[stage])
+
+        def _make_gemm_si(stage):
+            common = dict(zero_init=True)
+            if const_expr(self.transpose_s):
+                common.update(tCrB=tSrQs[stage], sB=sQ[None, None, None, stage])
+                positional = ()
+            else:
+                positional = (tSrQs[stage],)
+                common.update(sA=sQ[None, None, None, stage])
+            if const_expr(self.quant_qk):
+                return partial(
+                    sm100_utils.gemm_ptx_partial_fp4,
+                    qk_mma_op,
+                    self.tmem_s_offset[stage],
+                    *positional,
+                    **common,
+                    **_qk_scales(stage),
+                )
+            return partial(
                 sm100_utils.gemm_ptx_partial,
                 qk_mma_op,
                 self.tmem_s_offset[stage],
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
-                zero_init=True,
+                *positional,
+                **common,
             )
-            for stage in range(self.q_stage)
-        ]
-        gemm_Pi = [
-            partial(
-                sm100_utils.gemm_ptx_partial_fp4,
-                pv_mma_op,
-                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
-                tOrPs[stage],
-                sA=None,
-                tScaleA=tCtSFPs[stage],
-                tScaleB=tCtSFVs[stage],
-                pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs[stage].shape[2])),
-                tA_addr=self.tmem_p_offset[stage],
-            ) if const_expr(self.quant_pv) else
-            partial(
+
+        gemm_Si = [_make_gemm_si(stage) for stage in range(self.q_stage)]
+
+        def _make_gemm_pi(stage):
+            acc_offset = self.tmem_o_offset[stage if self.q_stage == 2 else 0]
+            if const_expr(self.transpose_s):
+                # A from shared memory: no TMEM address, and the split wait the
+                # TMEM path uses is not available here.
+                return partial(
+                    sm100_utils.gemm_ptx_partial_fp4,
+                    pv_mma_op,
+                    acc_offset,
+                    tOrPs[stage],
+                    sA=sP[None, None, None, 0],
+                    tScaleA=tCtSFPs[stage],
+                    tScaleB=tCtSFVs[stage],
+                )
+            if const_expr(self.quant_pv):
+                return partial(
+                    sm100_utils.gemm_ptx_partial_fp4,
+                    pv_mma_op,
+                    acc_offset,
+                    tOrPs[stage],
+                    sA=None,
+                    tScaleA=tCtSFPs[stage],
+                    tScaleB=tCtSFVs[stage],
+                    pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs[stage].shape[2])),
+                    tA_addr=self.tmem_p_offset[stage],
+                )
+            return partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op,
-                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                acc_offset,
                 tOrPs[stage],
                 sA=None,
                 pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs[stage].shape[2])),
             )
-            for stage in range(self.q_stage)
-        ]
+
+        gemm_Pi = [_make_gemm_pi(stage) for stage in range(self.q_stage)]
         if const_expr(self.fused_residual_first_block):
             qk_mma_op_bf16 = tiled_mma_qk_bf16.op
             pv_mma_op_bf16 = tiled_mma_pv_bf16.op
@@ -2937,10 +3197,7 @@ class FP4DecodeKernel:
                             sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         )
 
-                    gemm_Si[stage](
-                        tCrB=tSrKi,  # tCrB
-                        sB=sK_cur,  # sB
-                    )
+                    self.qk_gemm(gemm_Si[stage], tSrKi, sK_cur)
 
                     # 4. release S0 / S1
                     with cute.arch.elect_one():
@@ -3007,12 +3264,14 @@ class FP4DecodeKernel:
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
 
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                            mbar_phase=P_full_O_rescaled_phase,
+                        self.pv_gemm(
+                            gemm_Pi[stage],
+                            tOrVi,
+                            sV_cur,
+                            not O_should_accumulate,
+                            mbar_ptr,
+                            stage,
+                            P_full_O_rescaled_phase,
                         )
 
                         if const_expr(stage == self.q_stage - 1):
@@ -3058,10 +3317,7 @@ class FP4DecodeKernel:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
 
-                        gemm_Si[stage](
-                            tCrB=tSrK[None, None, None, Ki_index],  # tCrB
-                            sB=sK_cur,  # sB
-                        )
+                        self.qk_gemm(gemm_Si[stage], tSrK[None, None, None, Ki_index], sK_cur)
                         # 3. release S0
                         with cute.arch.elect_one():
                             tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
@@ -3119,12 +3375,14 @@ class FP4DecodeKernel:
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                     _zi_post = not O_should_accumulate
-                    gemm_Pi[stage](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=_zi_post,
-                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        mbar_phase=P_full_O_rescaled_phase,
+                    self.pv_gemm(
+                        gemm_Pi[stage],
+                        tOrVi,
+                        sV_cur,
+                        _zi_post,
+                        mbar_ptr,
+                        stage,
+                        P_full_O_rescaled_phase,
                     )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
@@ -3146,6 +3404,353 @@ class FP4DecodeKernel:
             work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
 
+
+    @cute.jit
+    def softmax_warpgroup_reduce(
+        self,
+        vals: cute.Tensor,
+        sSoftmaxRed: cute.Tensor,
+        tidx: Int32,
+        red_buf: Int32,
+        op: Callable,
+    ) -> Int32:
+        """Reduce one value per query row across all softmax threads, in place.
+
+        Transposed, a row of S runs along the thread axis, so a row reduction is
+        a warp butterfly followed by an exchange between the four softmax warps.
+        The scratch is double buffered by ``red_buf`` so a single named barrier
+        per call is enough: a warp can only overwrite the buffer it read two
+        calls ago, and the intervening barrier already ordered that read.
+        """
+        num_warps = const_expr(len(self.softmax0_warp_ids))
+        rows = const_expr(self.transposed_query_rows)
+        for j in cutlass.range_constexpr(rows):
+            vals[j] = utils.warp_reduce(vals[j], op)
+        base = red_buf * (num_warps * rows)
+        if tidx % cute.arch.WARP_SIZE == 0:
+            warp = tidx // cute.arch.WARP_SIZE
+            for j in cutlass.range_constexpr(rows):
+                sSoftmaxRed[base + warp * rows + j] = vals[j]
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.SoftmaxReduce),
+            number_of_threads=num_warps * cute.arch.WARP_SIZE,
+        )
+        for j in cutlass.range_constexpr(rows):
+            acc = sSoftmaxRed[base + j]
+            for w in cutlass.range_constexpr(1, num_warps):
+                acc = op(acc, sSoftmaxRed[base + w * rows + j])
+            vals[j] = acc
+        return red_buf ^ 1
+
+    @cute.jit
+    def zero_transposed_p(self, sP_uint8: cute.Tensor, sSFP: cute.Tensor, tidx: Int32):
+        """Zero the shared P tile and its scale factors once per CTA.
+
+        Only the first ``transposed_query_rows`` rows are ever written, but the
+        MMA reads all 128 and an undefined E4M3 scale factor can decode to NaN.
+        Zeroing the whole region is a permutation-invariant write, so the
+        swizzle can be ignored and the buffers filled as flat words.
+        """
+        num_threads = const_expr(len(self.softmax0_warp_ids) * cute.arch.WARP_SIZE)
+        p_words = const_expr(self.m_block_size * self.n_block_size // 2 // 4)
+        sfp_words = const_expr(
+            self.m_block_size * self.head_dim_v_padded // self.sf_vec_size * self.q_stage // 4
+        )
+        p_flat = cute.make_tensor(
+            cute.recast_ptr(sP_uint8.iterator, dtype=Int32), cute.make_layout(p_words)
+        )
+        sfp_flat = cute.make_tensor(
+            cute.recast_ptr(sSFP.iterator, dtype=Int32), cute.make_layout(sfp_words)
+        )
+        for i in cutlass.range_constexpr(p_words // num_threads):
+            p_flat[tidx + i * num_threads] = Int32(0)
+        for i in cutlass.range_constexpr(max(1, sfp_words // num_threads)):
+            if tidx + i * num_threads < sfp_words:
+                sfp_flat[tidx + i * num_threads] = Int32(0)
+
+    @cute.jit
+    def softmax_loop_transposed(
+        self,
+        stage: int | Int32,
+        softmax_scale_log2: Float32,
+        thr_mma_qk: cute.ThrMma,
+        tStSi: cute.Tensor,
+        sScale: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        learnable_sink: Optional[cute.Tensor],
+        mbar_ptr: cute.Pointer,
+        block_info: BlockInfo,
+        num_splits: Int32,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+        sSFP: cute.Tensor,
+        sP_uint8: cute.Tensor,
+        sSoftmaxRed: cute.Tensor,
+        tidx: Int32,
+    ):
+        """Softmax over an S tile held as (kv position, query row).
+
+        Thread ``tidx`` owns kv position ``tidx`` of the block and the
+        ``transposed_query_rows`` columns that carry a query, so it runs that
+        many exponentials instead of a whole row of keys. The row maximum is
+        along kv and therefore crosses threads; the row sum is deferred to the
+        end of the tile because the running correction factor is the same in
+        every thread and factors out of the accumulation.
+        """
+        rows = const_expr(self.transposed_query_rows)
+        # Only the leading columns of S carry a query; the rest of the MMA tile
+        # is padding that the tensor-memory load simply never reads.
+        tStS_live = cute.composition(tStSi, cute.make_layout((self.m_block_size, rows)))
+        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+        tScS_live = cute.composition(tScS, cute.make_layout((self.m_block_size, rows)))
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(rows)),
+            Float32,
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_live).get_slice(tidx)
+        tStS_t2r = thr_tmem_load.partition_S(tStS_live)
+        frg_shape = thr_tmem_load.partition_D(tScS_live).shape
+
+        self.zero_transposed_p(sP_uint8, sSFP, tidx)
+
+        mma_si_consumer_phase = Int32(0)
+        si_corr_producer_phase = Int32(1)
+        red_buf = Int32(0)
+
+        if stage == 1:
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_sfqk_load_offset + 0)
+        if const_expr(self.q_stage == 1) and stage == 0:
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_sfqk_load_offset + 0)
+
+        row_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        row_sum = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+
+        softmax_step = partial(
+            self.softmax_step_transposed,
+            softmax_scale_log2=softmax_scale_log2,
+            mbar_ptr=mbar_ptr,
+            thr_tmem_load=thr_tmem_load,
+            tStS_t2r=tStS_t2r,
+            frg_shape=frg_shape,
+            row_max=row_max,
+            row_sum=row_sum,
+            sScale=sScale,
+            sSFP=sSFP,
+            sP_uint8=sP_uint8,
+            sSoftmaxRed=sSoftmaxRed,
+            stage=stage,
+            tidx=tidx,
+        )
+
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, num_splits
+            )
+            # A split can be handed no kv block at all. Such a tile must stay out
+            # of the correction handshake entirely, as on the untransposed path,
+            # or the two warp groups fall out of step.
+            has_work = const_expr(not self.is_split_kv) or n_block_max > n_block_min
+            if has_work:
+                row_max.fill(-Float32.inf)
+                row_sum.fill(0.0)
+
+                iket.range_push("sm_wait_corr")
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_softmax_corr_empty_offset + stage,
+                    si_corr_producer_phase,
+                )
+                iket.range_pop()
+                si_corr_producer_phase ^= 1
+
+                mma_si_consumer_phase, si_corr_producer_phase, red_buf = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    red_buf,
+                    n_block_max - 1,
+                    seqlen_k=seqlen.seqlen_k,
+                    is_first=True,
+                    mask_seqlen=True,
+                )
+                for n_tile in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                    mma_si_consumer_phase, si_corr_producer_phase, red_buf = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        red_buf,
+                        n_block_max - 2 - n_tile,
+                        seqlen_k=seqlen.seqlen_k,
+                        is_first=False,
+                        mask_seqlen=False,
+                    )
+
+                red_buf = self.softmax_warpgroup_reduce(
+                    row_sum, sSoftmaxRed, tidx, red_buf, lambda a, b: a + b
+                )
+                if tidx == 0:
+                    for j in cutlass.range_constexpr(rows):
+                        sScale[j + stage * self.m_block_size] = row_sum[j]
+                    if const_expr(mLSE is not None or learnable_sink is not None):
+                        for j in cutlass.range_constexpr(rows):
+                            sScale[
+                                j + stage * self.m_block_size + self.m_block_size * 2
+                            ] = row_max[j]
+                cute.arch.mbarrier_arrive(
+                    mbar_ptr + self.mbar_softmax_corr_full_offset + stage
+                )
+
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def softmax_step_transposed(
+        self,
+        mma_si_consumer_phase: Int32,
+        si_corr_producer_phase: Int32,
+        red_buf: Int32,
+        n_block: Int32,
+        softmax_scale_log2: Float32,
+        mbar_ptr: cute.Pointer,
+        thr_tmem_load: cute.CopyAtom,
+        tStS_t2r: cute.Tensor,
+        frg_shape,
+        row_max: cute.Tensor,
+        row_sum: cute.Tensor,
+        sScale: cute.Tensor,
+        sSFP: cute.Tensor,
+        sP_uint8: cute.Tensor,
+        sSoftmaxRed: cute.Tensor,
+        stage: int | Int32,
+        tidx: Int32,
+        seqlen_k: Int32,
+        is_first: cutlass.Constexpr[bool],
+        mask_seqlen: cutlass.Constexpr[bool],
+    ) -> Tuple[Int32, Int32, Int32]:
+        """One KV block of the transposed softmax.
+
+        The tensor-memory load gives thread ``tidx`` kv position ``tidx``, which
+        is the invariant the whole step rests on: masking is one predicate, a
+        scale group of 16 kv positions is 16 lanes of one warp, and the two FP4
+        nibbles that share a byte sit in neighbouring lanes.
+        """
+        rows = const_expr(self.transposed_query_rows)
+        bytes_per_row = const_expr(self.n_block_size // 2)
+        atom_k_bytes = const_expr(self.n_block_size // 4)
+
+        iket.range_push("sm_wait_s")
+        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
+        iket.range_pop()
+        tSrS = cute.make_rmem_tensor(frg_shape, self.qk_acc_dtype)
+        cute.copy(thr_tmem_load, tStS_t2r, tSrS)
+        cute.arch.fence_view_async_tmem_load()
+        cute.arch.mbarrier_arrive(
+            mbar_ptr + self.mbar_sfqk_load_offset + (self.q_stage - 1 - stage)
+        )
+
+        if const_expr(mask_seqlen):
+            if n_block * self.n_block_size + tidx >= seqlen_k:
+                for j in cutlass.range_constexpr(rows):
+                    tSrS[j] = -Float32.inf
+
+        iket.range_push("sm_rowmax")
+        block_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            block_max[j] = tSrS[j]
+        red_buf = self.softmax_warpgroup_reduce(
+            block_max, sSoftmaxRed, tidx, red_buf, cute.arch.fmax
+        )
+        acc_scale = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        row_max_safe = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            if const_expr(is_first):
+                row_max_new = block_max[j]
+                row_max_safe[j] = row_max_new if row_max_new != -Float32.inf else 0.0
+                acc_scale[j] = 0.0
+            else:
+                row_max_old = row_max[j]
+                row_max_new = cute.arch.fmax(row_max_old, block_max[j])
+                safe = row_max_new if row_max_new != -Float32.inf else 0.0
+                acc_scale_ = (row_max_old - safe) * softmax_scale_log2
+                scale = utils.exp2f(acc_scale_)
+                # The skip decision is made on a maximum every thread agrees on,
+                # so it stays uniform across the warpgroup.
+                if const_expr(RESCALE_THRESHOLD > 0.0):
+                    if acc_scale_ >= -RESCALE_THRESHOLD:
+                        row_max_new = row_max_old
+                        safe = row_max_old
+                        scale = Float32(1.0)
+                row_max_safe[j] = safe
+                acc_scale[j] = scale
+            row_max[j] = row_max_new
+        iket.range_pop()
+
+        # Every thread holds the same correction factors, so one publishes them.
+        if const_expr(not is_first):
+            if tidx == 0:
+                for j in cutlass.range_constexpr(rows):
+                    sScale[j + stage * self.m_block_size] = acc_scale[j]
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
+
+        iket.range_push("sm_exp")
+        for j in cutlass.range_constexpr(rows):
+            tSrS[j] = cute.arch.exp2(
+                tSrS[j] * softmax_scale_log2 - row_max_safe[j] * softmax_scale_log2
+            )
+            if const_expr(is_first):
+                row_sum[j] = tSrS[j]
+            else:
+                row_sum[j] = row_sum[j] * acc_scale[j] + tSrS[j]
+        iket.range_pop()
+
+        iket.range_push("sm_pquant")
+        inv6 = Float32(1.0 / 6.0)
+        group_max = cute.make_rmem_tensor(cute.make_layout(rows), Float32)
+        for j in cutlass.range_constexpr(rows):
+            # A scale group is sf_vec_size consecutive kv positions, hence that
+            # many consecutive lanes of one warp.
+            group_max[j] = (
+                utils.warp_reduce(tSrS[j], cute.arch.fmax, width=self.sf_vec_size) * inv6
+            )
+        for j in cutlass.range_constexpr(rows):
+            tSrS[j] = tSrS[j] * (Float32(1.0) / cute.arch.fmax(group_max[j], 1e-20))
+
+        # K-major P wants kv contiguous, so the nibbles for kv = tidx and
+        # tidx + 1 share a byte. One butterfly per query row brings the odd
+        # lane's value over and the even lane stores the merged byte.
+        k_byte = tidx // 2
+        for j in cutlass.range_constexpr(rows):
+            partner = cute.arch.shuffle_sync_bfly(tSrS[j], offset=1)
+            if tidx % 2 == 0:
+                packed = sm100_utils.packed_float_to_e2m1x2(partner, tSrS[j])
+                sP_uint8[(j, k_byte % atom_k_bytes), 0, k_byte // atom_k_bytes, 0] = (
+                    cutlass.Uint8(packed & 0xFF)
+                )
+
+        sSFP_u8 = cute.recast_tensor(sSFP[None, None, None, stage], cutlass.Uint8)
+        if tidx % self.sf_vec_size == 0:
+            k_group = tidx // self.sf_vec_size
+            for j in cutlass.range_constexpr(rows):
+                sf_byte = packed_float_to_ue4m3(
+                    group_max[j], Float32(0.0), Float32(0.0), Float32(0.0)
+                )
+                sSFP_u8[
+                    (((j % 32, j // 32), 0), (0, k_group % 4)), 0, k_group // 4
+                ] = cutlass.Uint8(sf_byte & 0xFF)
+        # The MMA reads P and its scale factors through the async proxy while
+        # these are generic-proxy stores; the mbarrier below only orders generic
+        # traffic, so the fence is what makes them visible.
+        cute.arch.fence_view_async_shared()
+        iket.range_pop()
+
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+        iket.range_push("sm_wait_corr")
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
+        )
+        iket.range_pop()
+        return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, red_buf
 
     # for both softmax0 and softmax1 warp group
     @cute.jit
@@ -3171,6 +3776,8 @@ class FP4DecodeKernel:
         tCtSFP: Optional[Tuple[cute.Tensor, ...]] = None,
         sSFP: Optional[cute.Tensor] = None,
         mResidualSeqUsedK: Optional[cute.Tensor] = None,
+        sP_uint8: Optional[cute.Tensor] = None,
+        sSoftmaxRed: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3188,6 +3795,27 @@ class FP4DecodeKernel:
             # * (len(self.softmax0_warp_ids) if stage == 0 else len(self.softmax1_warp_ids)
             * (len(self.softmax0_warp_ids))
         )
+
+        if const_expr(self.transpose_s):
+            self.softmax_loop_transposed(
+                stage=stage,
+                softmax_scale_log2=softmax_scale_log2,
+                thr_mma_qk=thr_mma_qk,
+                tStSi=tStSi,
+                sScale=sScale,
+                mLSE=mLSE,
+                learnable_sink=learnable_sink,
+                mbar_ptr=mbar_ptr,
+                block_info=block_info,
+                num_splits=num_splits,
+                SeqlenInfoCls=SeqlenInfoCls,
+                TileSchedulerCls=TileSchedulerCls,
+                sSFP=sSFP,
+                sP_uint8=sP_uint8,
+                sSoftmaxRed=sSoftmaxRed,
+                tidx=tidx,
+            )
+            return
 
         tStScale = cute.composition(tStSi, cute.make_layout((self.m_block_size, 1)))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -3288,7 +3916,7 @@ class FP4DecodeKernel:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0,
+                rescale_threshold=RESCALE_THRESHOLD,
                 # rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
                 quant_pv=self.quant_pv,
@@ -3935,7 +4563,17 @@ class FP4DecodeKernel:
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
+                        # Transposed, softmax publishes one correction factor per
+                        # live query row rather than one per thread, so the O
+                        # rows past that bound have no factor and no consumer.
+                        if const_expr(self.transpose_s):
+                            scale = (
+                                sScale[tidx + stage * self.m_block_size]
+                                if tidx < self.transposed_query_rows
+                                else Float32(1.0)
+                            )
+                        else:
+                            scale = sScale[tidx + stage * self.m_block_size]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
@@ -3985,9 +4623,24 @@ class FP4DecodeKernel:
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
+                    if const_expr(self.transpose_s):
+                        # A zero sum marks the row as empty further down, which
+                        # is what the rows past the live query rows are.
+                        row_sum = (
+                            sScale[tidx + stage * self.m_block_size]
+                            if tidx < self.transposed_query_rows
+                            else Float32(0.0)
+                        )
+                    else:
+                        row_sum = sScale[tidx + stage * self.m_block_size]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         row_max = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                        if const_expr(self.transpose_s):
+                            row_max = (
+                                row_max
+                                if tidx < self.transposed_query_rows
+                                else -Float32.inf
+                            )
                     else:
                         row_max = None
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)

@@ -18,6 +18,9 @@ from .fp4_decode_kernel import FP4DecodeKernel
 
 PAGE_SIZE = 128
 HEAD_DIM = 128
+# Request the transposed softmax layout. The kernel narrows this to the shapes
+# it supports; everything else falls back to the untransposed path.
+_TRANSPOSE_S = True
 _decode_compile_cache: dict[tuple[Any, ...], Any] = {}
 _split_decode_compile_cache: dict[tuple[Any, ...], Any] = {}
 
@@ -263,6 +266,7 @@ def _compile_decode(
         residual_source="paged_bf16",
         use_out_indices=out_indices is not None,
         seqlen_q_static_one=True,
+        transpose_s=_TRANSPOSE_S,
     )
     fake_stream = cute.runtime.make_fake_stream()
     q_pointer = make_ptr(
@@ -445,6 +449,7 @@ def _compile_split_decode(
         residual_source="paged_bf16",
         use_out_indices=False,
         seqlen_q_static_one=True,
+        transpose_s=_TRANSPOSE_S,
     )
     fake_stream = cute.runtime.make_fake_stream()
     fp4_pointer = lambda: make_ptr(
