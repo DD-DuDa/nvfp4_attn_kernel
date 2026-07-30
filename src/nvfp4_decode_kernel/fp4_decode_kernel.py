@@ -3655,6 +3655,12 @@ class FP4DecodeKernel:
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
                 tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+                # These stores go through the generic proxy, but the MMA warp
+                # reads sSFP with tcgen05.cp, an async-proxy access. The
+                # mbarrier arrive below orders generic-proxy traffic only, so
+                # without this fence the S2T copy can still observe the
+                # previous n_block's scale factors.
+                cute.arch.fence_view_async_shared()
             iket.range_pop()
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)

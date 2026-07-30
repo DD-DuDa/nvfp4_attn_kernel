@@ -137,6 +137,10 @@ def run_shapes(inputs, rows: int) -> dict[str, torch.Tensor]:
 # epilogue runs under a different scheduler and q_stage. rows 64 is the unsplit
 # path with a main loop long enough to matter, which is where the high-batch
 # decode launches land.
+# pages_per_row 2 stays on the unsplit path; 64 crosses into split-K, where the
+# epilogue runs under a different scheduler and q_stage. rows 64 is the unsplit
+# path with a main loop long enough to matter, which is where the high-batch
+# decode launches land.
 DEFAULT_SHAPES = "3x2,64x8,1x64,5x64"
 
 

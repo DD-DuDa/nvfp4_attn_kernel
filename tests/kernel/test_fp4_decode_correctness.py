@@ -1028,6 +1028,66 @@ def test_trusted_metadata_matches_checked_path_exactly(
     assert torch.equal(trusted, checked)
 
 
+def test_repeated_identical_calls_are_bitwise_identical() -> None:
+    """The decode kernel must not depend on how its warps happen to interleave.
+
+    The shape matters. Every other case in this file launches a handful of
+    CTAs over one or two page blocks, which keeps the producer and consumer
+    warps close enough together that an unsynchronised buffer is very unlikely
+    to be reused under a live reader. Reproducing a pipeline race needs a main
+    loop deep enough to reach steady state (four page blocks) and enough
+    resident CTAs to spread out memory latency (18 rows x 8 KV heads = 144
+    CTAs, against 148 SMs), plus per-row residual lengths that differ so the
+    CTAs do not run in lockstep.
+    """
+    torch.manual_seed(0x0FF1CE)
+    device = torch.device("cuda")
+    rows, pages_per_row, heads_q, heads_kv = 18, 4, 32, 8
+    total_pages = rows * pages_per_row + 1
+
+    query = (
+        torch.randn(rows, heads_q, 128, dtype=torch.bfloat16, device=device) * 0.3
+    )
+    key_pages_bf16 = (
+        torch.randn(
+            total_pages, 128, heads_kv, 128, dtype=torch.bfloat16, device=device
+        )
+        * 0.3
+    )
+    value_pages_bf16 = torch.randn_like(key_pages_bf16) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(key_pages_bf16)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(value_pages_bf16)
+
+    call = dict(
+        key_pages_fp4=key_pages_fp4,
+        key_scales=key_scales,
+        value_pages_fp4=value_pages_fp4,
+        value_scales=value_scales,
+        fp4_page_table=torch.arange(
+            rows * pages_per_row, dtype=torch.int32, device=device
+        ).view(rows, pages_per_row),
+        seqused_fp4=torch.full(
+            (rows,), pages_per_row * 128, dtype=torch.int32, device=device
+        ),
+        residual_key_pages_bf16=key_pages_bf16,
+        residual_value_pages_bf16=value_pages_bf16,
+        residual_page_ids=torch.full(
+            (rows,), total_pages - 1, dtype=torch.int32, device=device
+        ),
+        seqused_residual=torch.tensor(
+            [0 if i == 0 else 1 + (i * 37) % 127 for i in range(rows)],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+
+    with torch.no_grad():
+        reference = fp4_decode(query, **call)
+        for _ in range(7):
+            assert torch.equal(fp4_decode(query, **call), reference)
+    torch.cuda.synchronize()
+
+
 def test_trusted_metadata_keeps_host_shape_checks(
     contract_decode_inputs: ContractDecodeInputs,
 ) -> None:
