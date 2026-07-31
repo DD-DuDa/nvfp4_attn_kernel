@@ -8,20 +8,27 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     get_attention_context,
 )
+from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
-from .guards import NVFP4, check_supported
-from .runtime import WriteRuntime
+from nvfp4_decode_kernel import fp4_decode
+
+from .guards import NVFP4, check_supported, check_layer_supported
+from .runtime import LayerRuntime
 from .write import write_kv
 
 
 class NVFP4Impl(FlashAttentionImpl):
-    """Writes the NVFP4 cache; attention itself is still FlashAttention's.
+    """Attention over the NVFP4 cache, split by what each row is doing.
 
-    The write path is complete: full pages are quantized into vLLM blocks and
-    the remainder goes to the BF16 tail. The read path is not, so a run with
-    ``kv_cache_dtype="nvfp4"`` fills a correct cache but returns nothing
-    meaningful from attention.
+    vLLM has sorted the one-token rows to the front of the batch (see
+    ``builder.decode_split``), which splits the step cleanly in two. The decode
+    prefix reads the FP4 pages and the BF16 tail through ``fp4_decode``. The
+    prefill suffix reads neither: with chunked prefill and prefix caching both
+    refused, a prompt arrives whole, so FlashAttention attends it against the
+    K/V of this same forward pass and never touches the block table.
+
+    Either side can be empty, and usually one is.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -35,16 +42,23 @@ class NVFP4Impl(FlashAttentionImpl):
         self.nvfp4 = (
             cache_config is not None and cache_config.cache_dtype == NVFP4
         )
+        if self.nvfp4:
+            check_layer_supported(self)
+            # FlashAttention turns this on for any quantized cache, and the
+            # attention layer then hands the impl an FP8 query. Both paths here
+            # need BF16: prefill attends against this pass's own BF16 K/V, and
+            # decode quantizes to FP4, not FP8.
+            self.supports_quant_query_input = False
         self.num_slots = config.scheduler_config.max_num_seqs
-        self.runtime: WriteRuntime | None = None
+        self.runtime: LayerRuntime | None = None
         self.layer_index = 0
 
     def _bind_runtime(self, device: torch.device) -> None:
-        """Create the model's shared write-path state once and hand it around.
+        """Create the model's shared state once and hand it around.
 
         Called from the profile run, where every attention layer is already
-        registered but the KV cache does not exist yet. Allocating the tail
-        here is what makes vLLM subtract it from the cache budget.
+        registered but the KV cache does not exist yet. Allocating here is what
+        makes vLLM subtract this memory from the cache budget.
         """
         modules = [
             module
@@ -57,18 +71,23 @@ class NVFP4Impl(FlashAttentionImpl):
                 "lists it, so the write path cannot be shared with its peers"
             )
         shapes = {
-            (module.impl.num_kv_heads, module.impl.head_size)
+            (
+                module.impl.num_heads,
+                module.impl.num_kv_heads,
+                module.impl.head_size,
+            )
             for module in modules
         }
         if len(shapes) != 1:
             raise ValueError(
-                f"NVFP4 needs one K/V shape across layers, found {shapes}"
+                f"NVFP4 needs one attention shape across layers, found {shapes}"
             )
-        num_kv_heads, head_dim = shapes.pop()
+        num_heads, num_kv_heads, head_dim = shapes.pop()
 
-        runtime = WriteRuntime(
+        runtime = LayerRuntime(
             num_layers=len(modules),
             num_slots=self.num_slots,
+            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             device=device,
@@ -142,10 +161,105 @@ class NVFP4Impl(FlashAttentionImpl):
                 output_scale,
                 output_block_scale,
             )
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not supported by the NVFP4 "
+                "attention path"
+            )
         if self.runtime is None:
             self._bind_runtime(query.device)
-        # No read path yet: the cache now holds FP4 that FlashAttention cannot
-        # read. Contributing nothing is wrong but bounded, whereas returning
-        # the buffer untouched feeds whatever was in that memory into the
-        # residual stream, and NaN there makes every later layer's K/V NaN.
-        return output.zero_()
+        if attn_metadata is None:
+            # Profile run. The cache is a placeholder with no storage, so there
+            # is nothing to read; zero rather than leave the buffer untouched,
+            # since NaN in the residual stream propagates into every later
+            # layer's K/V.
+            return output.zero_()
+
+        rows = attn_metadata.decode_prefix_rows
+        tokens = attn_metadata.decode_prefix_tokens
+        if rows:
+            self._decode(rows, query, kv_cache, attn_metadata, output)
+        if tokens < attn_metadata.num_actual_tokens:
+            self._prefill(tokens, query, key, value, attn_metadata, output)
+        return output
+
+    def _decode(
+        self,
+        rows: int,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+    ) -> None:
+        """Attention for the one-token rows, over the FP4 pages and the tail.
+
+        Every per-row argument is a prefix slice of this step's arrays, which
+        is what the batch reordering buys: no compaction, no scatter, and an
+        output that lands where vLLM already wants it.
+        """
+        key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
+            self.runtime.views(kv_cache)
+        )
+        decoded = fp4_decode(
+            query=query[:rows],
+            key_pages_fp4=key_pages_fp4,
+            key_scales=key_scales,
+            value_pages_fp4=value_pages_fp4,
+            value_scales=value_scales,
+            fp4_page_table=attn_metadata.block_table[:rows],
+            seqused_fp4=attn_metadata.seqused_fp4[:rows],
+            residual_key_pages_bf16=self.runtime.tail_key[self.layer_index],
+            residual_value_pages_bf16=self.runtime.tail_value[
+                self.layer_index
+            ],
+            residual_page_ids=attn_metadata.row_to_slot[:rows],
+            seqused_residual=attn_metadata.seqused_residual[:rows],
+            softmax_scale=self.scale,
+            # The control plane produced these on the device this same step and
+            # nothing since could have invalidated them. Checking would mean
+            # reading them back, which costs a synchronization per layer.
+            trusted_metadata=True,
+            query_padded_scratch=self.runtime.query_padded,
+        )
+        output[:rows].copy_(decoded)
+
+    def _prefill(
+        self,
+        tokens: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+    ) -> None:
+        """Attention for the rows that arrived with their whole prompt.
+
+        Cache-free: ``k`` and ``v`` are this pass's own tensors and
+        ``cu_seqlens_k`` is ``cu_seqlens_q``, so the FP4 pages this prompt is
+        about to be written into are never read. That is what lets prefill run
+        against a cache FlashAttention cannot decode.
+
+        ``max_seqlen_q`` is the whole batch's maximum rather than the suffix's.
+        The prefills are the long rows, so the two agree unless the batch is
+        pure decode, in which case this does not run.
+        """
+        starts = attn_metadata.query_start_loc
+        if tokens:
+            # Only a mixed batch pays for this. A step of nothing but prefills
+            # already starts at zero, and that is the shape a prefill step
+            # normally has.
+            starts = starts[attn_metadata.decode_prefix_rows :] - tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        flash_attn_varlen_func(
+            q=query[tokens:num_actual_tokens],
+            k=key[tokens:num_actual_tokens],
+            v=value[tokens:num_actual_tokens],
+            out=output[tokens:num_actual_tokens],
+            cu_seqlens_q=starts,
+            max_seqlen_q=attn_metadata.max_query_len,
+            cu_seqlens_k=starts,
+            max_seqlen_k=attn_metadata.max_query_len,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            fa_version=self.vllm_flash_attn_version,
+        )

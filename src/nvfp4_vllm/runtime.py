@@ -1,16 +1,17 @@
-"""GPU state the write path keeps for the lifetime of one model.
+"""GPU state one model's NVFP4 layers share for their whole lifetime.
 
-Two things have to outlive a step and be shared by every layer: the BF16 tail
-holding each sequence's partial page, and the views that reinterpret a layer's
-block array as NVFP4 regions. The metadata builder cannot own them, because it
-has no reference to the attention layers, so they are attached to the layers
-and created the first time one of them runs.
+Three things have to outlive a step and be shared by every layer: the BF16 tail
+holding each sequence's partial page, the views that reinterpret a layer's
+block array as NVFP4 regions, and the buffer the decode kernel reads its BF16
+query through. The metadata builder cannot own them, because it has no
+reference to the attention layers, so they are attached to the layers and
+created the first time one of them runs.
 
 That first time is deliberately the profile run, before the KV cache exists.
 vLLM sizes the cache from whatever memory is still free once profiling ends, so
-a tail allocated later would come out of memory already promised to the cache.
-Allocating it during profiling makes the cache exactly that much smaller, which
-is the honest accounting.
+anything allocated later would come out of memory already promised to the
+cache. Allocating during profiling makes the cache exactly that much smaller,
+which is the honest accounting.
 
 Carving the cache views cannot happen that early, since during profiling the
 cache is a placeholder with no storage, so the views appear on the first real
@@ -27,14 +28,15 @@ from . import layout
 PAGE_SIZE = 128
 
 
-class WriteRuntime:
-    """The tail buffers and cache views shared by one model's layers."""
+class LayerRuntime:
+    """The tail buffers, cache views, and query scratch one model shares."""
 
     def __init__(
         self,
         *,
         num_layers: int,
         num_slots: int,
+        num_heads: int,
         num_kv_heads: int,
         head_dim: int,
         device: torch.device,
@@ -50,6 +52,20 @@ class WriteRuntime:
         self.tail_key = torch.zeros(shape, dtype=torch.bfloat16, device=device)
         self.tail_value = torch.zeros(
             shape, dtype=torch.bfloat16, device=device
+        )
+
+        # The residual MMA reads the query through a page-tall tile of which
+        # decode fills only the first row. Zeroed once here and never again:
+        # the quantizer writes row 0 and nothing writes the rest, so the
+        # padding stays valid for the life of the process. Shared by every
+        # layer, since a layer is done with it before the next one runs.
+        self.query_padded = torch.zeros(
+            num_slots,
+            PAGE_SIZE,
+            num_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
         )
 
         self._views: dict[int, tuple[torch.Tensor, ...]] = {}

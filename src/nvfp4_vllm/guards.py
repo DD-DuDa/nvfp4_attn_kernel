@@ -10,6 +10,7 @@ runs once per layer per engine and is not cached.
 from __future__ import annotations
 
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.v1.attention.backend import AttentionImpl, AttentionType
 
 from .control import MAX_SUPPORTED_SLOTS
 
@@ -123,4 +124,39 @@ def check_supported(vllm_config: VllmConfig) -> None:
             f"cudagraph_mode={compilation_config.cudagraph_mode.name} is not "
             "supported by the NVFP4 KV cache: graph capture over the promotion "
             "path is unverified. Pass enforce_eager=True."
+        )
+
+
+def check_layer_supported(impl: AttentionImpl) -> None:
+    """Raise unless this attention layer is one the decode kernel can serve.
+
+    Separate from ``check_supported`` because these come from the model rather
+    than the engine configuration. Each of them is a modifier the decode kernel
+    does not implement, so serving the layer would return plausible attention
+    computed against the wrong mask or the wrong scores — wrong quietly, which
+    is the failure mode worth spending a check on.
+    """
+    if impl.attn_type != AttentionType.DECODER:
+        raise UnsupportedConfigError(
+            f"attention type {impl.attn_type} is not supported by the NVFP4 "
+            "KV cache, which is a decoder cache."
+        )
+    if impl.kv_sharing_target_layer_name is not None:
+        raise UnsupportedConfigError(
+            "cross-layer KV sharing is not supported by the NVFP4 KV cache: "
+            "the BF16 tail is indexed by layer, so a layer that reads another "
+            "layer's cache would read its own empty tail."
+        )
+    unsupported = {
+        "sliding window": impl.sliding_window != (-1, -1),
+        "logit soft capping": bool(impl.logits_soft_cap),
+        "ALiBi": impl.alibi_slopes is not None,
+        "attention sinks": impl.sinks is not None,
+    }
+    named = [name for name, present in unsupported.items() if present]
+    if named:
+        raise UnsupportedConfigError(
+            f"{', '.join(named)} is not supported by the NVFP4 decode kernel, "
+            "which computes unmodified scaled dot-product attention over the "
+            "whole cache."
         )
