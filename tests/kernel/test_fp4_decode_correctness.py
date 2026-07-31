@@ -21,6 +21,7 @@ from nvfp4_decode_kernel import fp4_decode
 FP4_MIN_COSINE = 0.99
 FP4_MAX_ABS_ERROR = 5e-2
 QUALITY_COSINE_TOLERANCE = 1e-2
+_PAGE_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -190,27 +191,83 @@ def _torch_fp4_decode(
     k_fp4 = k_fp4.repeat_interleave(repeats, dim=2)
     v_fp4 = v_fp4.repeat_interleave(repeats, dim=2)
 
-    scores = torch.einsum(
-        "bqhd,bkhd->bhqk",
-        q_fp4,
-        k_fp4,
+    # The residual block is a pair of BF16 MMAs in the kernel, so nothing about
+    # it is FP4: not its K and V, and not the query or the probabilities that
+    # meet them. Only the FP4 pages see the quantized query. Random keys hide
+    # the difference because the tail is then a small, unremarkable slice of the
+    # sequence, but in a real decode it holds the most recent tokens and carries
+    # much of the attention mass.
+    positions = torch.arange(
+        k_fp4.shape[1], device=q.device
+    ).unsqueeze(0)
+    valid = positions < seqused_k.unsqueeze(1)
+    residual = positions >= (seqused_k - seqused_residual).unsqueeze(1)
+    residual = (residual & valid)[:, None, None, :]
+
+    scores = torch.where(
+        residual,
+        torch.einsum("bqhd,bkhd->bhqk", q.float(), k_fp4),
+        torch.einsum("bqhd,bkhd->bhqk", q_fp4, k_fp4),
     ) * softmax_scale
 
-    positions = torch.arange(scores.shape[-1], device=scores.device)
-    valid = positions.unsqueeze(0) < seqused_k.unsqueeze(1)
     scores = scores.masked_fill(~valid[:, None, None, :], -torch.inf)
-    scores = scores - scores.amax(dim=-1, keepdim=True)
-    p_exp = torch.exp(scores)
-    denominator = p_exp.sum(dim=-1, keepdim=True)
+    return _online_softmax_pv(scores, v_fp4, residual)
 
-    p_fp4 = _nvfp4_round_trip(p_exp)
 
-    output = torch.einsum(
-        "bhqk,bkhd->bqhd",
-        p_fp4 / denominator,
-        v_fp4,
+def _online_softmax_pv(
+    scores: torch.Tensor,
+    v_fp4: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Accumulate PV the way the kernel does: one page at a time, backwards.
+
+    What the reference point for a probability's FP4 scale is decides how much
+    of it survives, and the kernel's is not the row's maximum. It walks pages
+    from the end of the sequence towards the start, so a page is quantized
+    against the largest score seen from that page onwards, and rescales the
+    accumulator in fp32 whenever a later page raises it. A dominant key near
+    the front therefore costs nothing to the pages behind it, while quantizing
+    the whole row against one global maximum flushes them to zero. Attention
+    over real activations is peaked enough for the difference to be visible;
+    over random keys it is not.
+    """
+    page = _PAGE_SIZE
+    batch, heads, rows, length = scores.shape
+    output = torch.zeros(
+        batch, heads, rows, v_fp4.shape[-1], device=scores.device
     )
-    return output
+    running_max = torch.full(
+        (batch, heads, rows), -torch.inf, device=scores.device
+    )
+    running_sum = torch.zeros(batch, heads, rows, device=scores.device)
+
+    for start in range(length - page, -1, -page):
+        block = scores[..., start : start + page]
+        block_max = torch.maximum(running_max, block.amax(dim=-1))
+        # A block of nothing but masked positions leaves both maxima at -inf,
+        # and their difference is a NaN rather than the zero it should be.
+        rescale = torch.exp(running_max - block_max)
+        rescale = torch.where(
+            torch.isfinite(rescale), rescale, torch.zeros_like(rescale)
+        )
+        finite_max = torch.where(
+            block_max > -torch.inf, block_max, torch.zeros_like(block_max)
+        )
+        p_exp = torch.exp(block - finite_max.unsqueeze(-1))
+
+        running_sum = running_sum * rescale + p_exp.sum(dim=-1)
+        output = output * rescale.unsqueeze(-1)
+        p_block = torch.where(
+            residual[..., start : start + page],
+            p_exp.to(torch.bfloat16).float(),
+            _nvfp4_round_trip(p_exp),
+        )
+        output = output + torch.einsum(
+            "bhqk,bkhd->bhqd", p_block, v_fp4[:, start : start + page]
+        )
+        running_max = block_max
+
+    return (output / running_sum.unsqueeze(-1)).permute(0, 2, 1, 3)
 
 
 def _interleaved_page_cache(*regions: torch.Tensor) -> list[torch.Tensor]:

@@ -4928,10 +4928,16 @@ class FP4DecodeKernel:
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
-        for stage_init in cutlass.range_constexpr(self.q_stage):
-            cute.arch.mbarrier_arrive(
-                mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage_init
-            )
+        # A tile that starts on an fp4 block has nothing to correct on its first
+        # step, since that block's PV zero-initializes O, so the mma warp is let
+        # through for free here. A fused residual has already written O by then,
+        # which makes the first factor a real one; that tile arrives from inside
+        # the loop instead, once the rescale has happened.
+        if const_expr(not self.fused_residual_first_block):
+            for stage_init in cutlass.range_constexpr(self.q_stage):
+                cute.arch.mbarrier_arrive(
+                    mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage_init
+                )
 
         softmax_corr_consumer_phase = Int32(0)
         o_corr_consumer_phase = Int32(0)
@@ -4961,16 +4967,27 @@ class FP4DecodeKernel:
                 has_work = self.tile_has_work(n_block_min, n_block_max, split_idx)
 
             if has_work:
-                # Ignore first signal from softmax as no correction is required
+                # The first signal from softmax needs no correction unless a
+                # residual seeded the online softmax, in which case it carries
+                # the factor that takes O from the residual's row max to the
+                # first fp4 block's.
                 iket.range_push("corr_wait_sm")
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + 0, softmax_corr_consumer_phase
                 )
+                if const_expr(self.fused_residual_first_block):
+                    self.correction_seeded_rescale(
+                        thr_mma_pv, tOtOs, sScale, tidx, 0, mbar_ptr
+                    )
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 0)
                 if const_expr(self.q_stage == 2):
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_softmax_corr_full_offset + 1, softmax_corr_consumer_phase
                     )
+                    if const_expr(self.fused_residual_first_block):
+                        self.correction_seeded_rescale(
+                            thr_mma_pv, tOtOs, sScale, tidx, 1, mbar_ptr
+                        )
                 iket.range_pop()
                 softmax_corr_consumer_phase ^= 1
 
@@ -5110,8 +5127,13 @@ class FP4DecodeKernel:
                     if const_expr(not self.use_correction_warps_for_epi):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
                     # Signal for the next work tile that O buffers in tmem are already read, so
-                    # mma warp can write to them
-                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+                    # mma warp can write to them. A fused residual overwrites O
+                    # before it ever waits on this barrier, so that tile takes
+                    # its arrival from its own first rescale instead.
+                    if const_expr(not self.fused_residual_first_block):
+                        cute.arch.mbarrier_arrive(
+                            mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage
+                        )
 
                 o_corr_consumer_phase ^= 1
                 softmax_corr_consumer_phase ^= 1
@@ -5258,6 +5280,39 @@ class FP4DecodeKernel:
             tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
             cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
         cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
+    def correction_seeded_rescale(
+        self,
+        thr_mma_pv: cute.ThrMma,
+        tOtOs: tuple[cute.Tensor],
+        sScale: cute.Tensor,
+        tidx: Int32,
+        stage: int,
+        mbar_ptr: cute.Pointer,
+    ):
+        """Apply the first correction factor of a residual-seeded tile.
+
+        The residual's PV writes O before any fp4 block runs, so the factor the
+        first fp4 softmax step publishes is a real one rather than the no-op it
+        is on a tile that starts empty. Arriving on P_full_O_rescaled here is
+        also what holds the mma warp's first fp4 PV until O has been scaled;
+        that tile has no free arrival standing in for this one.
+        """
+        if const_expr(self.transpose_s):
+            scale = (
+                sScale[tidx + stage * self.m_block_size]
+                if tidx < self.transposed_query_rows
+                else Float32(1.0)
+            )
+        else:
+            scale = sScale[tidx + stage * self.m_block_size]
+        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+        if should_rescale:
+            self.correction_rescale(
+                thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
+            )
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
 
     @cute.jit
     def correction_epilogue(
