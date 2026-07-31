@@ -130,6 +130,91 @@ def _tail_write_kernel(
         )
 
 
+@triton.jit
+def _tail_reset_kernel(
+    tail_key_ptr,
+    tail_value_ptr,
+    tail_layer_stride,
+    tail_slot_stride,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    row_to_slot_ptr,
+    num_reqs,
+    WIDTH: tl.constexpr,
+):
+    """Clear the tail page a brand new request is about to move into.
+
+    Attention reads a row's whole tail page and masks the positions past its
+    length by weighting them zero, so those positions have to hold a finite
+    number: zero times a NaN is a NaN, and one poisoned lane takes the row's
+    entire output with it. The buffer is allocated zeroed for that reason, but
+    a slot outlives the request that filled it, and the next occupant inherits
+    whatever the last one left past its own length. Clearing on arrival is what
+    keeps the allocation-time invariant true for every later tenant.
+
+    A request is on its first step when the sequence is no longer than what it
+    brought, which catches a single-token prompt that the batch reordering
+    filed among the decodes, and a recycled block id that let a new request
+    match some earlier tenant's slot. Both keep a stale page otherwise.
+    """
+    layer = tl.program_id(0)
+    row = tl.program_id(1)
+    position = tl.program_id(2)
+
+    slot = tl.load(row_to_slot_ptr + row, mask=row < num_reqs, other=-1)
+    start = tl.load(query_start_loc_ptr + row, mask=row < num_reqs, other=0)
+    end = tl.load(query_start_loc_ptr + row + 1, mask=row < num_reqs, other=0)
+    seq_len = tl.load(seq_lens_ptr + row, mask=row < num_reqs, other=0)
+
+    if (slot >= 0) & (seq_len <= end - start):
+        lanes = tl.arange(0, WIDTH)
+        destination = (
+            layer * tail_layer_stride
+            + slot * tail_slot_stride
+            + position * WIDTH
+            + lanes
+        )
+        zero = tl.zeros([WIDTH], dtype=tail_key_ptr.dtype.element_ty)
+        tl.store(tail_key_ptr + destination, zero)
+        tl.store(tail_value_ptr + destination, zero)
+
+
+def reset_new_request_tails(
+    *,
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    row_to_slot: torch.Tensor,
+) -> None:
+    """Clear every layer's tail page for the rows starting a request this step.
+
+    Takes the tail for all layers at once and runs before any of them writes,
+    rather than once per layer, because a slot's history has to end for the
+    whole model at the same moment; a later layer clearing its own page would
+    also have to do it after that layer had already read one.
+
+    The grid covers every row whether or not it is new, since which rows are
+    new is a device-side answer and asking the host would cost the very
+    synchronization the control plane exists to avoid. The rows that are not
+    new store nothing, which on a step that starts no request makes this an
+    empty launch.
+    """
+    num_layers, _, page, heads, head_dim = tail_key.shape
+    _tail_reset_kernel[(num_layers, seq_lens.shape[0], page)](
+        tail_key,
+        tail_value,
+        tail_key.stride(0),
+        tail_key.stride(1),
+        query_start_loc,
+        seq_lens,
+        row_to_slot,
+        seq_lens.shape[0],
+        WIDTH=heads * head_dim,
+        num_warps=4,
+    )
+
+
 class PageWorkTable:
     """Per-step description of which full pages this step must quantize.
 
