@@ -5,6 +5,50 @@ from __future__ import annotations
 import torch
 
 
+# Rows of the tile the residual MMA reads the BF16 query through. Only row 0 of
+# each tile holds a real query, since decode has one token per row.
+_RESIDUAL_ROW_TILE = 128
+
+
+def _padded_query_buffer(
+    query: torch.Tensor,
+    rows: int,
+    scratch: torch.Tensor | None,
+) -> torch.Tensor:
+    """The BF16 query padded to the residual MMA's row tile.
+
+    The quantizer writes only ``[row, 0, head, :]``, so the rest of each tile
+    has to be zero. A freshly allocated buffer gets that from ``zeros``; a
+    caller-owned one has to have been zeroed when it was created, and stays
+    valid forever because nothing ever writes those positions.
+    """
+    heads, head_dim = query.shape[1], query.shape[2]
+    if scratch is None:
+        return torch.zeros(
+            rows,
+            _RESIDUAL_ROW_TILE,
+            heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=query.device,
+        )
+    expected = (_RESIDUAL_ROW_TILE, heads, head_dim)
+    if (
+        scratch.dtype is not torch.bfloat16
+        or scratch.device != query.device
+        or scratch.ndim != 4
+        or scratch.shape[0] < rows
+        or tuple(scratch.shape[1:]) != expected
+        or not scratch.is_contiguous()
+    ):
+        raise ValueError(
+            "query_padded_scratch must be a contiguous BF16 tensor on the "
+            f"query's device shaped [at least {rows}, "
+            f"{', '.join(str(extent) for extent in expected)}]"
+        )
+    return scratch[:rows]
+
+
 def fp4_decode_impl(
     query: torch.Tensor | None,
     key_pages_fp4: torch.Tensor,
@@ -26,6 +70,7 @@ def fp4_decode_impl(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
+    query_padded_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prepare either query contract and run the shared decode core."""
     from ._decode import decode_fp4, decode_fp4_split, split_k_heuristic
@@ -52,14 +97,7 @@ def fp4_decode_impl(
             else query_row_indices.shape[0]
         )
         query_padded_bf16 = (
-            torch.zeros(
-                rows,
-                128,
-                query.shape[1],
-                query.shape[2],
-                dtype=torch.bfloat16,
-                device=query.device,
-            )
+            _padded_query_buffer(query, rows, query_padded_scratch)
             if residual_key_pages_bf16 is not None
             else None
         )
@@ -77,6 +115,10 @@ def fp4_decode_impl(
         if query_row_indices is not None:
             raise ValueError(
                 "query_row_indices applies only to the BF16 query path"
+            )
+        if query_padded_scratch is not None:
+            raise ValueError(
+                "query_padded_scratch applies only to the BF16 query path"
             )
         if softmax_scale is None:
             softmax_scale = 128**-0.5

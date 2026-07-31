@@ -30,6 +30,7 @@ def fp4_decode(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
+    query_padded_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run paged NVFP4 decode attention.
 
@@ -65,6 +66,13 @@ def fp4_decode(
         out_indices: Optional INT32 mapping from compact decode rows to rows
             in ``out``. When supplied, the kernel scatters directly into
             ``out``.
+        query_padded_scratch: Optional BF16 buffer shaped
+            ``[at least rows, 128, heads_q, head_dim]`` that holds the query
+            padded to the residual MMA's row tile. Only the first row of each
+            tile is written, so a caller-owned buffer has to be zeroed once and
+            never again. Supplying one avoids reallocating and rezeroing it on
+            every call, which matters when a residual is present on every layer
+            of every step.
 
     Returns:
         The supplied ``out`` tensor when direct scatter is enabled; otherwise
@@ -113,4 +121,5 @@ def fp4_decode(
         out=out,
         out_indices=out_indices,
         trusted_metadata=trusted_metadata,
+        query_padded_scratch=query_padded_scratch,
     )

@@ -1028,6 +1028,93 @@ def test_trusted_metadata_matches_checked_path_exactly(
     assert torch.equal(trusted, checked)
 
 
+def _residual_call_kwargs(inputs: ContractDecodeInputs) -> dict:
+    """The hybrid contract call, minus the query and the padded scratch."""
+    return {
+        "key_pages_fp4": inputs.key_pages_fp4,
+        "key_scales": inputs.key_scales,
+        "value_pages_fp4": inputs.value_pages_fp4,
+        "value_scales": inputs.value_scales,
+        "fp4_page_table": inputs.page_table,
+        "seqused_fp4": inputs.seqused_fp4,
+        "residual_key_pages_bf16": inputs.key_pages_bf16,
+        "residual_value_pages_bf16": inputs.value_pages_bf16,
+        "residual_page_ids": inputs.residual_page_ids,
+        "seqused_residual": inputs.seqused_residual,
+        "query_row_indices": inputs.query_row_indices,
+    }
+
+
+def test_query_padded_scratch_matches_internal_allocation(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """A caller-owned padded-query buffer must survive being reused.
+
+    The quantizer writes only row 0 of each tile, so the rest has to stay
+    zero for the residual MMA. Running twice through one buffer is what
+    proves that: a call that dirtied the padding would move the second
+    answer away from the first.
+    """
+    inputs = contract_decode_inputs
+    rows = inputs.page_table.shape[0]
+    call = _residual_call_kwargs(inputs)
+    # Wider than this batch on purpose. Production sizes one buffer from
+    # max_num_seqs and reuses it for whatever the step happens to bring.
+    scratch = torch.zeros(
+        rows + 5,
+        128,
+        inputs.query.shape[1],
+        inputs.query.shape[2],
+        dtype=torch.bfloat16,
+        device=inputs.query.device,
+    )
+    with torch.no_grad():
+        allocated = fp4_decode(inputs.query, **call)
+        first = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
+        second = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
+    torch.cuda.synchronize()
+    assert torch.equal(first, allocated)
+    assert torch.equal(second, allocated)
+    assert not scratch[:, 1:].any()
+
+
+def test_query_padded_scratch_is_validated(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    rows = inputs.page_table.shape[0]
+    call = _residual_call_kwargs(inputs)
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+
+    def buffer(*shape: int) -> torch.Tensor:
+        return torch.zeros(
+            *shape, dtype=torch.bfloat16, device=inputs.query.device
+        )
+
+    for wrong in (
+        buffer(rows - 1, 128, heads, head_dim),
+        buffer(rows, 64, heads, head_dim),
+        buffer(rows, 128, heads - 1, head_dim),
+    ):
+        with pytest.raises(ValueError, match="query_padded_scratch"):
+            fp4_decode(inputs.query, **call, query_padded_scratch=wrong)
+
+    compact_query = inputs.query.index_select(
+        0, inputs.query_row_indices.long()
+    )
+    query_fp4, query_scales = _quantize.quantize_query(
+        compact_query, heads_kv=inputs.key_pages_fp4.shape[2]
+    )
+    del call["query_row_indices"]
+    with pytest.raises(ValueError, match="query_padded_scratch applies only"):
+        fp4_decode(
+            **call,
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            query_padded_scratch=buffer(rows, 128, heads, head_dim),
+        )
+
+
 def test_repeated_identical_calls_are_bitwise_identical() -> None:
     """The decode kernel must not depend on how its warps happen to interleave.
 
