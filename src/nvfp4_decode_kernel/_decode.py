@@ -1017,7 +1017,11 @@ def decode_fp4_split(
         (seqused_fp4, "seqused_fp4"),
     ):
         _require_cuda_tensor(tensor, name, device=device)
-    output_partial = torch.empty(
+    # A split that owns no page leaves its slice of this untouched, and the
+    # combine still reads it, scaled by the zero its -inf LSE produces. Zero
+    # times a leftover infinity is a NaN, so what the allocator happened to
+    # hand back would decide whether the answer survives.
+    output_partial = torch.zeros(
         num_splits,
         rows,
         1,
@@ -1026,11 +1030,13 @@ def decode_fp4_split(
         dtype=torch.float32,
         device=device,
     )
-    lse_partial = torch.empty(
-        num_splits,
-        rows,
-        heads_q,
-        1,
+    # -inf is what a split with no work publishes, and it is what the combine
+    # reads as "this split contributes nothing". Starting from it means a slot
+    # nobody wrote is indistinguishable from an empty one, rather than being
+    # whatever the allocator last left in that block.
+    lse_partial = torch.full(
+        (num_splits, rows, heads_q, 1),
+        float("-inf"),
         dtype=torch.float32,
         device=device,
     )
