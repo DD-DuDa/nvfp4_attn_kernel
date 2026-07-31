@@ -6,9 +6,10 @@ non-NVFP4 layer working: until the decode kernel is wired in, the layers still
 run FlashAttention, and they read these objects through the base class's
 fields.
 
-The fields below are device tensors written by the control kernel. Reading any
-of them on the host costs a synchronization, so nothing outside a kernel
-should.
+Most of the fields below are device tensors written by the control kernel.
+Reading any of those on the host costs a synchronization, so nothing outside a
+kernel should. The two plain ints are the exception, and are marked as such:
+they come from CPU-side batch descriptions, never from the device.
 """
 
 from __future__ import annotations
@@ -47,19 +48,19 @@ class NVFP4Metadata(FlashAttentionMetadata):
     """``[num_reqs]`` bool. Rows whose tail filled a whole page this step and
     must be quantized into the FP4 cache before the next one."""
 
-    decode_row_indices: torch.Tensor
-    """``[num_slots]`` int32. Batch rows that emit exactly one token, packed to
-    the front and padded with -1, which is what the decode kernel indexes
-    by."""
+    decode_prefix_rows: int
+    """How many rows of this batch emit exactly one token. vLLM has already
+    moved them to the front, so they are rows ``[0, decode_prefix_rows)``. A
+    host int, not a device tensor: it comes from ``query_start_loc_cpu``, so
+    reading it is free.
 
-    decode_count: torch.Tensor
-    """``[1]`` int32. How many entries of ``decode_row_indices`` are real. On
-    the device because the host does not need it and reading it would
-    synchronize."""
+    Not the base class's ``num_decode_reqs``, which counts something else
+    (rows that carry decode context under decode context parallelism) and is
+    left at zero outside that feature."""
 
-    active_row_mask: torch.Tensor
-    """``[num_slots]`` bool. The same information as ``decode_count`` in the
-    shape a kernel can predicate on."""
+    decode_prefix_tokens: int
+    """Where the prefill tokens begin. Equal to ``decode_prefix_rows`` while
+    every decode row emits one token, but derived rather than assumed."""
 
     source_tokens: torch.Tensor
     """``[work]`` int32. First token of each full page this step must quantize,
@@ -76,6 +77,7 @@ class NVFP4Metadata(FlashAttentionMetadata):
         base: FlashAttentionMetadata,
         outputs: ControlOutputs,
         work_table: tuple[torch.Tensor, torch.Tensor],
+        split: tuple[int, int],
     ) -> "NVFP4Metadata":
         """Carry every FlashAttention field across and append the slot fields.
 
@@ -90,9 +92,8 @@ class NVFP4Metadata(FlashAttentionMetadata):
             seqused_fp4=outputs.seqused_fp4,
             seqused_residual=outputs.seqused_residual,
             promotion_mask=outputs.promotion_mask,
-            decode_row_indices=outputs.decode_row_indices,
-            decode_count=outputs.decode_count,
-            active_row_mask=outputs.active_row_mask,
+            decode_prefix_rows=split[0],
+            decode_prefix_tokens=split[1],
             source_tokens=work_table[0],
             destination_pages=work_table[1],
         )

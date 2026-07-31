@@ -28,12 +28,44 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from .control import ControlPlane
 from .guards import NVFP4, check_supported
 from .metadata import NVFP4Metadata
 from .write import PageWorkTable
+
+
+def decode_split(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> tuple[int, int]:
+    """Where this step's decode prefix ends, in rows and in tokens.
+
+    The one host assertion in this module, and the exception §6.3 allows: it
+    reads ``query_start_loc_cpu``, which the model runner already materialized,
+    so it costs no synchronization. What it guards is the premise the whole
+    read path rests on — that the reordering actually happened. Without it, a
+    vLLM that stopped reordering would have the decode kernel attend to prefill
+    rows' caches with decode rows' queries, which is wrong everywhere and loud
+    nowhere.
+    """
+    num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
+        common_attn_metadata, decode_threshold=1
+    )
+    query_start_loc = common_attn_metadata.query_start_loc_cpu
+    query_lens = query_start_loc[1 : common_attn_metadata.num_reqs + 1] - (
+        query_start_loc[: common_attn_metadata.num_reqs]
+    )
+    if not bool((query_lens[:num_decodes] == 1).all()) or not bool(
+        (query_lens[num_decodes:] > 1).all()
+    ):
+        raise ValueError(
+            "the NVFP4 read path needs one-token requests at the front of the "
+            f"batch, but query lengths are {query_lens.tolist()} with a decode "
+            f"prefix of {num_decodes}"
+        )
+    return num_decodes, num_decode_tokens
 
 
 class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
@@ -46,6 +78,9 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
     with several KV cache groups to one ``build()`` per step, and the base
     implementation shallow-copies the metadata object, so the slot fields
     below survive the copy.
+
+    Under NVFP4 it also asks vLLM to sort decode requests to the front of the
+    batch; see ``decode_split``.
     """
 
     def __init__(
@@ -62,6 +97,13 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
         if not self.nvfp4:
             self.plane = None
             return
+
+        # Ask the model runner to move one-token requests to the front of the
+        # batch. That makes the decode rows a contiguous prefix, so the decode
+        # kernel takes slices of this step's arrays instead of a compacted copy
+        # of them, and its output is a slice of vLLM's. Left unset above, so a
+        # BF16 run through this backend keeps FlashAttention's batch order.
+        self._init_reorder_batch_threshold(1)
 
         # Already enforced when the layers were constructed. Repeated here so a
         # builder is safe to construct on its own, and so the control plane is
@@ -118,4 +160,6 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             max_query_len=common_attn_metadata.max_query_len,
         )
 
-        return NVFP4Metadata.from_flash(base, outputs, work_table)
+        return NVFP4Metadata.from_flash(
+            base, outputs, work_table, decode_split(common_attn_metadata)
+        )

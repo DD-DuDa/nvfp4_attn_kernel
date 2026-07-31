@@ -60,9 +60,9 @@ FREE_KEY = -1
 # to no one, so a row keyed on it is not a request. Dummy batches read it
 # straight out of the zero-initialized block table.
 NULL_BLOCK = 0
-# Fills ``decode_row_indices`` past ``decode_count``. A real row index would be
-# indistinguishable from a live entry, and pointing spare entries at a real row
-# would make the decode kernel re-read that row's whole KV.
+# Marks a row or token that owns no tail slot. A real slot index would be
+# indistinguishable from a live entry, so the write path would extend some
+# other request's tail with tokens that are not its own.
 INACTIVE_ROW = -1
 
 # Sticky bit flags in ``error_code``. Nothing on the hot path reads them;
@@ -102,9 +102,6 @@ def _control_kernel(
     seqused_fp4_ptr,
     seqused_residual_ptr,
     promotion_mask_ptr,
-    decode_row_indices_ptr,
-    decode_count_ptr,
-    active_row_mask_ptr,
     error_code_ptr,
     num_reqs,
     num_actual_tokens,
@@ -260,19 +257,6 @@ def _control_kernel(
     tl.store(seqused_residual_ptr + idx, tl.where(live, seq - fp4, 0), mask=is_slot)
     tl.store(promotion_mask_ptr + idx, live & (seq % PAGE == 0), mask=is_slot)
 
-    is_decode = live & (query_len == 1)
-    decode_rank = tl.cumsum(is_decode.to(tl.int32), axis=0) - 1
-    decode_count = tl.sum(is_decode.to(tl.int32), axis=0)
-    compact = is_decode[None, :] & (decode_rank[None, :] == idx[:, None])
-    decode_rows = tl.sum(tl.where(compact, idx[None, :], 0), axis=1)
-    tl.store(
-        decode_row_indices_ptr + idx,
-        tl.where(idx < decode_count, decode_rows, _INACTIVE),
-        mask=is_slot,
-    )
-    tl.store(active_row_mask_ptr + idx, idx < decode_count, mask=is_slot)
-    tl.store(decode_count_ptr, decode_count)
-
     # Bounded by the tokens actually present, so a steady-state decode step
     # runs one iteration.
     for base in tl.range(0, num_actual_tokens, TOKEN_BLOCK):
@@ -303,9 +287,6 @@ class ControlOutputs:
     seqused_fp4: torch.Tensor
     seqused_residual: torch.Tensor
     promotion_mask: torch.Tensor
-    decode_row_indices: torch.Tensor
-    decode_count: torch.Tensor
-    active_row_mask: torch.Tensor
     error_code: torch.Tensor
 
 
@@ -357,9 +338,6 @@ class ControlPlane:
         self.seqused_fp4 = _slots(torch.int32, 0)
         self.seqused_residual = _slots(torch.int32, 0)
         self.promotion_mask = _slots(torch.bool, False)
-        self.decode_row_indices = _slots(torch.int32, INACTIVE_ROW)
-        self.active_row_mask = _slots(torch.bool, False)
-        self.decode_count = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.error_code = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.token_to_slot = torch.full(
             (max_num_batched_tokens,),
@@ -420,9 +398,6 @@ class ControlPlane:
             self.seqused_fp4,
             self.seqused_residual,
             self.promotion_mask,
-            self.decode_row_indices,
-            self.decode_count,
-            self.active_row_mask,
             self.error_code,
             num_reqs,
             num_actual_tokens,
@@ -439,10 +414,5 @@ class ControlPlane:
             seqused_fp4=self.seqused_fp4[:num_reqs],
             seqused_residual=self.seqused_residual[:num_reqs],
             promotion_mask=self.promotion_mask[:num_reqs],
-            # Fixed capacity: the number of decode rows is only known on the
-            # device, and slicing to it would require reading it back.
-            decode_row_indices=self.decode_row_indices,
-            decode_count=self.decode_count,
-            active_row_mask=self.active_row_mask,
             error_code=self.error_code,
         )

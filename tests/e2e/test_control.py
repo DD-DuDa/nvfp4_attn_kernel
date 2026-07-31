@@ -151,10 +151,6 @@ class ReferenceSlotTable:
             ((length - 1) // self.page) * self.page if alive else 0
             for length, alive in zip(step.seq_lens, live)
         ]
-        decode_rows = [
-            r for r in range(num_reqs) if live[r] and step.query_lens[r] == 1
-        ]
-        pad = self.num_slots - len(decode_rows)
         token_to_slot = [
             slot_of[row] if live[row] else 0
             for row in range(num_reqs)
@@ -173,9 +169,6 @@ class ReferenceSlotTable:
                 alive and length % self.page == 0
                 for length, alive in zip(step.seq_lens, live)
             ],
-            "decode_row_indices": decode_rows + [INACTIVE_ROW] * pad,
-            "decode_count": len(decode_rows),
-            "active_row_mask": [True] * len(decode_rows) + [False] * pad,
             "error_code": self.errors,
         }
 
@@ -204,9 +197,6 @@ def run(plane: ControlPlane, step: Step) -> dict:
         "seqused_fp4": outputs.seqused_fp4.tolist(),
         "seqused_residual": outputs.seqused_residual.tolist(),
         "promotion_mask": outputs.promotion_mask.tolist(),
-        "decode_row_indices": outputs.decode_row_indices.tolist(),
-        "decode_count": int(outputs.decode_count.item()),
-        "active_row_mask": outputs.active_row_mask.tolist(),
         "error_code": int(outputs.error_code.item()),
     }
 
@@ -289,20 +279,6 @@ def test_recycled_block_ids_do_not_confuse_a_new_request(plane, reference):
     assert answer["error_code"] == 0
 
 
-def test_decode_rows_are_compacted_out_of_a_mixed_batch(plane, reference):
-    # The decode kernel takes one row per sequence, so a prefill row sitting
-    # between two decode rows has to be indexed around rather than left as a
-    # hole the kernel would have to interpret.
-    check(plane, reference, prefills([11, 22], [5, 300]))
-    answer = check(plane, reference, Step([11, 33, 22], [6, 700, 301], [1, 700, 1]))
-    assert answer["decode_count"] == 2
-    assert answer["decode_row_indices"] == [0, 2] + [INACTIVE_ROW] * 6
-    assert answer["active_row_mask"] == [True, True] + [False] * 6
-
-    answer = check(plane, reference, decodes([11, 33, 22], [7, 701, 302]))
-    assert answer["decode_row_indices"] == [0, 1, 2] + [INACTIVE_ROW] * 5
-
-
 def test_every_token_is_labelled_with_its_row_slot(plane, reference):
     answer = check(plane, reference, Step([11, 22], [3, 300], [3, 300]))
     assert answer["token_to_slot"] == [0, 0, 0] + [1] * 300
@@ -329,7 +305,6 @@ def test_a_padded_row_is_not_a_request(plane, reference):
         plane, reference, Step([11, 22, 33, 33], [11, 21, 0, 0], [1, 1, 0, 0])
     )
     assert answer["row_to_slot"] == [0, 1, INACTIVE_ROW, INACTIVE_ROW]
-    assert answer["decode_count"] == 2
     assert answer["error_code"] == 0
     # 33's slot survives untouched, so the request could still be resumed.
     answer = check(plane, reference, decodes([11, 22, 33], [12, 22, 31]))
@@ -346,7 +321,6 @@ def test_a_dummy_batch_over_the_null_block_is_not_a_request(plane, reference):
     check(plane, reference, prefills([11, 22], [10, 20]))
     answer = check(plane, reference, prefills([NULL_BLOCK] * 8, [512] * 8))
     assert answer["row_to_slot"] == [INACTIVE_ROW] * 8
-    assert answer["decode_count"] == 0
     assert answer["error_code"] == 0
     # The real requests keep their slots and their history across it.
     answer = check(plane, reference, decodes([11, 22], [11, 21]))

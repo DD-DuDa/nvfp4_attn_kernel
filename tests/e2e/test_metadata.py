@@ -66,9 +66,10 @@ def _markers(cls) -> dict:
 # omission, which is what the field-set assertion below forces.
 NOT_SPLICED = {"error_code"}
 
-# The other source of appended fields: the page work table, which build()
-# produces alongside the control plane's outputs.
+# The other sources of appended fields: the page work table, and the
+# decode/prefill boundary build() reads off the CPU-side batch description.
 WORK_TABLE = ("source_tokens", "destination_pages")
+SPLIT = ("decode_prefix_rows", "decode_prefix_tokens")
 
 
 def _splice():
@@ -76,7 +77,12 @@ def _splice():
     base = FlashAttentionMetadata(**_markers(FlashAttentionMetadata))
     outputs = ControlOutputs(**_markers(ControlOutputs))
     work_table = tuple(_Marker(name) for name in WORK_TABLE)
-    return NVFP4Metadata.from_flash(base, outputs, work_table), base, outputs
+    split = tuple(_Marker(name) for name in SPLIT)
+    return (
+        NVFP4Metadata.from_flash(base, outputs, work_table, split),
+        base,
+        outputs,
+    )
 
 
 def test_the_splice_keeps_every_flash_attention_field():
@@ -89,23 +95,66 @@ def test_the_splice_keeps_every_flash_attention_field():
 
 
 def test_the_splice_keeps_every_control_plane_output():
+    # Computing the added set by subtraction also catches a field that shadows
+    # one of FlashAttention's: it would drop out of `added` here, and the
+    # splice itself would pass the same keyword twice.
     spliced, _, outputs = _splice()
     added = {field.name for field in fields(NVFP4Metadata)} - {
         field.name for field in fields(FlashAttentionMetadata)
     }
     from_control = {field.name for field in fields(ControlOutputs)} - NOT_SPLICED
-    assert added == from_control | set(WORK_TABLE)
+    assert added == from_control | set(WORK_TABLE) | set(SPLIT)
     for name in from_control:
         assert getattr(spliced, name) is getattr(outputs, name), name
-    for name in WORK_TABLE:
+    for name in WORK_TABLE + SPLIT:
         assert getattr(spliced, name).name == name
 
 
 def test_the_result_is_still_flash_attention_metadata():
-    # Until the decode kernel lands, every layer still runs FlashAttention and
-    # reads these objects through the base class.
+    # Prefill rows still run FlashAttention and read these objects through the
+    # base class.
     spliced, _, _ = _splice()
     assert isinstance(spliced, FlashAttentionMetadata)
+
+
+# --- the decode prefix -----------------------------------------------------
+
+
+def _batch(query_lens: list[int]):
+    """The little of CommonAttentionMetadata that the split reads."""
+    from types import SimpleNamespace
+
+    starts = [0]
+    for length in query_lens:
+        starts.append(starts[-1] + length)
+    return SimpleNamespace(
+        query_start_loc_cpu=torch.tensor(starts, dtype=torch.int32),
+        max_query_len=max(query_lens),
+        num_reqs=len(query_lens),
+        num_actual_tokens=starts[-1],
+        is_prefilling=None,
+    )
+
+
+def test_the_decode_prefix_is_measured_in_rows_and_tokens():
+    from nvfp4_vllm.builder import decode_split
+
+    # A pure decode batch is all prefix; a pure prefill batch has none.
+    assert decode_split(_batch([1, 1, 1])) == (3, 3)
+    assert decode_split(_batch([300, 40])) == (0, 0)
+    # Mixed: the two numbers stop agreeing past the boundary, which is why the
+    # token count is derived rather than assumed equal to the row count.
+    assert decode_split(_batch([1, 1, 300, 40])) == (2, 2)
+
+
+def test_a_batch_that_was_not_reordered_is_refused():
+    from nvfp4_vllm.builder import decode_split
+
+    # Everything downstream slices by the decode prefix, so a prefill row in
+    # front of a decode row has to stop the step rather than silently hand the
+    # kernel a row it cannot serve.
+    with pytest.raises(ValueError, match="front of the batch"):
+        decode_split(_batch([300, 1, 1]))
 
 
 # --- one build per step ----------------------------------------------------
