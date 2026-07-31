@@ -14,8 +14,8 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from nvfp4_decode_kernel import fp4_decode
 
 from .guards import NVFP4, check_supported, check_layer_supported
-from .runtime import LayerRuntime
-from .write import write_kv
+from .runtime import PAGE_SIZE, LayerRuntime
+from .write import reset_new_request_tails, write_kv
 
 
 class NVFP4Impl(FlashAttentionImpl):
@@ -116,6 +116,18 @@ class NVFP4Impl(FlashAttentionImpl):
         if metadata is None or self.runtime is None:
             return
 
+        # The first layer speaks for the whole model here: a slot's previous
+        # tenant has to be erased from every layer before any of them writes
+        # this step, and layers run in the order they were indexed.
+        if self.layer_index == 0:
+            reset_new_request_tails(
+                tail_key=self.runtime.tail_key,
+                tail_value=self.runtime.tail_value,
+                query_start_loc=metadata.query_start_loc,
+                seq_lens=metadata.seq_lens,
+                row_to_slot=metadata.row_to_slot,
+            )
+
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
             self.runtime.views(kv_cache)
         )
@@ -200,13 +212,24 @@ class NVFP4Impl(FlashAttentionImpl):
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
             self.runtime.views(kv_cache)
         )
+        # The kernel reads the page table's width as the longest row it has to
+        # walk, and picks a split count from it, so a table left at the model's
+        # capacity makes a short batch look long and buys splits that own no
+        # page at all. A row's last page is always its tail's, never an FP4
+        # one, which is what puts the boundary one token short of the length.
+        #
+        # The batch's longest row, not the decodes' own: the per-row lengths
+        # live on the device, and vLLM's host-side copy of them is materialized
+        # by a transfer that would cost this step a synchronization. A prefill
+        # sharing the step can only widen this, never narrow it wrongly.
+        pages = max(1, (attn_metadata.max_seq_len - 1) // PAGE_SIZE)
         decoded = fp4_decode(
             query=query[:rows],
             key_pages_fp4=key_pages_fp4,
             key_scales=key_scales,
             value_pages_fp4=value_pages_fp4,
             value_scales=value_scales,
-            fp4_page_table=attn_metadata.block_table[:rows],
+            fp4_page_table=attn_metadata.block_table[:rows, :pages],
             seqused_fp4=attn_metadata.seqused_fp4[:rows],
             residual_key_pages_bf16=self.runtime.tail_key[self.layer_index],
             residual_value_pages_bf16=self.runtime.tail_value[
