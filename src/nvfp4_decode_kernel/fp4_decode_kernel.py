@@ -1828,6 +1828,7 @@ class FP4DecodeKernel:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        iket.range_push("pro_init")
         # Prefetch tma descriptor
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
@@ -1952,8 +1953,12 @@ class FP4DecodeKernel:
                     mbar_ptr + self.mbar_q_fp4_ready_offset + i,
                     1,  # one arrive: the load warp (after cast)
                 )
+        iket.range_pop()
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
+        iket.range_push("pro_sync")
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
+        iket.range_pop()
+        iket.range_push("pro_setup")
 
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
@@ -2265,6 +2270,7 @@ class FP4DecodeKernel:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
+        iket.range_pop()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
@@ -2791,9 +2797,11 @@ class FP4DecodeKernel:
             )
 
             if const_expr(not self.use_block_sparsity):
+                iket.range_push("load_seqinfo")
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
+                iket.range_pop()
                 if const_expr(self.fused_residual_first_block):
                     if const_expr(self.residual_source == "paged_bf16"):
                         residual_kv_idx = mResidualBlockIds[batch_idx]
@@ -2903,6 +2911,7 @@ class FP4DecodeKernel:
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                         load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0 + SFQ0
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
+                    iket.range_push("load_pageidx")
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
@@ -2910,7 +2919,10 @@ class FP4DecodeKernel:
                     )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
+                    iket.range_pop()
+                    iket.range_push("load_issue_k0")
                     load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0 + SFK0
+                    iket.range_pop()
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
                         load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1 + SFQ1
@@ -3872,10 +3884,12 @@ class FP4DecodeKernel:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            iket.range_push("sm_seqinfo")
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
             )
+            iket.range_pop()
             # A split can be handed no kv block at all. Such a tile must stay out
             # of the correction handshake entirely, as on the untransposed path,
             # or the two warp groups fall out of step.
