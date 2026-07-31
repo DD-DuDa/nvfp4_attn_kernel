@@ -750,11 +750,21 @@ def flash_attn_combine(
         compiled = cute.compile(
             operation,
             *cute_args,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            cute.runtime.make_fake_stream(),
             options="--enable-tvm-ffi",
         )
         flash_attn_combine.compile_cache[key] = compiled
-    compiled(*cute_args)
+    # The partials this reads were written by the attention kernel on the
+    # caller's stream, and nothing orders the two apart from being on it as
+    # well. Taking the stream from the TVM FFI environment instead means
+    # taking the default stream, which is where this ran until a host that
+    # keeps its work off the default stream — vLLM does — turned the read
+    # into a race against the write. Every other kernel here already launches
+    # this way.
+    compiled(
+        *cute_args,
+        cuda.CUstream(torch.cuda.current_stream(out_partial.device).cuda_stream),
+    )
     return out, lse
 
 
