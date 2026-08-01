@@ -143,6 +143,7 @@ class StepState:
 class Session:
     sealed: list[Sealed]
     states: list[StepState]
+    num_layers: int
     launches: int
     host_micros: list[float]
     device_micros: list[float]
@@ -275,7 +276,7 @@ def session() -> Session:
     starts: list[torch.Tensor] = []
     host_micros: list[float] = []
     events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-    counters = {"launches": 0}
+    counters = {"launches": 0, "num_layers": 0}
 
     original_update = impl_module.NVFP4Impl.do_kv_cache_update
     original_decode = impl_module.NVFP4Impl._decode
@@ -327,6 +328,7 @@ def session() -> Session:
         end.record()
         events.append((begin, end))
         counters["launches"] += 1
+        counters["num_layers"] = runtime.num_layers
 
         step = len(starts) - 1
         lengths = metadata.seq_lens.tolist()
@@ -380,6 +382,7 @@ def session() -> Session:
         yield Session(
             sealed=sealed,
             states=states,
+            num_layers=counters["num_layers"],
             launches=counters["launches"],
             host_micros=host_micros,
             device_micros=[
@@ -448,9 +451,18 @@ def test_two_rows_seal_a_page_on_the_same_step(session: Session):
 
 
 def test_every_sealed_page_holds_the_quantizer_s_own_bytes(session: Session):
-    """The whole contract: right layer, right block, right four regions.
+    """The launch honoured its index tensors, in every layer's own allocation.
 
-    Every layer is compared, because the address table promotion reaches the
+    Both sides read the same two index tensors — the slot from
+    ``promotion_source_tokens``, the block from ``promotion_pages`` — so a
+    control plane that named the wrong slot would move both together and go
+    unseen here. That half belongs to ``test_control.py``, which checks those
+    tensors against a reference, and to the oracle below, which would not
+    reconcile against a page built from the wrong tokens.
+
+    What is left is the half this is for: given the right indices, did the
+    bytes land in the right layer, block and region. Every layer is compared
+    rather than a sample, because the address table promotion reaches the
     layers through is exactly the kind of thing that goes wrong in the middle
     while the ends stay right.
     """
@@ -469,8 +481,9 @@ def test_every_sealed_page_holds_the_quantizer_s_own_bytes(session: Session):
     )
 
     layers = {page.layer for page in session.sealed}
-    assert len(layers) == max(layers) + 1 and len(layers) > 1, (
-        f"only layers {sorted(layers)} were compared"
+    assert layers == set(range(session.num_layers)), (
+        f"layers {sorted(layers)} were compared, out of "
+        f"{session.num_layers} the model has"
     )
 
 
@@ -545,7 +558,12 @@ def test_the_fp4_prefix_takes_the_page_over(session: Session):
 def test_the_lengths_agree_with_the_page_split_all_the_way_through(
     session: Session,
 ):
-    """``seqused_fp4`` is whole pages, and the two parts sum to the length."""
+    """``seqused_fp4`` is whole pages, and the two parts sum to the length.
+
+    A property of the control plane rather than of promotion, kept here
+    because it is the invariant the tests above read the lengths under, and a
+    run where it stopped holding would make them report something else.
+    """
     for index, state in enumerate(session.states):
         for row, length in enumerate(state.seq_lens):
             assert state.seqused_fp4[row] == ((length - 1) // PAGE_SIZE) * PAGE_SIZE, (
@@ -704,8 +722,14 @@ def test_promotion_is_launched_once_a_step_whatever_the_batch(
     )
 
 
-def test_only_the_rows_that_crossed_were_written(session: Session):
-    """A fixed launch shape must not turn into fixed work."""
+def test_only_the_rows_that_crossed_carried_a_destination(session: Session):
+    """A fixed launch shape must not turn into fixed work.
+
+    This counts destinations, not writes. That the kernel leaves an idle page
+    alone is the kernel suite's to prove, and
+    ``test_a_base_table_sends_each_layer_to_its_own_allocation`` does it there
+    by poisoning the pages nobody should touch.
+    """
     payload = sum(
         1
         for state in session.states
@@ -752,6 +776,10 @@ def test_every_request_was_scheduled_on_every_step(session: Session):
     another's and the oracle would be comparing against a sequence that never
     existed.
     """
+    assert len(set(PROMPT_LENGTHS)) == len(PROMPT_LENGTHS), (
+        f"two requests start from the same length: {PROMPT_LENGTHS}. Their "
+        "histories would be filed under one key and spliced together."
+    )
     widths = {len(state.seq_lens) for state in session.states}
     assert widths == {len(PROMPT_LENGTHS)}, (
         f"the batch changed width during the run: {widths}"

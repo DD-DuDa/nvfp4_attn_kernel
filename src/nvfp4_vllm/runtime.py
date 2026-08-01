@@ -161,10 +161,20 @@ class LayerRuntime:
         the boundary token, and what reached the user would be a model that is
         slightly and inexplicably worse. Two integers a layer is cheaper than
         ever having to debug that.
+
+        The count carries across steps rather than resetting at layer 0, so
+        that a step which ran only some of its layers is caught by the next
+        step's first layer arriving early. It resynchronizes when it complains,
+        because the other way to leave it mid-stack is for something else to
+        raise partway through a step, and a stale count would then answer every
+        later step with a complaint about layer order instead of about whatever
+        actually broke.
         """
         if layer_index != self._expected_layer:
+            expected = self._expected_layer
+            self._expected_layer = (layer_index + 1) % self.num_layers
             raise ValueError(
-                f"layer {layer_index} ran where layer {self._expected_layer} "
-                "was expected; promotion assumes layers run in index order"
+                f"layer {layer_index} ran where layer {expected} was expected; "
+                "promotion assumes layers run in index order"
             )
         self._expected_layer = (layer_index + 1) % self.num_layers

@@ -16,8 +16,12 @@ the layers above it.
 Four of the six lengths also fill their page during the run, which puts the
 other way a slot's contents move — promotion wrapping the tail back to its
 start — into the same mixture as the handovers, and at different steps for
-each. A slot that changes hands the step after it was wrapped is the case
-neither this file nor ``test_promotion.py`` would reach alone.
+each. So a slot is handed on having been wrapped once or twice mid-generation
+rather than only ever grown, which is a state neither this file nor
+``test_promotion.py`` reached before. The wrap and the handover are still
+several steps apart, since a request only leaves at the end of its own
+generation; a slot reused on the very next step would need requests that stop
+at different lengths, and nothing here does that yet.
 
 The counting is done on the device and read once at the end. Checking a step's
 output on the host would synchronize on every step, which would change the
