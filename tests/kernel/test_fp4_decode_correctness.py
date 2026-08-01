@@ -1047,10 +1047,11 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
     assert torch.equal(out[:rows], allocated)
     # The rows this batch does not own belong to other requests.
     assert torch.equal(out[rows:], torch.full_like(out[rows:], sentinel))
-    # Split-K returns ``out[:rows]`` where the unsplit path returns the whole
-    # ``out``; what both promise is a view of the caller's own buffer.
+    # Both entries hand back the batch's own prefix of the caller's buffer,
+    # not the spare rows they never wrote.
     assert returned.data_ptr() == out.data_ptr()
-    assert torch.equal(returned[:rows], allocated)
+    assert tuple(returned.shape) == (rows, heads_q, head_dim)
+    assert torch.equal(returned, allocated)
 
 
 @pytest.mark.parametrize(
@@ -1144,6 +1145,76 @@ def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
             seqused_fp4,
             out=out,
         )
+
+
+def test_a_single_tile_out_returns_only_the_rows_it_wrote() -> None:
+    """The single-tile path returns the same prefix the split path does.
+
+    The two disagreed: split-K returned ``out[:rows]`` while this one returned
+    the caller's whole buffer, rows it never wrote included. ``out_indices``
+    stays the exception, since a scatter can land anywhere in the buffer and
+    only the whole of it describes where the results went.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    from nvfp4_decode_kernel import _decode
+
+    torch.manual_seed(0x1717)
+    rows, heads_q, heads_kv, pages, head_dim = 2, 16, 1, 1, 128
+    query = torch.randn(
+        rows, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        pages,
+        _PAGE_SIZE,
+        heads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    decode_arguments = (
+        key_pages_fp4,
+        key_scales,
+        value_pages_fp4,
+        value_scales,
+        torch.zeros(rows, pages, device="cuda", dtype=torch.int32),
+        torch.full(
+            (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
+        ),
+    )
+
+    sms = torch.cuda.get_device_properties(
+        query.device
+    ).multi_processor_count
+    splits = _decode.split_k_heuristic(rows, heads_kv, pages, sms=sms)
+    assert splits == 1, (
+        "this test is about the path split-K does not take, but the "
+        f"heuristic chose {splits} splits for {sms} SMs"
+    )
+
+    spare_rows = 3
+    sentinel = torch.tensor(17.0, dtype=torch.bfloat16, device=query.device)
+    out = torch.full(
+        (rows + spare_rows, heads_q, head_dim),
+        sentinel,
+        dtype=torch.bfloat16,
+        device=query.device,
+    )
+    with torch.no_grad():
+        allocated = fp4_decode(query, *decode_arguments)
+        returned = fp4_decode(query, *decode_arguments, out=out)
+    torch.cuda.synchronize()
+
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(returned.shape) == (rows, heads_q, head_dim)
+    assert torch.equal(returned, allocated)
+    assert torch.equal(out[rows:], torch.full_like(out[rows:], sentinel))
 
 
 def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(

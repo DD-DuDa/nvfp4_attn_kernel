@@ -974,7 +974,10 @@ def decode_fp4(
             )
         compiled(*call_args, **call_kwargs)
     if out is not None:
-        return out
+        # Only a scatter can land rows past the batch prefix, so only then is
+        # the whole buffer the answer. Otherwise out[rows:] belongs to other
+        # requests, and the split path returns the same prefix.
+        return out if out_indices is not None else out[:rows]
     return output_4d[:, 0]
 
 

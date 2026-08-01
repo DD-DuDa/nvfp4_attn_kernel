@@ -81,8 +81,11 @@ def fp4_decode(
             every step.
 
     Returns:
-        The supplied ``out`` tensor when there is one; otherwise a compact
-        BF16 output corresponding to the selected query rows.
+        A compact BF16 output for the selected query rows. It is a view of
+        ``out`` when one was supplied rather than a fresh allocation: the
+        whole of ``out`` when ``out_indices`` scattered the rows across it,
+        and ``out[:rows]`` otherwise, because the rows past the batch belong
+        to whoever else shares the buffer.
     """
     try:
         from ._kernel import fp4_decode_impl
