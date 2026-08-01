@@ -62,16 +62,35 @@ class CacheReport:
     num_layers: int
     num_blocks: int
     total_bytes: int
+    tail_bytes: int = 0
 
     @property
     def tokens(self) -> int:
         return self.num_blocks * PAGE_SIZE
 
+    @property
+    def charged_bytes(self) -> int:
+        """Everything this cache costs, including what is not in the cache.
+
+        The BF16 tail is the FP4 layout's own overhead: V is packed along the
+        token axis a page at a time, so a partial page has to live somewhere
+        else. Leaving it out would be the accounting mistake this whole file
+        exists to prevent, in the other direction.
+        """
+        return self.total_bytes + self.tail_bytes
+
+    @property
+    def tokens_per_gib(self) -> float:
+        return self.tokens / (self.charged_bytes / 2**30)
+
     def summary(self) -> str:
+        tail = (
+            f", tail {self.tail_bytes / 2**20:,.0f} MiB" if self.tail_bytes else ""
+        )
         return (
             f"{self.label}: page {self.page_size_bytes:,} B/layer, "
             f"{self.num_blocks:,} blocks, {self.tokens:,} tokens, "
-            f"{self.total_bytes / 2**30:.2f} GiB"
+            f"{self.total_bytes / 2**30:.2f} GiB{tail}"
         )
 
 
@@ -93,6 +112,20 @@ def _model_runner(llm):
     return core.model_executor.driver_worker.worker.model_runner
 
 
+def _tail_bytes(llm) -> int:
+    """What the BF16 tail costs this engine, or zero if it has none.
+
+    Reached through a layer rather than through the runtime module, because
+    the runtime is attached to the layers and there is no registry of it.
+    """
+    runner = _model_runner(llm)
+    for module in runner.model.modules():
+        runtime = getattr(getattr(module, "impl", None), "runtime", None)
+        if runtime is not None:
+            return runtime.tail_bytes
+    return 0
+
+
 def _read_report(label: str, llm) -> CacheReport:
     """Summarize a live engine's KV cache as ints.
 
@@ -110,6 +143,7 @@ def _read_report(label: str, llm) -> CacheReport:
         num_layers=len(caches),
         num_blocks=layer_bytes // spec.page_size_bytes,
         total_bytes=layer_bytes * len(caches),
+        tail_bytes=_tail_bytes(llm),
     )
 
 
@@ -151,13 +185,15 @@ def _free_gib() -> float:
     return free / 2**30
 
 
-@pytest.mark.skipif(
-    not RUN_E2E,
-    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
-)
-def test_nvfp4_kv_cache_holds_more_than_three_times_the_tokens(monkeypatch):
+@pytest.fixture(scope="module")
+def reports() -> dict[str, CacheReport]:
+    """One pair of engines, read by every test in the file.
+
+    Built once because building them is most of the runtime here, and because
+    two engines profiled at different moments would not be comparable.
+    """
     _require_sm100()
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     free_before = _free_gib()
     bf16 = _measure("BF16", "auto", "FLASH_ATTN")
@@ -170,6 +206,15 @@ def test_nvfp4_kv_cache_holds_more_than_three_times_the_tokens(monkeypatch):
         f"{free_before:.2f} GiB it started from, so the NVFP4 engine would be "
         "sized against a smaller budget"
     )
+    return {"bf16": bf16, "nvfp4": nvfp4}
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
+def test_nvfp4_kv_cache_holds_more_than_three_times_the_tokens(reports):
+    bf16, nvfp4 = reports["bf16"], reports["nvfp4"]
 
     assert bf16.num_layers == nvfp4.num_layers, (
         f"the two engines disagree on layer count ({bf16.num_layers} vs "
@@ -199,4 +244,61 @@ def test_nvfp4_kv_cache_holds_more_than_three_times_the_tokens(monkeypatch):
         f"the NVFP4 cache holds only {token_ratio:.4f}x the tokens of the "
         f"BF16 cache, below the {MIN_TOKEN_CAPACITY_RATIO}x floor.\n"
         f"{bf16.summary()}\n{nvfp4.summary()}"
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
+def test_the_tail_buffer_does_not_eat_the_saving(reports):
+    """The ratio above is gross. This is the same ratio after the rent.
+
+    The FP4 layout cannot store a partial page, so it keeps one BF16 page per
+    layer per slot on the side. That memory is not in vLLM's KV accounting and
+    it is not free: it scales with ``MAX_SUPPORTED_SLOTS``, which is why
+    raising that constant is a memory decision and not only a kernel one.
+
+    Charging it changes the honest headline, and the test is here so the
+    charge is visible rather than discovered later by somebody sizing a
+    deployment.
+    """
+    bf16, nvfp4 = reports["bf16"], reports["nvfp4"]
+
+    assert bf16.tail_bytes == 0, (
+        "the BF16 arm reported a tail buffer, so it went through the NVFP4 "
+        "runtime and the comparison has no baseline"
+    )
+    assert nvfp4.tail_bytes > 0, (
+        "the NVFP4 arm reported no tail buffer, so either the runtime was "
+        "never built or this test is reading the wrong attribute, and the "
+        "net figure below would flatter us"
+    )
+
+    # This engine runs MAX_NUM_SEQS slots, not the ceiling. The tail is linear
+    # in slot count, so the worst case is reported alongside the measurement —
+    # that is the figure somebody sizing a deployment needs, and quoting the
+    # sample instead would understate it fourfold.
+    from nvfp4_vllm.control import MAX_SUPPORTED_SLOTS
+
+    per_slot = nvfp4.tail_bytes / MAX_NUM_SEQS
+    at_ceiling = per_slot * MAX_SUPPORTED_SLOTS
+    gross = nvfp4.tokens / bf16.tokens
+    net = nvfp4.tokens_per_gib / bf16.tokens_per_gib
+    worst = (
+        nvfp4.tokens / ((nvfp4.total_bytes + at_ceiling) / 2**30)
+    ) / bf16.tokens_per_gib
+    print(
+        f"tail {nvfp4.tail_bytes / 2**20:,.0f} MiB at {MAX_NUM_SEQS} slots, "
+        f"{per_slot / 2**20:,.1f} MiB per slot, "
+        f"{at_ceiling / 2**20:,.0f} MiB at the {MAX_SUPPORTED_SLOTS}-slot "
+        f"ceiling ({at_ceiling / nvfp4.total_bytes * 100:.2f}% of the cache)\n"
+        f"capacity ratio {gross:.4f} gross, {net:.4f} net, "
+        f"{worst:.4f} net at the ceiling"
+    )
+    assert worst > MIN_TOKEN_CAPACITY_RATIO, (
+        f"with the tail buffer at its {MAX_SUPPORTED_SLOTS}-slot ceiling of "
+        f"{at_ceiling / 2**20:,.0f} MiB the NVFP4 cache is worth {worst:.4f}x "
+        f"the BF16 one per byte, below the {MIN_TOKEN_CAPACITY_RATIO}x floor "
+        f"the gross ratio cleared at {gross:.4f}"
     )
