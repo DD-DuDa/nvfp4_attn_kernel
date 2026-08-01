@@ -935,6 +935,124 @@ def test_split_k_empty_partitions_are_ignored() -> None:
     assert torch.equal(split, unsplit)
 
 
+@pytest.mark.parametrize(
+    "with_residual",
+    [False, True],
+    ids=["pure-fp4", "residual"],
+)
+def test_out_alone_keeps_split_k_and_writes_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    with_residual: bool,
+) -> None:
+    """An ``out`` without ``out_indices`` keeps split-K and writes in place.
+
+    This is the path every vLLM decode step takes: ``impl.py`` hands over
+    ``out=output[:rows]`` and no indices, which leaves the heuristic free to
+    split. The only other test that passes ``out`` also passes ``out_indices``,
+    and that forces the single-tile path, so the split branch's write into a
+    caller's buffer is otherwise never executed.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    from nvfp4_decode_kernel import _decode
+
+    torch.manual_seed(0x0117)
+    rows, heads_q, heads_kv, pages, head_dim = 1, 16, 1, 64, 128
+    query = torch.randn(
+        rows, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        pages,
+        _PAGE_SIZE,
+        heads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    page_table = torch.arange(
+        pages, device="cuda", dtype=torch.int32
+    ).reshape(rows, pages)
+    seqused_fp4 = torch.full(
+        (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
+    )
+
+    sms = torch.cuda.get_device_properties(
+        query.device
+    ).multi_processor_count
+    heuristic_splits = _decode.split_k_heuristic(
+        rows, heads_kv, pages, sms=sms
+    )
+    assert heuristic_splits > 1, (
+        "these shapes have to reach split-K for this test to mean anything, "
+        f"but the heuristic chose {heuristic_splits} splits for {sms} SMs"
+    )
+
+    residual = {}
+    if with_residual:
+        residual = {
+            "residual_key_pages_bf16": k_pages,
+            "residual_value_pages_bf16": v_pages,
+            "residual_page_ids": torch.zeros(
+                rows, device="cuda", dtype=torch.int32
+            ),
+            "seqused_residual": torch.full(
+                (rows,), 72, device="cuda", dtype=torch.int32
+            ),
+        }
+
+    # The heuristic agreeing is not evidence that the call took that branch,
+    # so record what the dispatcher actually handed the split implementation.
+    calls = []
+    run_split = _decode.decode_fp4_split
+
+    def recording_split(**kwargs):
+        calls.append((kwargs["num_splits"], kwargs["out"]))
+        return run_split(**kwargs)
+
+    monkeypatch.setattr(_decode, "decode_fp4_split", recording_split)
+
+    # vLLM's buffer is sized for the whole step, not for this batch alone.
+    spare_rows = 3
+    sentinel = torch.tensor(17.0, dtype=torch.bfloat16, device=query.device)
+    out = torch.full(
+        (rows + spare_rows, heads_q, head_dim),
+        sentinel,
+        dtype=torch.bfloat16,
+        device=query.device,
+    )
+
+    decode_arguments = (
+        key_pages_fp4,
+        key_scales,
+        value_pages_fp4,
+        value_scales,
+        page_table,
+        seqused_fp4,
+    )
+    with torch.no_grad():
+        allocated = fp4_decode(query, *decode_arguments, **residual)
+        returned = fp4_decode(query, *decode_arguments, out=out, **residual)
+    torch.cuda.synchronize()
+
+    assert [splits for splits, _ in calls] == [heuristic_splits] * 2
+    assert calls[0][1] is None
+    assert calls[1][1] is out
+
+    assert torch.equal(out[:rows], allocated)
+    # The rows this batch does not own belong to other requests.
+    assert torch.equal(out[rows:], torch.full_like(out[rows:], sentinel))
+    # Split-K returns ``out[:rows]`` where the unsplit path returns the whole
+    # ``out``; what both promise is a view of the caller's own buffer.
+    assert returned.data_ptr() == out.data_ptr()
+    assert torch.equal(returned[:rows], allocated)
+
+
 def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
     contract_decode_inputs: ContractDecodeInputs,
 ) -> None:
