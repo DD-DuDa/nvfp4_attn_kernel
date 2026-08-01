@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from .control import ControlPlane
 from .guards import NVFP4, check_supported
 from .metadata import NVFP4Metadata
+from .runtime import PAGE_SIZE
 from .write import PageWorkTable
 
 
@@ -42,13 +43,13 @@ def decode_split(
 ) -> tuple[int, int]:
     """Where this step's decode prefix ends, in rows and in tokens.
 
-    The one host assertion in this module, and the exception §6.3 allows: it
-    reads ``query_start_loc_cpu``, which the model runner already materialized,
-    so it costs no synchronization. What it guards is the premise the whole
-    read path rests on — that the reordering actually happened. Without it, a
-    vLLM that stopped reordering would have the decode kernel attend to prefill
-    rows' caches with decode rows' queries, which is wrong everywhere and loud
-    nowhere.
+    The one place this module looks at a batch on the host, and it is allowed
+    to because ``query_start_loc_cpu`` is something the model runner already
+    materialized, so reading it costs no synchronization. What it guards is the
+    premise the whole read path rests on — that the reordering actually
+    happened. Without it, a vLLM that stopped reordering would have the decode
+    kernel attend to prefill rows' caches with decode rows' queries, which is
+    wrong everywhere and loud nowhere.
     """
     num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
         common_attn_metadata, decode_threshold=1
@@ -57,6 +58,10 @@ def decode_split(
     query_lens = query_start_loc[1 : common_attn_metadata.num_reqs + 1] - (
         query_start_loc[: common_attn_metadata.num_reqs]
     )
+    # The second condition is the one that can fire. vLLM counts the prefix by
+    # scanning one-token rows from the front, so an unsorted batch gives a
+    # prefix that is too short rather than a wrong one, and what gives it away
+    # is a one-token row left behind among the prefills.
     if not bool((query_lens[:num_decodes] == 1).all()) or not bool(
         (query_lens[num_decodes:] > 1).all()
     ):
@@ -151,7 +156,7 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
         )
 
-        work_table = self.work_table.build(
+        source_tokens, destination_pages = self.work_table.build(
             query_start_loc=common_attn_metadata.query_start_loc,
             seqused_fp4=outputs.seqused_fp4,
             row_to_slot=outputs.row_to_slot,
@@ -160,6 +165,23 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             max_query_len=common_attn_metadata.max_query_len,
         )
 
+        decode_rows, decode_tokens = decode_split(common_attn_metadata)
+        query_start_loc = common_attn_metadata.query_start_loc
+        if decode_tokens:
+            # Only a mixed batch pays for this. A step of nothing but prefills
+            # already starts at zero, which is the shape a prefill step
+            # normally has.
+            query_start_loc = query_start_loc[decode_rows:] - decode_tokens
+
         return NVFP4Metadata.from_flash(
-            base, outputs, work_table, decode_split(common_attn_metadata)
+            base,
+            outputs,
+            source_tokens=source_tokens,
+            destination_pages=destination_pages,
+            decode_prefix_rows=decode_rows,
+            decode_prefix_tokens=decode_tokens,
+            prefill_query_start_loc=query_start_loc,
+            decode_page_columns=max(
+                1, (common_attn_metadata.max_seq_len - 1) // PAGE_SIZE
+            ),
         )

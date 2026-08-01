@@ -147,6 +147,8 @@ def check_layer_supported(impl: AttentionImpl) -> None:
             "the BF16 tail is indexed by layer, so a layer that reads another "
             "layer's cache would read its own empty tail."
         )
+    # The two above each fail for their own reason and say so. These four fail
+    # for one reason, so they are reported together rather than one per run.
     unsupported = {
         "sliding window": impl.sliding_window != (-1, -1),
         "logit soft capping": bool(impl.logits_soft_cap),

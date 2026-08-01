@@ -14,7 +14,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from nvfp4_decode_kernel import fp4_decode
 
 from .guards import NVFP4, check_supported, check_layer_supported
-from .runtime import PAGE_SIZE, LayerRuntime
+from .runtime import LayerRuntime
 from .write import reset_new_request_tails, write_kv
 
 
@@ -42,6 +42,7 @@ class NVFP4Impl(FlashAttentionImpl):
         self.nvfp4 = (
             cache_config is not None and cache_config.cache_dtype == NVFP4
         )
+        self.num_slots = 0
         if self.nvfp4:
             check_layer_supported(self)
             # FlashAttention turns this on for any quantized cache, and the
@@ -49,7 +50,7 @@ class NVFP4Impl(FlashAttentionImpl):
             # need BF16: prefill attends against this pass's own BF16 K/V, and
             # decode quantizes to FP4, not FP8.
             self.supports_quant_query_input = False
-        self.num_slots = config.scheduler_config.max_num_seqs
+            self.num_slots = config.scheduler_config.max_num_seqs
         self.runtime: LayerRuntime | None = None
         self.layer_index = 0
 
@@ -113,6 +114,9 @@ class NVFP4Impl(FlashAttentionImpl):
             return
 
         metadata, _, _, _ = get_attention_context(layer.layer_name)
+        # Both mean the profile run, where there is no cache to write into:
+        # the builder returns no metadata, and the runtime is not bound until
+        # the first forward. On a real step neither can be None.
         if metadata is None or self.runtime is None:
             return
 
@@ -212,18 +216,8 @@ class NVFP4Impl(FlashAttentionImpl):
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
             self.runtime.views(kv_cache)
         )
-        # The kernel reads the page table's width as the longest row it has to
-        # walk, and picks a split count from it, so a table left at the model's
-        # capacity makes a short batch look long and buys splits that own no
-        # page at all. A row's last page is always its tail's, never an FP4
-        # one, which is what puts the boundary one token short of the length.
-        #
-        # The batch's longest row, not the decodes' own: the per-row lengths
-        # live on the device, and vLLM's host-side copy of them is materialized
-        # by a transfer that would cost this step a synchronization. A prefill
-        # sharing the step can only widen this, never narrow it wrongly.
-        pages = max(1, (attn_metadata.max_seq_len - 1) // PAGE_SIZE)
-        decoded = fp4_decode(
+        pages = attn_metadata.decode_page_columns
+        fp4_decode(
             query=query[:rows],
             key_pages_fp4=key_pages_fp4,
             key_scales=key_scales,
@@ -243,8 +237,8 @@ class NVFP4Impl(FlashAttentionImpl):
             # reading them back, which costs a synchronization per layer.
             trusted_metadata=True,
             query_padded_scratch=self.runtime.query_padded,
+            out=output[:rows],
         )
-        output[:rows].copy_(decoded)
 
     def _prefill(
         self,
@@ -266,12 +260,7 @@ class NVFP4Impl(FlashAttentionImpl):
         The prefills are the long rows, so the two agree unless the batch is
         pure decode, in which case this does not run.
         """
-        starts = attn_metadata.query_start_loc
-        if tokens:
-            # Only a mixed batch pays for this. A step of nothing but prefills
-            # already starts at zero, and that is the shape a prefill step
-            # normally has.
-            starts = starts[attn_metadata.decode_prefix_rows :] - tokens
+        starts = attn_metadata.prefill_query_start_loc
         num_actual_tokens = attn_metadata.num_actual_tokens
         flash_attn_varlen_func(
             q=query[tokens:num_actual_tokens],

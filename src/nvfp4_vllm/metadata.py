@@ -62,6 +62,26 @@ class NVFP4Metadata(FlashAttentionMetadata):
     """Where the prefill tokens begin. Equal to ``decode_prefix_rows`` while
     every decode row emits one token, but derived rather than assumed."""
 
+    prefill_query_start_loc: torch.Tensor
+    """``[num_prefills + 1]`` int32. ``query_start_loc`` rebased on the first
+    prefill token, which is what FlashAttention needs once the decode prefix
+    has been sliced off. Built here rather than per layer because every layer
+    of the step would otherwise recompute the same subtraction on the
+    device."""
+
+    decode_page_columns: int
+    """How many page-table columns the decode kernel has to walk. The kernel
+    reads the table's width as the longest row it could see and picks a split
+    count from it, so a table left at the model's capacity makes a short batch
+    look long and buys splits that own no page.
+
+    The batch's longest row, not the decodes' own: the per-row lengths live on
+    the device, and vLLM's host-side copy is materialized by a transfer that
+    would cost the step a synchronization. A prefill sharing the step can only
+    widen this, never narrow it wrongly. A row's last page is always its
+    tail's, never an FP4 one, which is what puts the boundary one token short
+    of the length."""
+
     source_tokens: torch.Tensor
     """``[work]`` int32. First token of each full page this step must quantize,
     as an index into the step's flattened K/V."""
@@ -76,8 +96,13 @@ class NVFP4Metadata(FlashAttentionMetadata):
         cls,
         base: FlashAttentionMetadata,
         outputs: ControlOutputs,
-        work_table: tuple[torch.Tensor, torch.Tensor],
-        split: tuple[int, int],
+        *,
+        source_tokens: torch.Tensor,
+        destination_pages: torch.Tensor,
+        decode_prefix_rows: int,
+        decode_prefix_tokens: int,
+        prefill_query_start_loc: torch.Tensor,
+        decode_page_columns: int,
     ) -> "NVFP4Metadata":
         """Carry every FlashAttention field across and append the slot fields.
 
@@ -92,8 +117,10 @@ class NVFP4Metadata(FlashAttentionMetadata):
             seqused_fp4=outputs.seqused_fp4,
             seqused_residual=outputs.seqused_residual,
             promotion_mask=outputs.promotion_mask,
-            decode_prefix_rows=split[0],
-            decode_prefix_tokens=split[1],
-            source_tokens=work_table[0],
-            destination_pages=work_table[1],
+            decode_prefix_rows=decode_prefix_rows,
+            decode_prefix_tokens=decode_prefix_tokens,
+            prefill_query_start_loc=prefill_query_start_loc,
+            decode_page_columns=decode_page_columns,
+            source_tokens=source_tokens,
+            destination_pages=destination_pages,
         )

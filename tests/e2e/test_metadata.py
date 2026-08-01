@@ -1,18 +1,22 @@
 """The attention metadata the NVFP4 path hands to the layers.
 
-Two halves. The first checks the one thing ``build()`` does beyond calling
-FlashAttention's builder and launching the control plane: it splices the
-control plane's answer onto FlashAttention's metadata without losing a field.
-That needs neither a GPU nor a model.
+Three groups, in order of what they need to run. The first checks the one
+thing ``build()`` does beyond calling FlashAttention's builder and launching
+the control plane: it splices the control plane's answer onto FlashAttention's
+metadata without losing a field. That, and the decode-prefix arithmetic after
+it, need neither a GPU nor a model.
 
-The second half is one live engine. It exists for a fact no unit test can
-establish: that ``build()`` runs exactly once per scheduler step. Everything
-about the slot table depends on that — the LRU ordering, the continuity check,
-the tail lengths — and vLLM decides it, not us. Generating a known number of
-tokens and watching the control plane's step counter move is the direct
-measurement.
+The second builds a metadata builder from a model configuration, which is as
+far as the cache dtype has to travel to decide whether there is a control
+plane at all.
 
-The engine half is skipped unless ``NVFP4_RUN_VLLM_E2E=1``.
+The third is one live engine. It exists for a fact no unit test can establish:
+that ``build()`` runs exactly once per scheduler step. Everything about the
+slot table depends on that — the LRU ordering, the continuity check, the tail
+lengths — and vLLM decides it, not us. Generating a known number of tokens and
+watching the control plane's step counter move is the direct measurement.
+
+Everything past the first group is skipped unless ``NVFP4_RUN_VLLM_E2E=1``.
 
 Environment overrides:
 
@@ -66,23 +70,26 @@ def _markers(cls) -> dict:
 # omission, which is what the field-set assertion below forces.
 NOT_SPLICED = {"error_code"}
 
-# The other sources of appended fields: the page work table, and the
-# decode/prefill boundary build() reads off the CPU-side batch description.
-WORK_TABLE = ("source_tokens", "destination_pages")
-SPLIT = ("decode_prefix_rows", "decode_prefix_tokens")
+# The other sources of appended fields: the page work table, and what build()
+# derives once per step from the CPU-side batch description.
+APPENDED = (
+    "source_tokens",
+    "destination_pages",
+    "decode_prefix_rows",
+    "decode_prefix_tokens",
+    "prefill_query_start_loc",
+    "decode_page_columns",
+)
 
 
 def _splice():
     """One spliced object plus the two things it was spliced from."""
     base = FlashAttentionMetadata(**_markers(FlashAttentionMetadata))
     outputs = ControlOutputs(**_markers(ControlOutputs))
-    work_table = tuple(_Marker(name) for name in WORK_TABLE)
-    split = tuple(_Marker(name) for name in SPLIT)
-    return (
-        NVFP4Metadata.from_flash(base, outputs, work_table, split),
-        base,
-        outputs,
+    spliced = NVFP4Metadata.from_flash(
+        base, outputs, **{name: _Marker(name) for name in APPENDED}
     )
+    return spliced, base, outputs
 
 
 def test_the_splice_keeps_every_flash_attention_field():
@@ -103,10 +110,10 @@ def test_the_splice_keeps_every_control_plane_output():
         field.name for field in fields(FlashAttentionMetadata)
     }
     from_control = {field.name for field in fields(ControlOutputs)} - NOT_SPLICED
-    assert added == from_control | set(WORK_TABLE) | set(SPLIT)
+    assert added == from_control | set(APPENDED)
     for name in from_control:
         assert getattr(spliced, name) is getattr(outputs, name), name
-    for name in WORK_TABLE + SPLIT:
+    for name in APPENDED:
         assert getattr(spliced, name).name == name
 
 
@@ -267,34 +274,63 @@ def test_the_control_plane_advances_once_per_decode_step(monkeypatch):
         torch.cuda.empty_cache()
 
 
+# --- the pass-through under a BF16 cache -----------------------------------
+
+
+def _builder(kv_cache_dtype: str):
+    """A metadata builder for one attention layer, with no engine behind it.
+
+    Its constructor only reads configuration, so a configuration is all it
+    takes. An engine would load the weights to reach a branch that does not
+    depend on them.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from nvfp4_vllm.builder import NVFP4MetadataBuilder
+
+    config = EngineArgs(
+        model=MODEL,
+        dtype="bfloat16",
+        kv_cache_dtype=kv_cache_dtype,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=MAX_NUM_SEQS,
+        enforce_eager=True,
+        block_size=PAGE_SIZE,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=False,
+    ).create_engine_config()
+    model_config, parallel_config = config.model_config, config.parallel_config
+    spec = FullAttentionSpec(
+        block_size=PAGE_SIZE,
+        num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+        head_size=model_config.get_head_size(),
+        dtype=torch.bfloat16,
+    )
+    return NVFP4MetadataBuilder(
+        spec, ["layer.0"], config, torch.device("cuda", 0)
+    )
+
+
 @pytest.mark.skipif(
     not RUN_E2E,
-    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+    reason="set NVFP4_RUN_VLLM_E2E=1 to reach the model configuration",
 )
-def test_a_bf16_engine_has_no_control_plane(monkeypatch):
+def test_a_bf16_cache_gets_no_control_plane():
     # The backend is chosen per engine, not per cache dtype, so the NVFP4
     # builder is also what a BF16 run gets. It has to stay a pass-through.
     _require_sm100()
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    assert _builder("auto").plane is None
 
-    from vllm import LLM
 
-    llm = LLM(
-        model=MODEL,
-        dtype="bfloat16",
-        kv_cache_dtype="auto",
-        tensor_parallel_size=1,
-        max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=MAX_NUM_SEQS,
-        gpu_memory_utilization=0.9,
-        enforce_eager=True,
-        block_size=PAGE_SIZE,
-        attention_config={"backend": "CUSTOM"},
-    )
-    try:
-        assert _control_plane(llm) is None
-    finally:
-        llm.llm_engine.engine_core.shutdown()
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to reach the model configuration",
+)
+def test_an_nvfp4_cache_gets_one():
+    # The other half of the branch, so a builder that stopped building control
+    # planes altogether cannot pass the test above.
+    _require_sm100()
+    builder = _builder("nvfp4")
+    assert builder.plane is not None
+    assert builder.reorder_batch_threshold == 1
