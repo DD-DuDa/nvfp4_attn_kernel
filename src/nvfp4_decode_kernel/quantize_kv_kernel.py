@@ -7,7 +7,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.runtime import make_ptr
 
 from .quantize_q_kernel import _pack_e2m1, _pack_e4m3
@@ -42,6 +42,29 @@ def _resolve_work(
     else:
         destination_page = destination_pages[work]
     return source_token, destination_page
+
+
+@cute.jit
+def _rebase(tensor: cute.Tensor, bases, layer: Int32) -> cute.Tensor:
+    """The same page layout, based wherever this layer's copy happens to be.
+
+    A caller with one destination passes no table and gets the tensor back
+    untouched. A caller with one destination per layer passes their base
+    addresses, because independently allocated destinations share only their
+    interior layout — their addresses are not a stride apart, so no single
+    tensor can reach all of them.
+    """
+    if const_expr(bases is None):
+        return tensor
+    return cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Uint8,
+            bases[layer],
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        tensor.layout,
+    )
 
 
 @cute.jit
@@ -160,11 +183,14 @@ def _quantize_key_pages_kernel(
     key_scales: cute.Tensor,
     source_tokens: cute.Tensor,
     destination_pages: cute.Tensor,
+    packed_bases: cute.Tensor,
+    scale_bases: cute.Tensor,
+    source_layer_stride: Int32,
     sf_vec_size: cutlass.Constexpr[int],
     rest_k: cutlass.Constexpr[int],
 ):
     thread, _, _ = cute.arch.thread_idx()
-    head, work, _ = cute.arch.block_idx()
+    head, work, layer = cute.arch.block_idx()
     lane = thread % 32
     warp = thread // 32
     sequence = warp * 32 + lane
@@ -172,9 +198,13 @@ def _quantize_key_pages_kernel(
     source_token, page = _resolve_work(source_tokens, destination_pages, work)
     if page >= 0:
         _quantize_vector(
-            key_pages[source_token, sequence, head, None],
-            key_pages_fp4[page, sequence, head, None],
-            key_scales,
+            key_pages[
+                source_token + layer * source_layer_stride, sequence, head, None
+            ],
+            _rebase(key_pages_fp4, packed_bases, layer)[
+                page, sequence, head, None
+            ],
+            _rebase(key_scales, scale_bases, layer),
             page,
             lane,
             warp,
@@ -191,11 +221,14 @@ def _quantize_value_pages_kernel(
     value_scales: cute.Tensor,
     source_tokens: cute.Tensor,
     destination_pages: cute.Tensor,
+    packed_bases: cute.Tensor,
+    scale_bases: cute.Tensor,
+    source_layer_stride: Int32,
     sf_vec_size: cutlass.Constexpr[int],
     page_rest_k: cutlass.Constexpr[int],
 ):
     thread, _, _ = cute.arch.thread_idx()
-    head, work, _ = cute.arch.block_idx()
+    head, work, layer = cute.arch.block_idx()
     lane = thread % 32
     warp = thread // 32
     head_dim = warp * 32 + lane
@@ -203,9 +236,13 @@ def _quantize_value_pages_kernel(
     source_token, page = _resolve_work(source_tokens, destination_pages, work)
     if page >= 0:
         _quantize_vector(
-            value_pages[source_token, None, head, head_dim],
-            value_pages_fp4[page, head, head_dim, None],
-            value_scales,
+            value_pages[
+                source_token + layer * source_layer_stride, None, head, head_dim
+            ],
+            _rebase(value_pages_fp4, packed_bases, layer)[
+                page, head, head_dim, None
+            ],
+            _rebase(value_scales, scale_bases, layer),
             page,
             lane,
             warp,
@@ -229,6 +266,8 @@ def _launch_key_pages(
     key_scales_ptr: cute.Pointer,
     source_tokens_ptr,
     destination_pages_ptr,
+    packed_bases_ptr,
+    scale_bases_ptr,
     pages_shape: Tuple[Int32, Int32, Int32, Int32],
     pages_strides: Tuple[Int32, Int32, Int32, Int32],
     fp4_shape: Tuple[Int32, Int32, Int32, Int32],
@@ -241,6 +280,8 @@ def _launch_key_pages(
     ],
     heads: cutlass.Constexpr[int],
     work: Int32,
+    layers: Int32,
+    source_layer_stride: Int32,
     rest_k: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
@@ -262,10 +303,13 @@ def _launch_key_pages(
         key_scales,
         _index_tensor(source_tokens_ptr, work),
         _index_tensor(destination_pages_ptr, work),
+        _index_tensor(packed_bases_ptr, layers),
+        _index_tensor(scale_bases_ptr, layers),
+        source_layer_stride,
         const_expr(SF_VEC_SIZE),
         const_expr(rest_k),
     ).launch(
-        grid=(heads, work, 1),
+        grid=(heads, work, layers),
         block=(128, 1, 1),
         stream=stream,
     )
@@ -278,6 +322,8 @@ def _launch_value_pages(
     value_scales_ptr: cute.Pointer,
     source_tokens_ptr,
     destination_pages_ptr,
+    packed_bases_ptr,
+    scale_bases_ptr,
     pages_shape: Tuple[Int32, Int32, Int32, Int32],
     pages_strides: Tuple[Int32, Int32, Int32, Int32],
     fp4_shape: Tuple[Int32, Int32, Int32, Int32],
@@ -290,6 +336,8 @@ def _launch_value_pages(
     ],
     heads: cutlass.Constexpr[int],
     work: Int32,
+    layers: Int32,
+    source_layer_stride: Int32,
     page_rest_k: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
@@ -311,10 +359,13 @@ def _launch_value_pages(
         value_scales,
         _index_tensor(source_tokens_ptr, work),
         _index_tensor(destination_pages_ptr, work),
+        _index_tensor(packed_bases_ptr, layers),
+        _index_tensor(scale_bases_ptr, layers),
+        source_layer_stride,
         const_expr(SF_VEC_SIZE),
         const_expr(page_rest_k),
     ).launch(
-        grid=(heads, work, 1),
+        grid=(heads, work, layers),
         block=(128, 1, 1),
         stream=stream,
     )
@@ -463,6 +514,42 @@ def _int_pointer(tensor: torch.Tensor | None):
     )
 
 
+def _base_pointers(bases: torch.Tensor | None):
+    """Split the ``[2, layers]`` address table into one pointer per region.
+
+    Addresses rather than a tensor because there is nothing to make a tensor
+    of: the destinations are separate allocations. Entries must all be real —
+    a table short of a layer is a caller bug that the kernel would turn into a
+    null dereference, which is the loud failure this deliberately does not
+    soften into a silent skip.
+    """
+    if bases is None:
+        return None, None, 1
+    if (
+        bases.dtype is not torch.int64
+        or not bases.is_cuda
+        or not bases.is_contiguous()
+        or bases.ndim != 2
+        or bases.shape[0] != 2
+        or bases.shape[1] < 1
+    ):
+        raise ValueError(
+            "destination_bases must be a contiguous int64 CUDA tensor of "
+            "shape [2, layers] holding the packed and scale base addresses"
+        )
+    layers = bases.shape[1]
+
+    def pointer(row: int):
+        return make_ptr(
+            Int64,
+            bases[row].data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        )
+
+    return pointer(0), pointer(1), layers
+
+
 def _compile_and_launch(
     launcher,
     cache: dict,
@@ -471,6 +558,7 @@ def _compile_and_launch(
     scales: torch.Tensor,
     source_tokens: torch.Tensor | None,
     destination_pages: torch.Tensor | None,
+    destination_bases: torch.Tensor | None,
     *,
     heads: int,
     rest_k: int,
@@ -497,6 +585,16 @@ def _compile_and_launch(
     )
     source_ptr = _int_pointer(source_tokens)
     destination_ptr = _int_pointer(destination_pages)
+    packed_bases_ptr, scale_bases_ptr, layers = _base_pointers(destination_bases)
+    # One destination per layer means one source per layer too, stacked in that
+    # order along the token axis. Deriving the stride from the buffer keeps the
+    # two ends from disagreeing about how long a layer is.
+    if pages.shape[0] % layers:
+        raise ValueError(
+            f"a source of {pages.shape[0]} tokens does not divide into "
+            f"{layers} layers"
+        )
+    source_layer_stride = pages.shape[0] // layers
     # The source is flat in tokens, and the kernel wants a (page, token, head,
     # dim) view of it. Giving the page axis a one-token stride turns the leading
     # index into a token offset, so a work item can start anywhere rather than
@@ -519,6 +617,8 @@ def _compile_and_launch(
         scales_ptr,
         source_ptr,
         destination_ptr,
+        packed_bases_ptr,
+        scale_bases_ptr,
     )
     layout_args = (
         pages_shape,
@@ -528,12 +628,14 @@ def _compile_and_launch(
         scales_shape,
         scales_strides,
     )
+    grid_args = (Int32(work), Int32(layers), Int32(source_layer_stride))
     cache_key = (
         torch.cuda.current_device(),
         heads,
         rest_k,
         source_tokens is None,
         destination_pages is None,
+        destination_bases is None,
     )
     compiled = cache.get(cache_key)
     if compiled is None:
@@ -542,12 +644,12 @@ def _compile_and_launch(
             *tensor_args,
             *layout_args,
             heads,
-            Int32(work),
+            *grid_args,
             rest_k,
             stream,
         )
         cache[cache_key] = compiled
-    compiled(*tensor_args, *layout_args, Int32(work), stream)
+    compiled(*tensor_args, *layout_args, *grid_args, stream)
 
 
 def quantize_key_tokens_into(
@@ -556,6 +658,7 @@ def quantize_key_tokens_into(
     key_scales: torch.Tensor,
     source_tokens: torch.Tensor,
     destination_pages: torch.Tensor,
+    destination_bases: torch.Tensor | None = None,
 ) -> None:
     """Quantize K pages out of a flat token buffer into a paged destination.
 
@@ -564,6 +667,13 @@ def quantize_key_tokens_into(
     which is how a fixed launch shape covers a varying batch. Both destinations
     may be strided along their page axis, so they can be regions of a cache page
     that carries more than one of them.
+
+    ``destination_bases`` repeats the whole thing once per layer: an int64
+    ``[2, layers]`` table of packed and scale base addresses, against a source
+    holding the layers back to back in the same order. The destinations keep
+    the layout given here and differ only in where they start, because a KV
+    cache is allocated one layer at a time and the layers are not a stride
+    apart. The indices are shared, so one launch covers every layer.
     """
     heads = _validate_tokens(key_tokens, "key_tokens")
     _validate_destination(
@@ -585,6 +695,7 @@ def quantize_key_tokens_into(
         key_scales,
         source_tokens,
         destination_pages,
+        destination_bases,
         heads=heads,
         rest_k=HEAD_DIM // 64,
         work=work,
@@ -597,6 +708,7 @@ def quantize_value_tokens_into(
     value_scales: torch.Tensor,
     source_tokens: torch.Tensor,
     destination_pages: torch.Tensor,
+    destination_bases: torch.Tensor | None = None,
 ) -> None:
     """Quantize V pages out of a flat token buffer into a paged destination.
 
@@ -622,6 +734,7 @@ def quantize_value_tokens_into(
         value_scales,
         source_tokens,
         destination_pages,
+        destination_bases,
         heads=heads,
         rest_k=PAGE_SIZE // 64,
         work=work,
@@ -655,6 +768,7 @@ def quantize_key_pages(
         key_pages.reshape(-1, heads, HEAD_DIM),
         key_pages_fp4,
         key_scales,
+        None,
         None,
         None,
         heads=heads,
@@ -692,6 +806,7 @@ def quantize_value_pages(
         value_pages.reshape(-1, heads, HEAD_DIM),
         value_pages_fp4,
         value_scales,
+        None,
         None,
         None,
         heads=heads,
