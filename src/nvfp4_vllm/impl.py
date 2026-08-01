@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
 from nvfp4_decode_kernel import fp4_decode
 
+from . import promote
 from .guards import NVFP4, check_supported, check_layer_supported
 from .runtime import LayerRuntime
 from .write import reset_new_request_tails, write_kv
@@ -133,7 +134,7 @@ class NVFP4Impl(FlashAttentionImpl):
             )
 
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
-            self.runtime.views(kv_cache)
+            self.runtime.views(self.layer_index, kv_cache)
         )
         write_kv(
             key=key,
@@ -188,15 +189,21 @@ class NVFP4Impl(FlashAttentionImpl):
             # Profile run. The cache is a placeholder with no storage, so there
             # is nothing to read; zero rather than leave the buffer untouched,
             # since NaN in the residual stream propagates into every later
-            # layer's K/V.
+            # layer's K/V. Counted out of the order below too, which is about
+            # steps that write.
             return output.zero_()
 
+        self.runtime.expect_layer(self.layer_index)
         rows = attn_metadata.decode_prefix_rows
         tokens = attn_metadata.decode_prefix_tokens
         if rows:
             self._decode(rows, query, kv_cache, attn_metadata, output)
         if tokens < attn_metadata.num_actual_tokens:
             self._prefill(tokens, query, key, value, attn_metadata, output)
+        # Last layer, so every layer has now both read the tail as this step's
+        # metadata describes it and written its share of whatever filled it.
+        if self.layer_index == self.runtime.num_layers - 1:
+            promote.launch(attn_metadata, self.runtime)
         return output
 
     def _decode(
@@ -214,7 +221,7 @@ class NVFP4Impl(FlashAttentionImpl):
         output that lands where vLLM already wants it.
         """
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
-            self.runtime.views(kv_cache)
+            self.runtime.views(self.layer_index, kv_cache)
         )
         pages = attn_metadata.decode_page_columns
         fp4_decode(

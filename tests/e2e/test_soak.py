@@ -13,6 +13,12 @@ checked, which is the part a text-level assertion cannot do: a single
 non-finite lane in an early layer is laundered into plausible-looking text by
 the layers above it.
 
+Four of the six lengths also fill their page during the run, which puts the
+other way a slot's contents move — promotion wrapping the tail back to its
+start — into the same mixture as the handovers, and at different steps for
+each. A slot that changes hands the step after it was wrapped is the case
+neither this file nor ``test_promotion.py`` would reach alone.
+
 The counting is done on the device and read once at the end. Checking a step's
 output on the host would synchronize on every step, which would change the
 timing the soak is meant to sample.
@@ -49,12 +55,13 @@ PAGE_SIZE = 128
 MAX_MODEL_LEN = 4096
 MAX_NUM_SEQS = 8
 
-# Prompts sized so their tails start at very different offsets, since a slot
-# handed from a long tail to a short one is the case that exposes stale tokens.
-# Promotion is not implemented, so every row has to stay inside its page for
-# the whole run: the largest starting tail plus the tokens generated is 97 + 30,
-# still under a page.
-PROMPT_TOKENS = (897, 901, 913, 929, 961, 993)
+# Tails that start at very different offsets, since a slot handed from a long
+# tail to a short one is the case that exposes stale tokens. The offsets are
+# 0, 40, 72, 100, 118 and 124 tokens into a page, so four of the six fill their
+# page within the thirty generated: 1024 during its own prefill, then 1148 on
+# step 4, 1142 on step 10 and 1124 on step 28. 1064 and 1096 never cross, so
+# both kinds of row are in every batch.
+PROMPT_TOKENS = (1024, 1064, 1096, 1124, 1142, 1148)
 GENERATED_TOKENS = 30
 
 
@@ -72,6 +79,8 @@ class Soak:
     decode_steps: int
     requests: int
     slots_used: int
+    pages_sealed: int
+    prompt_lengths: list[int]
     texts: list[str]
     token_counts: list[int]
 
@@ -105,6 +114,7 @@ def soak() -> Soak:
     )
 
     import nvfp4_vllm.impl as impl_module
+    import nvfp4_vllm.promote as promote_module
 
     device = torch.device("cuda")
     # [layer] count of steps whose output held a non-finite value, so a failure
@@ -113,10 +123,15 @@ def soak() -> Soak:
     # [slot] whether the run ever put a row there, so the reuse this file
     # depends on is measured rather than assumed.
     slots_seen = torch.zeros(MAX_NUM_SEQS, dtype=torch.int32, device=device)
+    # Pages promotion actually sealed, so the crossings the lengths were chosen
+    # for are counted rather than assumed. Accumulated on the device for the
+    # same reason as the two above.
+    sealed = torch.zeros((), dtype=torch.int32, device=device)
     counters = {"decode_steps": 0}
 
     original_decode = impl_module.NVFP4Impl._decode
     original_update = impl_module.NVFP4Impl.do_kv_cache_update
+    original_launch = promote_module.launch
 
     def watch_decode(self, rows, query, kv_cache, attn_metadata, output):
         original_decode(self, rows, query, kv_cache, attn_metadata, output)
@@ -143,8 +158,13 @@ def soak() -> Soak:
             reduce="amax",
         )
 
+    def watch_launch(metadata, runtime):
+        original_launch(metadata, runtime)
+        sealed.add_((metadata.promotion_pages >= 0).sum().to(torch.int32))
+
     impl_module.NVFP4Impl._decode = watch_decode
     impl_module.NVFP4Impl.do_kv_cache_update = watch_update
+    promote_module.launch = watch_launch
     llm = LLM(
         model=MODEL,
         dtype="bfloat16",
@@ -165,9 +185,13 @@ def soak() -> Soak:
         sampling = SamplingParams(
             max_tokens=GENERATED_TOKENS, ignore_eos=True, temperature=0.0
         )
+        # Startup runs the engine on shapes of its own choosing; only what the
+        # rounds below seal is being counted.
+        sealed.zero_()
 
         texts: list[str] = []
         token_counts: list[int] = []
+        lengths: list[int] = []
         requests = 0
         for round_index in range(ROUNDS):
             # The batch's size changes from round to round as well as its
@@ -176,14 +200,18 @@ def soak() -> Soak:
             # fixed row-to-slot mapping.
             width = 2 + round_index % (MAX_NUM_SEQS - 1)
             batch = [
-                prompts[PROMPT_TOKENS[(round_index + i) % len(PROMPT_TOKENS)]]
+                PROMPT_TOKENS[(round_index + i) % len(PROMPT_TOKENS)]
                 for i in range(width)
             ]
             completions = llm.generate(
-                [TokensPrompt(prompt_token_ids=ids) for ids in batch],
+                [
+                    TokensPrompt(prompt_token_ids=prompts[length])
+                    for length in batch
+                ],
                 sampling,
             )
             requests += len(batch)
+            lengths.extend(batch)
             for completion in completions:
                 output = completion.outputs[0]
                 texts.append(output.text)
@@ -194,12 +222,15 @@ def soak() -> Soak:
             decode_steps=counters["decode_steps"],
             requests=requests,
             slots_used=int(slots_seen.sum()),
+            pages_sealed=int(sealed),
+            prompt_lengths=lengths,
             texts=texts,
             token_counts=token_counts,
         )
     finally:
         impl_module.NVFP4Impl._decode = original_decode
         impl_module.NVFP4Impl.do_kv_cache_update = original_update
+        promote_module.launch = original_launch
         llm.llm_engine.engine_core.shutdown()
         del llm
 
@@ -211,6 +242,30 @@ def test_the_run_reused_its_slots(soak: Soak):
         "reuse for a slot to have changed hands"
     )
     assert soak.decode_steps > 0, "no decode step ran"
+
+
+def test_the_run_sealed_the_pages_its_lengths_call_for(soak: Soak):
+    """The other premise: slots were wrapped by promotion as well as reused.
+
+    Counted rather than asserted to be positive, because the interesting
+    mixture is quantitative — a change to the lengths that leaves one crossing
+    a run would still pass a "greater than zero" and would no longer be putting
+    handover and wrapping together.
+    """
+    expected = sum(
+        1
+        for length in soak.prompt_lengths
+        for seq in range(length, length + GENERATED_TOKENS)
+        if seq % PAGE_SIZE == 0
+    )
+    assert soak.pages_sealed == expected, (
+        f"{soak.pages_sealed} pages were sealed over {soak.requests} requests, "
+        f"and the lengths call for {expected}"
+    )
+    assert expected >= soak.requests // 2, (
+        f"only {expected} of {soak.requests} requests cross a page boundary, "
+        "so the run is mostly the no-crossing case again"
+    )
 
 
 def test_no_decode_step_went_non_finite(soak: Soak):
