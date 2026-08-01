@@ -1,7 +1,7 @@
 """Opt-in end-to-end check of the CUSTOM backend, on a BF16 and an FP4 cache.
 
-The same GSM8K subset is scored three times. ``FLASH_ATTN`` and ``CUSTOM``
-both run a BF16 KV cache with no quantization anywhere, so they run identical
+The same GSM8K subset is scored four times. ``FLASH_ATTN`` and ``CUSTOM`` both
+run a BF16 KV cache with no quantization anywhere, so they run identical
 arithmetic and greedy decoding must produce the same token ids exactly. The
 BF16 arm additionally has to clear an absolute accuracy floor, or two arms
 agreeing on garbage would satisfy the equality check.
@@ -19,6 +19,12 @@ alarm — it catches a page written to the wrong block, a layer written into
 another layer, a page of history dropped — and it does not catch a gradual
 five-point decay. What guards against silently losing a page is the byte
 equality in ``test_promotion.py``, not this.
+
+The fourth arm is vLLM's own NVFP4 KV cache, which FlashInfer serves through
+trtllm-gen on SM100. It is the only other 4-bit cache on this machine, and it
+answers the question a comparison against BF16 cannot: how much of the loss is
+the cost of four bits, which both arms pay, and how much is the cost of this
+layout, which only ours does.
 
 ``CUSTOM`` resolves through the ``vllm.general_plugins`` entry point declared
 in ``pyproject.toml``. The test must not register the backend itself, or that
@@ -54,6 +60,9 @@ PAGE_SIZE = 128
 
 BF16_ATTENTION_CONFIG = {"backend": "FLASH_ATTN"}
 CUSTOM_ATTENTION_CONFIG = {"backend": "CUSTOM"}
+# vLLM's own NVFP4 KV cache. FlashInfer is the only backend that serves one,
+# and only through trtllm-gen on SM100, which this file already requires.
+FLASHINFER_ATTENTION_CONFIG = {"backend": "FLASHINFER"}
 
 GSM8K_NUM_EXAMPLES = int(os.environ.get("NVFP4_GSM8K_N", "32"))
 GSM8K_NUM_FEWSHOT = 5
@@ -274,12 +283,11 @@ class Arm:
 
 
 @pytest.fixture(scope="module")
-def arms() -> tuple[Arm, Arm, Arm]:
-    """The three arms, scored once for both tests below.
+def arms() -> tuple[Arm, Arm, Arm, Arm]:
+    """The four arms, scored once for the tests below.
 
-    Three 8B engines is most of the cost of this file, and the BF16 baseline
-    is the comparison both gates are against, so it is built once rather than
-    once per gate.
+    Four 8B engines is nearly all the cost of this file, and every gate below
+    compares two of them, so they are built once rather than once per gate.
     """
     _require_sm100()
     # In-process engine core, so each arm's teardown is deterministic.
@@ -290,6 +298,7 @@ def arms() -> tuple[Arm, Arm, Arm]:
         ("FLASH_ATTN", BF16_ATTENTION_CONFIG, "auto"),
         ("CUSTOM", CUSTOM_ATTENTION_CONFIG, "auto"),
         ("CUSTOM/nvfp4", CUSTOM_ATTENTION_CONFIG, "nvfp4"),
+        ("FLASHINFER/nvfp4", FLASHINFER_ATTENTION_CONFIG, "nvfp4"),
     )
     scored = []
     for label, attention_config, kv_cache_dtype in plan:
@@ -314,7 +323,7 @@ def arms() -> tuple[Arm, Arm, Arm]:
 )
 def test_custom_backend_matches_flash_attn(arms):
     """With a BF16 cache the backend changes nothing, so nothing may change."""
-    flash, custom, _ = arms
+    flash, custom, _, _ = arms
 
     assert flash.score.accuracy >= GSM8K_MIN_ACCURACY, (
         "the BF16 baseline is too weak to gate against: "
@@ -351,7 +360,7 @@ def test_the_fp4_cache_answers_about_as_well_as_the_bf16_one(arms):
     the only place the whole path is asked whether the model still works, on a
     workload that was not written for it.
     """
-    flash, _, nvfp4 = arms
+    flash, _, nvfp4, _ = arms
     drop = flash.score.accuracy - nvfp4.score.accuracy
 
     assert drop <= GSM8K_MAX_ACCURACY_DROP, (
@@ -365,4 +374,33 @@ def test_the_fp4_cache_answers_about_as_well_as_the_bf16_one(arms):
         "the FP4 arm is below the absolute floor, so a baseline that also "
         f"fell would have hidden it: {nvfp4.score.summary(nvfp4.label)}\n"
         f"{_mismatch_report(nvfp4.score)}"
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
+def test_the_fp4_cache_keeps_up_with_the_one_vllm_ships(arms):
+    """Our four bits against the only other four bits on this machine.
+
+    A drop measured against BF16 cannot separate what four bits cost from what
+    this layout costs, because there is nothing in the comparison that pays the
+    first without the second. vLLM's own NVFP4 cache pays the first and not the
+    second, so the gap between the two FP4 arms is the part that is ours.
+
+    One-sided on purpose. Their path is a reference and not a target, so this
+    is worth failing over only when ours is the worse one; an assertion that
+    also fired when theirs regressed would be a test of someone else's code.
+    """
+    _, _, ours, theirs = arms
+    behind = theirs.score.accuracy - ours.score.accuracy
+
+    assert behind <= GSM8K_MAX_ACCURACY_DROP, (
+        f"our FP4 cache is {behind:.4f} behind the one vLLM ships, over the "
+        f"{GSM8K_MAX_ACCURACY_DROP} allowed, which is a cost of this layout "
+        "rather than of quantizing at all.\n"
+        f"{ours.score.summary(ours.label)} | "
+        f"{theirs.score.summary(theirs.label)}\n"
+        f"{_mismatch_report(ours.score)}"
     )
