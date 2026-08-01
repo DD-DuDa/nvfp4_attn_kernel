@@ -145,9 +145,10 @@ footer.foot{margin-top:72px;padding-top:18px;border-top:1px solid var(--rule);fo
       <li><a href="#speed"><span class="n">07</span>速度账三条臂</a></li>
       <li><a href="#gpu"><span class="n">08</span>一步 decode 的 GPU 账</a></li>
       <li><a href="#host"><span class="n">09</span>剩下 97.5% 在 host</a></li>
-      <li><a href="#kernel"><span class="n">10</span>kernel 层：反差</a></li>
-      <li><a href="#limits"><span class="n">11</span>边界与下一步</a></li>
-      <li><a href="#artifacts"><span class="n">12</span>复现</a></li>
+      <li><a href="#previous"><span class="n">10</span>与上一代同口径</a></li>
+      <li><a href="#kernel"><span class="n">11</span>kernel 层：反差</a></li>
+      <li><a href="#limits"><span class="n">12</span>边界与下一步</a></li>
+      <li><a href="#artifacts"><span class="n">13</span>复现</a></li>
     </ul>
   </aside>
   <main>
@@ -583,12 +584,83 @@ FP4    ├─ host 18,620 µs ────────────────�
         合计只有 389.29 毫秒，wall / Self-CUDA ≈ <strong>1,508×</strong>。这里
         NVFP4 是 <strong>5.12×</strong>，BF16 eager 自己是 3.20×，BF16+graph 是
         0.89×（即已经是 GPU-bound）。同一个病，但从「不可用」变成「与 vLLM 自身
-        eager 开销同一量级」。
+        eager 开销同一量级」。GPU 那一侧的同口径对比见下一节。
+      </div>
+    </section>
+
+    <section id="previous">
+      <h2><span class="n">10</span>与上一代实现同口径：GPU 侧开销降到五分之一</h2>
+      <p class="lead">
+        上一节反复引用的
+        <code>nvfp4_attn/docs/kernel_new/docs/1.start_point.html</code>
+        是上一代实现的审计报告，它给的是另一个口径的数：K=8、prompt 604–686、
+        64 个 decode token，<strong>整段 profile 的 Self-CUDA 总量，含 prefill</strong>。
+        为了能并排，这里按同一个 workload 重采了一遍，而不是把本文的每步数字
+        乘以 64 换算——换算会把 prefill 丢掉，而被比较的那个数含 prefill。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th class="num">上一代</th><th class="num">本实现</th><th class="num">变化</th></tr></thead>
+        <tbody>
+          <tr><td>BF16（对照）</td><td class="num">323.313 ms</td><td class="num">320.968 ms</td><td class="num">−0.7%</td></tr>
+          <tr><td>NVFP4</td><td class="num">384.412 ms</td><td class="num good">333.137 ms</td><td class="num good">−13.3%</td></tr>
+          <tr class="totalrow"><td>NVFP4 − BF16</td><td class="num">+61.099 ms<br>+18.90%</td><td class="num good">+12.169 ms<br>+3.79%</td><td class="num good">开销降到 1/5</td></tr>
+        </tbody>
+      </table>
+      <div class="callout win">
+        <span class="lab">这个并排为什么站得住</span>
+        BF16 那条臂在新旧两个仓库里走的是<strong>同一条 vLLM 路径</strong>，它是这次
+        对比自带的对照组。两边相差 <strong>0.7%</strong>（320.968 对 323.313），
+        说明两次采集的机器、模型和 workload 确实可比，所以 NVFP4 那一行的 −13.3%
+        是实现的差别，不是环境的差别。
+      </div>
+      <p>
+        同一份 trace 按本文的 bucket 归类。注意这一栏的单位是<strong>一次生成的
+        总量（ms）</strong>，不是每步：
+      </p>
+      <table>
+        <thead><tr><th>bucket</th><th class="num">BF16 ms</th><th class="num">NVFP4 ms</th><th class="num">delta</th><th class="num">BF16 launch</th><th class="num">FP4 launch</th></tr></thead>
+        <tbody>
+          <tr><td>gemm</td><td class="num">236.60</td><td class="num">237.96</td><td class="num">+1.36</td><td class="num">14,304</td><td class="num">14,304</td></tr>
+          <tr><td>model_other</td><td class="num">39.52</td><td class="num">39.50</td><td class="num">−0.02</td><td class="num">8,448</td><td class="num">8,448</td></tr>
+          <tr><td>attention</td><td class="num">34.53</td><td class="num">20.02</td><td class="num good">−14.51</td><td class="num">4,064</td><td class="num">2,048</td></tr>
+          <tr><td>q_quant</td><td class="num">0</td><td class="num">13.05</td><td class="num bad">+13.05</td><td class="num">0</td><td class="num">2,016</td></tr>
+          <tr><td>kv_write</td><td class="num">6.37</td><td class="num">7.43</td><td class="num">+1.07</td><td class="num">2,048</td><td class="num">2,112</td></tr>
+          <tr><td>scratch</td><td class="num">0.25</td><td class="num">6.38</td><td class="num bad">+6.13</td><td class="num">192</td><td class="num">4,224</td></tr>
+          <tr><td>promotion</td><td class="num">0</td><td class="num">4.69</td><td class="num warn">+4.69</td><td class="num">0</td><td class="num">193</td></tr>
+          <tr><td>control</td><td class="num">0.95</td><td class="num">1.21</td><td class="num">+0.26</td><td class="num">192</td><td class="num">256</td></tr>
+          <tr><td>copy</td><td class="num">0.57</td><td class="num">0.52</td><td class="num">−0.06</td><td class="num">264</td><td class="num">264</td></tr>
+          <tr><td>other</td><td class="num">2.18</td><td class="num">2.39</td><td class="num">+0.21</td><td class="num">649</td><td class="num">712</td></tr>
+          <tr class="totalrow"><td>Self-CUDA 合计</td><td class="num">320.97</td><td class="num">333.14</td><td class="num">+12.17</td><td class="num">30,161</td><td class="num">34,577</td></tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <span class="lab">这个口径多看见了一样东西</span>
+        <strong>promotion 4.69 ms、193 次 launch</strong>。第 08 节那张每步表里
+        promotion 只有 10&nbsp;µs，因为两点差分把 prefill 减掉了，而封页主要发生在
+        prefill——prompt 有 604–686 个 token，一进来就要封掉四五整页。两个口径都对，
+        但只有这一个能看见封页的真实总账。
+      </div>
+      <div class="callout warn">
+        <span class="lab">与第 08 节的两处口径差异</span>
+        一，这里 attention 是 BF16 的 <strong>0.58</strong> 倍（20.02 对 34.53），
+        比每步表的 0.647 更好，因为序列更短时 <code>split_k_heuristic</code> 选了
+        <code>num_splits=1</code>，没有 combine kernel——FP4 decode kernel 本体
+        18.18&nbsp;ms × 2,016 次就是全部。二，BF16 那 4,064 次里有 4,032 次是
+        decode（FA4 每层两个 kernel），另 32 次是 prefill；我们是 2,016 次 decode
+        加 32 次 prefill。
+      </div>
+      <div class="callout fail">
+        <span class="lab">但要说清楚：这一节只讲 GPU</span>
+        Self-CUDA 是 GPU kernel 的时长总和，不含 launch 之间的空洞。上一代报告的
+        真正结论是 wall 586.96 秒对 Self-CUDA 389.29 毫秒——<strong>1,508×</strong>，
+        病根在 CPU。本实现把 GPU 侧的开销从 +18.90% 压到 +3.79%，把 wall/Self-CUDA
+        从 1,508× 压到 5.12×，但第 09 节已经说明：剩下的仍然是 host 侧。
+        <strong>这一节的 −13.3% 是真的进步，但它不是那 9,208&nbsp;µs 的答案。</strong>
       </div>
     </section>
 
     <section id="kernel">
-      <h2><span class="n">10</span>kernel 层：单看 kernel 我们快一倍</h2>
+      <h2><span class="n">11</span>kernel 层：单看 kernel 我们快一倍</h2>
       <p class="lead">
         另一条轴。<code>docs/reports/1.decode-baseline-comparison.md</code> 在 47 个
         配置上把这个 FP4 decode kernel 和 FA4 BF16 单独对拍过，双方都拿已经量化好的
@@ -626,7 +698,7 @@ FP4    ├─ host 18,620 µs ────────────────�
     </section>
 
     <section id="limits">
-      <h2><span class="n">11</span>边界与下一步</h2>
+      <h2><span class="n">12</span>边界与下一步</h2>
       <h3>本报告确立了什么</h3>
       <ul>
         <li>内存目标达成，且扣掉 tail buffer 之后仍然达成（3.5433 净，按 32 slot 上限）。</li>
@@ -634,6 +706,7 @@ FP4    ├─ host 18,620 µs ────────────────�
         <li>四个 bit 的准确率代价是 3.0 个点，比同机唯一的另一个 4-bit cache 好 5.5 个点。</li>
         <li>没有跨请求污染，没有自定义的 host 同步与拷贝增量。</li>
         <li>每步慢的 9,447&nbsp;µs 里，GPU 只占 239&nbsp;µs（2.5%），attention kernel 自身反而快 208&nbsp;µs。</li>
+        <li>按上一代审计的同一 workload 重采，GPU 侧相对 BF16 的开销从 +18.90% 降到 +3.79%，且 BF16 对照组两边只差 0.7%。</li>
       </ul>
       <h3>没解决的，按性价比排序</h3>
       <table>
@@ -688,7 +761,7 @@ FP4    ├─ host 18,620 µs ────────────────�
     </section>
 
     <section id="artifacts">
-      <h2><span class="n">12</span>复现</h2>
+      <h2><span class="n">13</span>复现</h2>
       <pre><span class="com"># 引擎层的全部数字（内存、并发、准确率、周转、稳态、速度账）</span>
 <span class="cmd">bash scripts/run_tests.sh e2e -- -s -k "kv_cache_memory or long_context or \
   speed_account or request_turnover or steady_state"</span>
@@ -707,6 +780,13 @@ CUDA_VISIBLE_DEVICES=1 python tests/kernel_profile/profile_engine.py \
 
 <span class="com"># host 归因（第 09 节下半张表），--host 会抬高 wall，只读排序</span>
 <span class="cmd">python tests/kernel_profile/profile_engine.py --arm nvfp4 --host --out /tmp/host_nvfp4.json</span>
+
+<span class="com"># 第 10 节：复刻上一代审计的 workload（K=8 / 64 token，整段求和，含 prefill）</span>
+<span class="cmd">CUDA_VISIBLE_DEVICES=0 python tests/kernel_profile/profile_engine.py \
+  --arm nvfp4 --workload legacy --out /tmp/legacy_nvfp4.json
+CUDA_VISIBLE_DEVICES=1 python tests/kernel_profile/profile_engine.py \
+  --arm bf16  --workload legacy --out /tmp/legacy_bf16.json
+python tests/kernel_profile/compare_engine.py /tmp/legacy_nvfp4.json /tmp/legacy_bf16.json</span>
 
 <span class="ok">73 kernel + 111 e2e + 4 soak passed</span></pre>
       <table>

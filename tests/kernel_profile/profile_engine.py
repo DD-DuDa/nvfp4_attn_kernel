@@ -1,24 +1,37 @@
-"""Per-kernel GPU cost of one decode step, for an NVFP4 engine and a BF16 one.
+"""Per-kernel GPU cost of a decode step, for an NVFP4 engine and a BF16 one.
 
 ``tests/e2e/test_speed_account.py`` says a decode step costs 23,142 us on the
 FP4 cache against 13,695 eager on BF16. This says where the difference goes.
 
-The workload constants are imported from that test rather than restated, so the
-two measurements describe the same step and the CPU share can be had by
+Two workloads, because they answer different questions.
+
+``two_point`` is the default and the one the report's per-step tables come
+from. Its constants are imported from that speed test rather than restated, so
+the two measurements describe the same step and the CPU share can be had by
 subtracting this total from that wall time. Kernels are attributed by the same
 two-point difference the wall measurement uses: profile a short generation and
 a long one, subtract per kernel, divide by the step difference. Prefill runs
-once in each and cancels exactly, which matters here because prefill quantizes
-whole pages and would otherwise be counted as a decode cost.
+once in each and cancels exactly, which matters because prefill quantizes whole
+pages and would otherwise be counted as a decode cost.
 
-Only CUDA activity is recorded. Turning on CPU profiling would inflate the wall
-time this is meant to be subtracted from, and the CPU share is better had as a
-residual than as a distorted direct measurement.
+``legacy`` reproduces the workload behind the previous implementation's audit
+in ``nvfp4_attn/docs/kernel_new/docs/1.start_point.html`` — eight prompts of
+604 to 686 tokens, 64 generated tokens, one profiled generation summed whole
+including its prefill — so that this implementation's Self-CUDA total can be
+put beside that report's 323.313 ms and 384.412 ms without either side being
+restated in units it was not measured in. It carries prefill on purpose: the
+number it is being compared against does.
+
+Only CUDA activity is recorded unless ``--host`` is passed. Turning on CPU
+profiling inflates the wall time this is meant to be subtracted from, and the
+CPU share is better had as a residual than as a distorted direct measurement.
 
 Writes JSON. ``compare_engine.py`` reduces two of these into a paired table.
 
     python tests/kernel_profile/profile_engine.py --arm nvfp4 --out /tmp/a.json
     python tests/kernel_profile/profile_engine.py --arm bf16  --out /tmp/b.json
+    python tests/kernel_profile/profile_engine.py --arm bf16 --workload legacy \
+        --out /tmp/legacy_bf16.json
 """
 
 from __future__ import annotations
@@ -33,6 +46,13 @@ import time
 from pathlib import Path
 
 import torch
+
+
+# The workload of nvfp4_attn/docs/kernel_new/docs/1.start_point.html, which is
+# what its 323.313 ms and 384.412 ms Self-CUDA totals were measured on.
+LEGACY_BATCH = 8
+LEGACY_PROMPT_RANGE = (604, 686)
+LEGACY_TOKENS = 64
 
 
 def _speed_account():
@@ -67,6 +87,23 @@ def _kernels(prof, host: bool) -> dict[str, dict[str, float]]:
     return totals
 
 
+def _legacy_prompts() -> list:
+    """Eight prompts spread across the previous audit's 604–686 token range."""
+    from vllm.inputs import TokensPrompt
+
+    low, high = LEGACY_PROMPT_RANGE
+    span = (high - low) / max(LEGACY_BATCH - 1, 1)
+    return [
+        TokensPrompt(
+            prompt_token_ids=[
+                1000 + (row * 31 + i * 7) % 20000
+                for i in range(low + round(row * span))
+            ]
+        )
+        for row in range(LEGACY_BATCH)
+    ]
+
+
 def _profile(llm, prompts, max_tokens: int, host: bool) -> tuple[dict, float]:
     from torch.profiler import ProfilerActivity, profile
     from vllm import SamplingParams
@@ -90,6 +127,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arm", choices=["nvfp4", "bf16"], required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--workload",
+        choices=["two_point", "legacy"],
+        default="two_point",
+        help=(
+            "two_point: per-decode-step, prefill differenced away. "
+            "legacy: one K=8 / 64-token generation summed whole, matching "
+            "the previous implementation's audit."
+        ),
+    )
     parser.add_argument(
         "--host",
         action="store_true",
@@ -122,23 +169,41 @@ def main() -> None:
         },
     )
     try:
-        prompts = speed._prompts()
+        prompts = (
+            speed._prompts()
+            if args.workload == "two_point"
+            else _legacy_prompts()
+        )
+        # Unmeasured, and 8 tokens exactly as the previous audit's warmup was.
         llm.generate(
             prompts,
             SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
             use_tqdm=False,
         )
-        short, short_wall = _profile(
-            llm, prompts, speed.SHORT_TOKENS, args.host
-        )
-        long, long_wall = _profile(llm, prompts, speed.LONG_TOKENS, args.host)
+        if args.workload == "legacy":
+            totals, wall = _profile(llm, prompts, LEGACY_TOKENS, args.host)
+            short, short_wall = {}, 0.0
+            long, long_wall = totals, wall
+        else:
+            short, short_wall = _profile(
+                llm, prompts, speed.SHORT_TOKENS, args.host
+            )
+            long, long_wall = _profile(
+                llm, prompts, speed.LONG_TOKENS, args.host
+            )
     finally:
         llm.llm_engine.engine_core.shutdown()
         del llm
         gc.collect()
         torch.cuda.empty_cache()
 
-    steps = speed.LONG_TOKENS - speed.SHORT_TOKENS
+    # Legacy divides by one: the figure it is compared against is a total over
+    # the whole generation, not a rate.
+    steps = (
+        1
+        if args.workload == "legacy"
+        else speed.LONG_TOKENS - speed.SHORT_TOKENS
+    )
     per_step = {}
     for name in set(short) | set(long):
         a = short.get(name, {"us": 0.0, "count": 0})
@@ -148,17 +213,24 @@ def main() -> None:
             "launches": (b["count"] - a["count"]) / steps,
         }
 
+    legacy = args.workload == "legacy"
     payload = {
         "arm": args.arm,
+        "workload": args.workload,
         "host": args.host,
-        "batch": speed.BATCH,
-        "prompt_tokens": speed.PROMPT_TOKENS,
-        "short_tokens": speed.SHORT_TOKENS,
-        "long_tokens": speed.LONG_TOKENS,
+        "batch": LEGACY_BATCH if legacy else speed.BATCH,
+        "prompt_tokens": (
+            f"{LEGACY_PROMPT_RANGE[0]}-{LEGACY_PROMPT_RANGE[1]}"
+            if legacy
+            else speed.PROMPT_TOKENS
+        ),
+        "generated_tokens": LEGACY_TOKENS if legacy else None,
+        "short_tokens": None if legacy else speed.SHORT_TOKENS,
+        "long_tokens": None if legacy else speed.LONG_TOKENS,
         "steps": steps,
         # Under the profiler, so inflated. Recorded for provenance only; the
         # wall figures this is compared against come from the e2e test.
-        "profiled_wall_us_per_step": (long_wall - short_wall) / steps * 1e6,
+        "profiled_wall_us": (long_wall - short_wall) / steps * 1e6,
         "kernels": dict(
             sorted(per_step.items(), key=lambda kv: -kv[1]["us"])
         ),
@@ -166,7 +238,13 @@ def main() -> None:
     Path(args.out).write_text(json.dumps(payload, indent=2))
 
     total = sum(row["us"] for row in per_step.values())
-    print(f"\n{args.arm}: {total:,.0f} us/step of GPU work")
+    if legacy:
+        print(
+            f"\n{args.arm}: {total / 1e3:,.3f} ms Self-CUDA over one "
+            f"K={LEGACY_BATCH} / {LEGACY_TOKENS}-token generation"
+        )
+    else:
+        print(f"\n{args.arm}: {total:,.0f} us/step of GPU work")
     for name, row in list(payload["kernels"].items())[:25]:
         print(f"  {row['us']:9,.1f} us  x{row['launches']:6.1f}  {name[:88]}")
 

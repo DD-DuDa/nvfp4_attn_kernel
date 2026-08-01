@@ -134,6 +134,11 @@ def main() -> None:
     b = json.loads(Path(args.bf16).read_text())
     assert a["arm"] == "nvfp4" and b["arm"] == "bf16"
     assert a["steps"] == b["steps"]
+    assert a.get("workload") == b.get("workload"), (
+        "the two arms were profiled on different workloads, so their totals "
+        "are not comparable"
+    )
+    legacy = a.get("workload") == "legacy"
 
     fp4, fp4_unknown = reduce(a)
     bf16, bf16_unknown = reduce(b)
@@ -148,11 +153,18 @@ def main() -> None:
     labels = {key: text for key, text, _ in BUCKETS}
     labels["other"] = "Unclassified"
 
-    print(
-        f"\nGPU time per decode step, batch {a['batch']}, "
-        f"prompt {a['prompt_tokens']} tokens, "
-        f"{a['steps']} steps of two-point difference\n"
-    )
+    if legacy:
+        print(
+            f"\nSelf-CUDA over one generation, batch {a['batch']}, "
+            f"prompt {a['prompt_tokens']} tokens, "
+            f"{a['generated_tokens']} generated, prefill included\n"
+        )
+    else:
+        print(
+            f"\nGPU time per decode step, batch {a['batch']}, "
+            f"prompt {a['prompt_tokens']} tokens, "
+            f"{a['steps']} steps of two-point difference\n"
+        )
     print(f"{'bucket':<14}{'BF16 us':>10}{'NVFP4 us':>11}{'delta':>10}"
           f"{'BF16 lch':>10}{'FP4 lch':>9}  what")
     print("-" * 96)
@@ -176,6 +188,42 @@ def main() -> None:
         f"{'TOTAL GPU':<14}{total_a:>10,.1f}{total_b:>11,.1f}"
         f"{total_b - total_a:>+10,.1f}{launch_a:>10,.0f}{launch_b:>9,.0f}"
     )
+
+    if legacy:
+        # nvfp4_attn/docs/kernel_new/docs/1.start_point.html, "Paired BF16
+        # comparison", collected 2026-07-16 on this same workload.
+        previous = {"bf16": 323.313, "nvfp4": 384.412}
+        print(
+            "\nagainst the previous implementation on the same workload "
+            "(nvfp4_attn 1.start_point.html):\n"
+        )
+        print(f"{'':<14}{'previous ms':>13}{'this ms':>11}{'change':>11}")
+        for label, key, now in (
+            ("BF16", "bf16", total_a),
+            ("NVFP4", "nvfp4", total_b),
+        ):
+            was = previous[key]
+            print(
+                f"{label:<14}{was:>13,.3f}{now / 1e3:>11,.3f}"
+                f"{(now / 1e3 - was) / was * 100:>+10.1f}%"
+            )
+        gap_was = previous["nvfp4"] - previous["bf16"]
+        gap_now = (total_b - total_a) / 1e3
+        print(
+            f"{'NVFP4 - BF16':<14}{gap_was:>+13,.3f}{gap_now:>+11,.3f}"
+            f"{'':>11}"
+        )
+        print(
+            f"{'as a share':<14}"
+            f"{gap_was / previous['bf16'] * 100:>12.2f}%"
+            f"{gap_now / (total_a / 1e3) * 100:>10.2f}%"
+        )
+        print(
+            "\nthe BF16 arm is the same vLLM path in both repositories, so "
+            "how close\nthose two BF16 numbers are is the measure of how "
+            "comparable the runs are."
+        )
+        return
 
     # The wall figures come from tests/e2e/test_speed_account.py, measured on
     # this same configuration without a profiler attached. Everything in a step
