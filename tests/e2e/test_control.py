@@ -34,12 +34,16 @@ from nvfp4_vllm.control import (
     ERR_STALE_SLOT_HISTORY,
     FREE_KEY,
     INACTIVE_ROW,
+    MAX_SUPPORTED_SLOTS,
     NULL_BLOCK,
     PAGE_SIZE,
     ControlPlane,
 )
 
 
+# The width the scripted tests below are written at. Deliberately narrow: they
+# assert on whole rows of output, and eight of anything is readable. The
+# ceiling is exercised by the randomized cross-check at the end of the file.
 NUM_SLOTS = 8
 MAX_TOKENS = 4096
 # Columns in the block table the steps below hand to the kernel. Wide enough
@@ -532,11 +536,31 @@ def test_a_steady_stream_never_loses_a_slot(plane):
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
-def test_the_kernel_agrees_with_the_reference_under_random_scheduling(
-    plane, reference, seed
-):
-    simulator = Simulator(random.Random(seed), skip_probability=0.25)
+@pytest.mark.parametrize("width", [NUM_SLOTS, MAX_SUPPORTED_SLOTS])
+def test_the_kernel_agrees_with_the_reference_under_random_scheduling(seed, width):
+    """The one test that runs the table at its declared ceiling.
+
+    Width is the kernel's most load-bearing constexpr: it sets BLOCK, and
+    every pairwise matrix in there is BLOCK by BLOCK. The scripted tests above
+    all sit at eight, where a rank-pairing bug has only a few places to hide,
+    so the ceiling gets its coverage here — against the reference model, over
+    random scheduling, with the block pool widened to match so the table
+    actually fills up.
+    """
+    plane = ControlPlane(
+        max_num_seqs=width,
+        max_num_batched_tokens=MAX_TOKENS,
+        device="cuda",
+    )
+    reference = ReferenceSlotTable(num_slots=width)
+    simulator = Simulator(
+        random.Random(seed),
+        skip_probability=0.25,
+        num_slots=width,
+        block_pool=width + 4,
+    )
     crossings = 0
+    busiest = 0
     for index in range(300):
         step = simulator.step()
         if not step.block0:
@@ -544,7 +568,12 @@ def test_the_kernel_agrees_with_the_reference_under_random_scheduling(
         answer = run(plane, step)
         assert answer == reference.prepare(step), f"step {index} diverged"
         crossings += sum(page >= 0 for page in answer["promotion_pages"])
+        busiest = max(busiest, len(step.block0))
     assert crossings, "no row filled a tail page, so promotion agreed vacuously"
+    assert busiest > width // 2, (
+        f"the widest step held {busiest} of {width} rows, so most of the "
+        "table was never asked to do anything"
+    )
 
 
 class Simulator:

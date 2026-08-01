@@ -49,11 +49,24 @@ import triton.language as tl
 
 PAGE_SIZE = 128
 
-# The largest slot table v1 is validated for. The constraint is the BF16 tail
-# buffer this control plane hands out indices into, which is preallocated at
-# 16 MiB per slot on an 8B model; the kernel below holds a [slots, slots]
-# comparison in registers and stays comfortable into the low hundreds.
-MAX_SUPPORTED_SLOTS = 8
+# The largest slot table v1 is validated for. Two things pay for width.
+#
+# The BF16 tail buffer this control plane hands out indices into costs 16.8 MiB
+# a slot on an 8B model, so 32 slots is 537 MiB. That is linear and cheap to
+# reason about.
+#
+# The kernel below is the harder limit. It runs as a single CTA of four warps
+# and holds about seven [BLOCK, BLOCK] boolean matrices live at once, where
+# BLOCK is max_num_seqs rounded up to a power of two. Compiled register counts
+# and spills, measured: 48/0 at eight slots, 96/0 at thirty-two, 255/12 at
+# sixty-four, 255/372 at a hundred and twenty-eight. Thirty-two is the last
+# width that fits, so anything past it is a kernel change — more warps, or a
+# blocked rewrite — rather than a change to this number.
+#
+# vLLM's own default here is 1024, and its native nvfp4 path has no ceiling at
+# all because it quantizes each token straight into the paged cache and keeps
+# no tail. This limit is the price of packing V along the token axis.
+MAX_SUPPORTED_SLOTS = 32
 
 FREE_KEY = -1
 # vLLM's block pool takes block 0 out of the free list at startup and hands it
