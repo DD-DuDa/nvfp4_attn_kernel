@@ -88,6 +88,15 @@ ERR_NO_FREE_SLOT = 8
 ERR_DUPLICATE_KEY = 16
 ERR_PROMOTION_COLUMN = 32
 
+ERROR_NAMES = {
+    ERR_CONTINUATION_PREFILL: "a prompt arrived split across steps",
+    ERR_SLOT_LOST: "a row with history matched no slot",
+    ERR_STALE_SLOT_HISTORY: "a matched slot's length does not continue",
+    ERR_NO_FREE_SLOT: "a row needing a slot found none free",
+    ERR_DUPLICATE_KEY: "two live rows share a physical block",
+    ERR_PROMOTION_COLUMN: "a promotion column is past the block table",
+}
+
 _TOKEN_BLOCK = 256
 
 # Triton cannot close over plain Python globals, only over constexpr ones.
@@ -344,6 +353,10 @@ class ControlOutputs:
     error_code: torch.Tensor
 
 
+class ControlPlaneError(RuntimeError):
+    """An invariant the slot table reported through ``error_code``."""
+
+
 class ControlPlane:
     """Slot table and per-step scratch for one engine.
 
@@ -408,6 +421,28 @@ class ControlPlane:
         self.slot_last_seen.fill_(-1)
         self.step.zero_()
         self.error_code.zero_()
+
+    def raise_for_errors(self) -> None:
+        """Read the sticky error word and raise if the kernel reported anything.
+
+        Reading it costs a host synchronization, so nothing on the normal path
+        calls this — see ``NVFP4_DEBUG``. The flags are sticky for the life of
+        the engine, so a caller that reads only at the end still learns
+        everything that went wrong, just not when.
+        """
+        code = int(self.error_code.item())
+        if not code:
+            return
+        named = [
+            text for bit, text in ERROR_NAMES.items() if code & bit
+        ]
+        unknown = code & ~sum(ERROR_NAMES)
+        if unknown:
+            named.append(f"unrecognized flags {unknown:#x}")
+        raise ControlPlaneError(
+            f"the slot control plane reported error_code {code}: "
+            + "; ".join(named)
+        )
 
     def prepare(
         self,

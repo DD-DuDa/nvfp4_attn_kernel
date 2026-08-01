@@ -21,6 +21,8 @@ which is the case lazy reclamation already handles.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -36,6 +38,15 @@ from .guards import NVFP4, check_supported
 from .metadata import NVFP4Metadata
 from .runtime import PAGE_SIZE
 from .write import PageWorkTable
+
+
+# The control plane records broken invariants in a sticky device word that
+# nothing reads, because reading it costs a host synchronization every step and
+# the whole read path is built to have none. Setting this trades that back: the
+# step that breaks an invariant is the step that reports it, named, instead of
+# the run ending in output that is merely wrong. Off by default, and meant for
+# a bisect rather than for production.
+DEBUG_ENV = "NVFP4_DEBUG"
 
 
 def decode_split(
@@ -103,6 +114,9 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             self.plane = None
             return
 
+        # Read once. Per step this has to be a bool test, not a dict lookup.
+        self.debug = os.environ.get(DEBUG_ENV) == "1"
+
         # Ask the model runner to move one-token requests to the front of the
         # batch. That makes the decode rows a contiguous prefix, so the decode
         # kernel takes slices of this step's arrays instead of a compacted copy
@@ -155,6 +169,13 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
         )
+
+        if self.debug:
+            # Placed after prepare rather than before, so the step that broke
+            # the invariant is the step that raises. The flags are sticky, so
+            # every later step would raise too, but the first one is the one
+            # with a batch worth looking at.
+            self.plane.raise_for_errors()
 
         source_tokens, destination_pages = self.work_table.build(
             query_start_loc=common_attn_metadata.query_start_loc,

@@ -38,6 +38,7 @@ from nvfp4_vllm.control import (
     NULL_BLOCK,
     PAGE_SIZE,
     ControlPlane,
+    ControlPlaneError,
 )
 
 
@@ -533,6 +534,35 @@ def test_a_steady_stream_never_loses_a_slot(plane):
             run(plane, step)
     assert int(plane.error_code.item()) == 0
     assert simulator.retired > 3 * NUM_SLOTS, "the table never turned over"
+
+
+def test_a_clean_table_has_nothing_to_report(plane):
+    check(plane, ReferenceSlotTable(), prefills([11, 12], [300, 128]))
+    plane.raise_for_errors()
+
+
+def test_the_debug_read_names_every_flag_it_finds(plane):
+    """What ``NVFP4_DEBUG`` buys: the invariant, in words, at the step.
+
+    The flags are a bitmask in a device word that nothing on the hot path
+    reads, so the only way anyone learns what one means is this message. Two
+    at once is the case worth pinning, since a run that breaks one invariant
+    often breaks a second on the same step.
+    """
+    plane.error_code.fill_(ERR_SLOT_LOST | ERR_DUPLICATE_KEY)
+    with pytest.raises(ControlPlaneError) as caught:
+        plane.raise_for_errors()
+    message = str(caught.value)
+    assert "matched no slot" in message and "share a physical block" in message
+    assert str(ERR_SLOT_LOST | ERR_DUPLICATE_KEY) in message
+
+
+def test_a_flag_nobody_named_is_still_reported(plane):
+    # A bit added to the kernel and not to the table would otherwise read as
+    # an empty error, which is worse than an unhelpful one.
+    plane.error_code.fill_(1 << 20)
+    with pytest.raises(ControlPlaneError, match="unrecognized"):
+        plane.raise_for_errors()
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
