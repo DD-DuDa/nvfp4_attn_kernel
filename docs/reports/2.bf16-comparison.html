@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NVFP4 KV cache vs BF16 vLLM · Engine-level comparison</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,800;1,9..144,500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f6f1e7; --panel:#fbf8f0; --panel-2:#f1ead9;
+  --code-bg:#2c2722; --code-ink:#e9e0cb;
+  --rule:rgba(60,50,30,.10); --rule-strong:rgba(60,50,30,.24);
+  --ink:#1f1b14; --ink-2:#4a3f2c; --muted:#79705f; --dim:#a59d8b;
+  --amber:#b46a1c; --crimson:#b8403a; --rust:#9a3a25;
+  --mint:#2f7a55; --sky:#2c5d8c; --plum:#6e3a78;
+  --serif:'Source Serif 4','Iowan Old Style',Georgia,serif;
+  --display:'Fraunces','Source Serif 4',Georgia,serif;
+  --mono:'JetBrains Mono','SF Mono',ui-monospace,Menlo,monospace;
+  --max-prose:78ch; --sidebar-w:228px;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--serif); font-size:16px; line-height:1.6;
+  font-feature-settings:"kern","liga","onum"; -webkit-font-smoothing:antialiased;
+  background-image:
+    radial-gradient(ellipse 90% 60% at 50% -10%,rgba(180,106,28,.07),transparent 70%),
+    radial-gradient(ellipse 60% 40% at 100% 100%,rgba(44,93,140,.05),transparent 60%);
+  background-attachment:fixed;
+}
+::selection{background:rgba(180,106,28,.24)}
+.layout{display:grid;grid-template-columns:var(--sidebar-w) minmax(0,1fr);max-width:1320px;margin:0 auto}
+aside.toc{
+  position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:48px 18px 48px 34px;border-right:1px solid var(--rule)
+}
+.toc-title{
+  font-family:var(--display);font-style:italic;font-size:11.5px;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--amber);margin:0 0 14px
+}
+.toc-list{list-style:none;padding:0;margin:0}
+.toc-list li{margin-bottom:3px}
+.toc-list a{
+  display:flex;gap:8px;padding:6px 8px 6px 10px;border-left:2px solid transparent;
+  color:var(--muted);text-decoration:none;font-size:13px;line-height:1.35
+}
+.toc-list a:hover{color:var(--ink);border-left-color:var(--amber);background:rgba(180,106,28,.05)}
+.toc-list .n{width:21px;flex:0 0 21px;font-family:var(--mono);font-size:10.5px;color:var(--dim);padding-top:2px}
+main{padding:56px 56px 96px;min-width:0}
+.eyebrow{
+  font-family:var(--display);font-style:italic;font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--amber);margin:0 0 14px
+}
+h1{
+  font-family:var(--display);font-size:clamp(34px,5vw,52px);line-height:1.02;
+  margin:0 0 18px;letter-spacing:-.015em
+}
+h1 em{color:var(--rust);font-style:italic}
+.hero-sub{max-width:var(--max-prose);color:var(--ink-2);font-size:17.5px;line-height:1.55;margin:0 0 18px}
+.source-line{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:18px}
+.summary-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:30px 0}
+.stat{min-height:112px;background:var(--panel);border:1px solid var(--rule);padding:15px 16px;border-radius:7px}
+.stat .label{
+  font-family:var(--display);font-style:italic;font-size:11.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--muted);margin:0 0 5px
+}
+.stat .val{font-family:var(--mono);font-size:19px;font-weight:600;line-height:1.15}
+.stat .delta{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.35}
+.stat.win .val{color:var(--mint)} .stat.warn .val{color:var(--amber)} .stat.fail .val{color:var(--crimson)}
+h2{
+  font-family:var(--display);font-size:27px;line-height:1.15;margin:58px 0 14px;
+  scroll-margin-top:24px;letter-spacing:-.005em
+}
+h2 .n{font-family:var(--display);font-style:italic;color:var(--amber);margin-right:12px}
+h3{font-family:var(--display);font-size:19px;margin:26px 0 10px}
+p{max-width:var(--max-prose);margin:0 0 12px}
+p.lead{color:var(--ink-2);font-size:16.5px}
+strong{color:var(--ink)}
+code,pre,.mono,.num{font-family:var(--mono)}
+p code,li code,td code{
+  font-size:.86em;background:var(--panel-2);border:1px solid var(--rule);
+  padding:1px 5px;border-radius:4px
+}
+pre{
+  background:var(--code-bg);color:var(--code-ink);padding:17px 19px;border-radius:9px;
+  overflow-x:auto;font-size:12.5px;line-height:1.6;margin:14px 0 20px;
+  box-shadow:0 14px 34px -26px rgba(31,27,20,.7)
+}
+pre .com{color:#a59d8b;font-style:italic} pre .cmd{color:#f0c976} pre .ok{color:#95d6a9}
+table{border-collapse:collapse;margin:14px 0 20px;font-size:13.5px;min-width:100%;background:rgba(251,248,240,.45)}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--rule);vertical-align:top}
+th{background:var(--panel-2);font-family:var(--display);font-size:13px}
+td.num,th.num{font-family:var(--mono);text-align:right;white-space:nowrap}
+td.good{color:var(--mint);font-weight:600} td.warn{color:var(--amber)} td.bad{color:var(--crimson)}
+tr.totalrow td{border-top:2px solid var(--rule-strong);font-weight:600;background:var(--panel)}
+.callout{border-radius:8px;padding:14px 18px;margin:18px 0;font-size:14.5px;line-height:1.55;max-width:var(--max-prose)}
+.callout .lab{font-family:var(--display);font-style:italic;font-size:11px;letter-spacing:.14em;text-transform:uppercase;margin-right:10px}
+.callout.win{background:rgba(47,122,85,.10);border-left:3px solid var(--mint)} .callout.win .lab{color:var(--mint)}
+.callout.warn{background:rgba(180,106,28,.08);border-left:3px solid var(--amber)} .callout.warn .lab{color:var(--amber)}
+.callout.fail{background:rgba(184,64,58,.08);border-left:3px solid var(--crimson)} .callout.fail .lab{color:var(--crimson)}
+.callout.info{background:rgba(44,93,140,.07);border-left:3px solid var(--sky)} .callout.info .lab{color:var(--sky)}
+ul,ol{max-width:var(--max-prose);padding-left:1.4em} li{margin-bottom:5px}
+.diagram{
+  font-family:var(--mono);font-size:12px;line-height:1.55;background:var(--panel);
+  border:1px solid var(--rule);border-radius:9px;padding:18px 20px;margin:16px 0 20px;
+  white-space:pre;overflow-x:auto
+}
+.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:18px 0 22px}
+.flow-step{position:relative;min-height:112px;padding:14px;background:var(--panel);border:1px solid var(--rule);border-radius:7px}
+.flow-step:not(:last-child)::after{
+  content:"→";position:absolute;right:-10px;top:42px;z-index:2;color:var(--amber);font-family:var(--mono)
+}
+.flow-step .k{font-family:var(--mono);color:var(--amber);font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+.flow-step strong{display:block;margin:4px 0;font-size:14px}
+.flow-step span{color:var(--muted);font-size:12px;line-height:1.35;display:block}
+.bar-row{display:grid;grid-template-columns:190px 1fr 96px;gap:12px;align-items:center;margin:9px 0;font-size:13px}
+.bar-track{height:12px;border-radius:99px;background:var(--panel-2);overflow:hidden;border:1px solid var(--rule)}
+.bar-fill{height:100%;background:var(--sky)} .bar-fill.amber{background:var(--amber)} .bar-fill.mint{background:var(--mint)}
+.bar-fill.crimson{background:var(--crimson)}
+.gate-row{display:flex;gap:9px;align-items:flex-start;margin-bottom:8px}
+.gate-badge{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:3px 7px;border-radius:4px;flex-shrink:0;min-width:74px;text-align:center}
+.gate-badge.pass{background:rgba(47,122,85,.14);color:var(--mint)}
+.gate-badge.limit{background:rgba(180,106,28,.12);color:var(--amber)}
+.gate-desc{font-size:13.5px;color:var(--ink-2);padding-top:1px}
+footer.foot{margin-top:72px;padding-top:18px;border-top:1px solid var(--rule);font-size:12px;color:var(--dim)}
+@media(max-width:1050px){.summary-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.flow{grid-template-columns:repeat(2,minmax(0,1fr))}.flow-step:not(:last-child)::after{display:none}}
+@media(max-width:800px){.layout{display:block}aside.toc{position:relative;height:auto;padding:24px;border-right:0;border-bottom:1px solid var(--rule)}.toc-list{columns:2}main{padding:38px 24px 72px}}
+@media(max-width:560px){.summary-strip,.flow{grid-template-columns:1fr}.toc-list{columns:1}.bar-row{grid-template-columns:110px 1fr 70px}h1{font-size:34px}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <p class="toc-title">NVFP4 · vs BF16 vLLM</p>
+    <ul class="toc-list">
+      <li><a href="#verdict"><span class="n">01</span>结论</a></li>
+      <li><a href="#contract"><span class="n">02</span>证据合同</a></li>
+      <li><a href="#memory"><span class="n">03</span>内存：装得下多少</a></li>
+      <li><a href="#concurrency"><span class="n">04</span>并发：长上下文</a></li>
+      <li><a href="#accuracy"><span class="n">05</span>准确率：四条臂</a></li>
+      <li><a href="#hygiene"><span class="n">06</span>状态卫生</a></li>
+      <li><a href="#speed"><span class="n">07</span>速度账三条臂</a></li>
+      <li><a href="#gpu"><span class="n">08</span>一步 decode 的 GPU 账</a></li>
+      <li><a href="#host"><span class="n">09</span>剩下 97.5% 在 host</a></li>
+      <li><a href="#kernel"><span class="n">10</span>kernel 层：反差</a></li>
+      <li><a href="#limits"><span class="n">11</span>边界与下一步</a></li>
+      <li><a href="#artifacts"><span class="n">12</span>复现</a></li>
+    </ul>
+  </aside>
+  <main>
+    <p class="eyebrow">Engine comparison · 2026-08-01 · Llama-3.1-8B-Instruct · SM100</p>
+    <h1>NVFP4 KV cache vs BF16 vLLM<br><em>3.54× 的内存，2.5% 的 GPU 代价，其余全在 host</em></h1>
+    <p class="hero-sub">
+      同一台机器、同一个模型、同一份配置，只换 KV cache 的精度。内存与并发
+      两项达到设计目标；准确率掉 3.0 个点；每步 decode 慢 9,447&nbsp;µs——但把这
+      9,447 拆开之后，<strong>只有 239&nbsp;µs 是 GPU 多做的工作</strong>，其余
+      9,208&nbsp;µs 是 host 没跟上设备。attention kernel 本身反而比 BF16
+      <strong>快 208&nbsp;µs</strong>。
+    </p>
+    <p class="source-line">Source · tests/e2e/{kv_cache_memory,long_context_concurrency,vllm_integration,request_turnover,steady_state,speed_account}.py · tests/kernel_profile/{profile_engine,compare_engine}.py · docs/reports/1.decode-baseline-comparison.md</p>
+
+    <div class="summary-strip">
+      <div class="stat win">
+        <p class="label">Token 容量</p>
+        <div class="val">3.5583×</div>
+        <div class="delta">扣掉 tail buffer 后 3.5433×</div>
+      </div>
+      <div class="stat win">
+        <p class="label">65,536 上下文并发</p>
+        <div class="val">61.3 vs 17.3</div>
+        <div class="delta">batch 32 我们跑得满</div>
+      </div>
+      <div class="stat warn">
+        <p class="label">GSM8K N=200</p>
+        <div class="val">−0.0300</div>
+        <div class="delta">0.7400 vs BF16 0.7700</div>
+      </div>
+      <div class="stat fail">
+        <p class="label">每步 decode</p>
+        <div class="val">+9,447 µs</div>
+        <div class="delta">其中 GPU 只占 +239 µs</div>
+      </div>
+    </div>
+
+    <section id="verdict">
+      <h2><span class="n">01</span>结论</h2>
+      <div class="callout win">
+        <span class="lab">达到设计目标的</span>
+        同样的显存预算下 FP4 cache 装 <strong>4,221,696</strong> 个 token，BF16 装
+        <strong>1,186,432</strong>，比值 3.5583，正好是页大小比 16/4.5 = 3.5556 该给的。
+        把这个比值花在 65,536 的上下文上，就是 61.3 条并发对 17.3 条：一批 32 路请求
+        在我们这里跑得满，在 BF16 上必须排队。
+      </div>
+      <div class="callout win">
+        <span class="lab">没有付出的代价</span>
+        自定义路径在 steady-state 里 <strong>不多做一次 DtoH/HtoD</strong>（同 backend
+        下与 BF16 引擎逐次相等：23 步 48/52 对 48/52）。200 个请求连续跑完，同一批题
+        两遍逐 token 相同，slot 表的 sticky <code>error_code</code> 为 0。
+      </div>
+      <div class="callout warn">
+        <span class="lab">付出的代价</span>
+        准确率掉 <strong>3.0 个点</strong>（0.7400 vs 0.7700，N=200）——这是四个 bit
+        本身的代价，同一张表上 vLLM 自带的 nvfp4 掉 8.5 个点。tail buffer 按 32 slot
+        上限收 512&nbsp;MiB，占 cache 的 0.34%。
+      </div>
+      <div class="callout fail">
+        <span class="lab">真正的 blocker，且它不在 GPU 上</span>
+        每步 decode 慢 9,447&nbsp;µs。配对 profile 显示 <strong>GPU 侧只多做了
+        239&nbsp;µs</strong>（4,522 vs 4,283），剩下 <strong>9,208&nbsp;µs 是 host
+        gap</strong>。同一份 trace 里 attention kernel 自己比 BF16 快 208&nbsp;µs，
+        而 Python/CuTeDSL 前端把它赚回来的时间花掉了 30 倍。
+      </div>
+      <div class="callout info">
+        <span class="lab">必须一起读的第二个数</span>
+        这 9,447 只是「四个 bit」那一笔。同一组测量里「不能用 CUDA graph」另收
+        9,888&nbsp;µs/step。两笔几乎一样大，而后者与量化无关，做完 graph capture
+        就能拿回来。拿 NVFP4 eager 直接比 BF16+graph 是 6.1×，那个数会同时把两笔
+        算在四个 bit 头上。
+      </div>
+    </section>
+
+    <section id="contract">
+      <h2><span class="n">02</span>证据合同</h2>
+      <p class="lead">
+        所有数字来自同一台机器上的实测，不是估算。两条臂除 KV cache 精度外配置相同；
+        每一节都注明该数出自哪个文件，以便重跑。
+      </p>
+      <table>
+        <thead>
+          <tr><th>测什么</th><th>怎么测</th><th>出处</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>页大小、block 数、token 容量、tail 成本</td>
+            <td>同配置先后建两个引擎，读 <code>kv_cache_spec</code> 与已分配张量</td>
+            <td><code>tests/e2e/test_kv_cache_memory.py</code></td>
+          </tr>
+          <tr>
+            <td>65,536 上下文下的并发条数</td>
+            <td>同上，再按 cache token 数除以上下文长度；并真的跑 32 路</td>
+            <td><code>tests/e2e/test_long_context_concurrency.py</code></td>
+          </tr>
+          <tr>
+            <td>GSM8K 准确率（四条臂）</td>
+            <td>5-shot、greedy、256 新 token、同一批题</td>
+            <td><code>tests/e2e/test_vllm_integration.py</code></td>
+          </tr>
+          <tr>
+            <td>跨请求状态污染</td>
+            <td>200 个请求，同一批 100 题跑两遍，比 token id</td>
+            <td><code>tests/e2e/test_request_turnover.py</code></td>
+          </tr>
+          <tr>
+            <td>host 同步、launch 次数、拷贝差量</td>
+            <td><code>set_sync_debug_mode</code> + 计数器 + 同 backend 的 BF16 对照</td>
+            <td><code>tests/e2e/test_steady_state.py</code></td>
+          </tr>
+          <tr>
+            <td>每步 decode 延迟</td>
+            <td>两点回归：同 prompt 生成 32 与 288 token，取斜率</td>
+            <td><code>tests/e2e/test_speed_account.py</code></td>
+          </tr>
+          <tr>
+            <td>每步 decode 的 per-kernel GPU 时间</td>
+            <td>同样的两点差分，逐 kernel 相减，prefill 自动抵消</td>
+            <td><code>tests/kernel_profile/profile_engine.py</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <span class="lab">为什么两点差分</span>
+        直接 profile 一次生成，得到的表里 prefill 和 decode 混在一起，而 prefill
+        要整页量化，会被算成 decode 的成本。生成 32 token 与 288 token 各 profile
+        一次再逐 kernel 相减，prefill 在两边各跑一次、精确抵消，剩下的除以 256
+        就是一步 decode。速度账用同一个方法，所以两组数可以直接相减。
+      </div>
+      <table>
+        <tbody>
+          <tr><th>模型</th><td>Llama-3.1-8B-Instruct · BF16 权重 · 32 层 · 32 Q head / 8 KV head</td></tr>
+          <tr><th>机器</th><td>SM100 · 183 GB · torch 2.11.0+cu130 · vLLM v0.1.dev1+g1ad84fea8</td></tr>
+          <tr><th>共同配置</th><td><code>enforce_eager</code>（除注明的 graph 臂）· <code>block_size=128</code> · 无 prefix caching · 无 chunked prefill</td></tr>
+          <tr><th>延迟 workload</th><td>batch 8 · prompt 1,000 token · 两点 32/288</td></tr>
+          <tr><th>回归状态</th><td class="good">73 kernel + 111 e2e + 4 soak 全绿</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="memory">
+      <h2><span class="n">03</span>内存：同样的预算装得下多少</h2>
+      <p class="lead">
+        这是整个项目的目的。两个引擎拿到的 KV 预算相差 0.08%（144.83 对
+        144.94&nbsp;GiB），所以比的是页大小，不是谁抢到更多显存。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th class="num">页/层</th><th class="num">blocks</th><th class="num">tokens</th><th class="num">KV 预算</th></tr></thead>
+        <tbody>
+          <tr><td>BF16</td><td class="num">524,288 B</td><td class="num">9,269</td><td class="num">1,186,432</td><td class="num">144.83 GiB</td></tr>
+          <tr><td>NVFP4</td><td class="num">147,456 B</td><td class="num">32,982</td><td class="num">4,221,696</td><td class="num">144.94 GiB</td></tr>
+          <tr class="totalrow"><td>比值</td><td class="num">3.5556</td><td class="num">3.5583</td><td class="num good">3.5583</td><td class="num">1.0008</td></tr>
+        </tbody>
+      </table>
+      <p>
+        3.5556 就是 16&nbsp;/&nbsp;4.5：一个 BF16 值 16 bit，一个 NVFP4 值 4 bit
+        外加每 16 个值共享一个 E4M3 scale，合 4.5 bit。实测的 token 容量比
+        3.5583 略高于它，差在两个 backend 别处预留量的零头上。
+      </p>
+      <h3>tail buffer：这套 layout 独有的租金</h3>
+      <p>
+        V 沿 token 轴整页打包，半页无法量化，所以每层每 slot 要在 cache 之外留一个
+        BF16 页。这块内存不在 vLLM 的 KV 记账里，报毛比值等于不报它。
+      </p>
+      <table>
+        <thead><tr><th>口径</th><th class="num">tail 大小</th><th class="num">占 cache</th><th class="num">容量比</th></tr></thead>
+        <tbody>
+          <tr><td>毛（不计 tail）</td><td class="num">—</td><td class="num">—</td><td class="num">3.5583</td></tr>
+          <tr><td>实测 8 slot</td><td class="num">128 MiB</td><td class="num">0.09%</td><td class="num">3.5525</td></tr>
+          <tr class="totalrow"><td>32 slot 上限</td><td class="num">512 MiB</td><td class="num">0.34%</td><td class="num good">3.5433</td></tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <span class="lab">断言建在上限那一栏</span>
+        每 slot 16.0&nbsp;MiB，线性于 slot 数。测量时引擎只开了 8 slot，按实测报会
+        把成本少算四倍，所以门槛按 <code>MAX_SUPPORTED_SLOTS = 32</code> 的最坏情况
+        收。旧仓库正是在这里翻车过——FP4 池做成净增量，总量反而更大。
+      </div>
+    </section>
+
+    <section id="concurrency">
+      <h2><span class="n">04</span>并发：把比值花在长上下文上</h2>
+      <p class="lead">
+        3.5583 是关于 block 的数。在 65,536 的上下文上，它变成关于请求的数。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th class="num">cache tokens</th><th class="num">65,536 下装几条</th><th>batch 32 能不能跑满</th></tr></thead>
+        <tbody>
+          <tr><td>BF16</td><td class="num">1,136,512</td><td class="num">17.3</td><td class="bad">不能，必须排队</td></tr>
+          <tr><td>NVFP4</td><td class="num">4,018,176</td><td class="num good">61.3</td><td class="good">能，32 条全部返回完整输出</td></tr>
+        </tbody>
+      </table>
+      <p>
+        写成容量而不是「实测抢占了几次」，是因为抢占是调度器的决定、它腾地方的办法
+        不止一种；cache 能装多少才是这个项目改变的性质。
+      </p>
+      <div class="callout win">
+        <span class="lab">顺带越过的一道坎</span>
+        这一跑是这条路径第一次真的走到 block table 五百列宽、FP4 页偏移越过
+        2<sup>31</sup>。那个 wrap 是 quantizer 寻址里的真 bug（<code>175761c</code>
+        修的），此前只有 kernel 测试用手搭的两 GiB 张量摸到过；这次是按用户会走的
+        路走到的。
+      </div>
+      <div class="callout warn">
+        <span class="lab">为什么不是「相同显存下的最大上下文」</span>
+        原本的验收口径是这个，但这台机器上 BF16 的 cache 已经装得下模型 rope 上限
+        （131,072）的 9 倍，两条臂都会停在架构上限而不是内存上限，测出来是同一个数。
+        换成固定长上下文比并发，才是这台机器上唯一能分出胜负的口径。
+      </div>
+    </section>
+
+    <section id="accuracy">
+      <h2><span class="n">05</span>准确率：四个 bit 该掉多少</h2>
+      <p class="lead">
+        同一批 GSM8K 题、5-shot、greedy、256 新 token。前两条臂算术完全相同，
+        用来证明测量本身没问题；后两条是这台机器上仅有的两个 4-bit KV cache。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th>KV cache</th><th class="num">N=32</th><th class="num">N=200</th><th>读法</th></tr></thead>
+        <tbody>
+          <tr><td><code>FLASH_ATTN</code></td><td>BF16</td><td class="num">0.7500</td><td class="num">0.7700</td><td>基线</td></tr>
+          <tr><td><code>CUSTOM</code></td><td>BF16</td><td class="num">0.7500</td><td class="num">0.7700</td><td>与上一行 token 完全相同</td></tr>
+          <tr><td><code>CUSTOM</code></td><td class="good">NVFP4（本仓库）</td><td class="num">0.7188</td><td class="num good">0.7400</td><td>−0.0300</td></tr>
+          <tr><td><code>FLASHINFER</code></td><td>NVFP4（vLLM 自带）</td><td class="num">0.6562</td><td class="num">0.6850</td><td>−0.0850</td></tr>
+        </tbody>
+      </table>
+      <p>
+        第二条臂存在的唯一理由是证伪：它和第一条走完全相同的算术，如果 token 不是
+        逐个相同，那说明 backend 接线本身就改变了结果，后面两条臂的对比也就不成立。
+        实测 32/32 完全一致。
+      </p>
+      <div class="callout win">
+        <span class="lab">与另一个 4-bit cache 的对比</span>
+        我们比 vLLM 自带的 nvfp4 高 <strong>5.5 个点</strong>（N=200 多答对 11 题）。
+        这条对比回答了 BF16 对比回答不了的问题：多少损失是四个 bit 本身的（两边都付），
+        多少是布局的（只有一边付）。
+      </div>
+      <div class="callout warn">
+        <span class="lab">这条对比不完全公平</span>
+        FlashInfer 那条臂还把 Q 和输出一起 FP8 量化了，所以它的 8.5 个点里有一部分
+        不是 KV cache 的错。不能据此声称我们的 KV 布局强 5.5 个点。
+      </div>
+    </section>
+
+    <section id="hygiene">
+      <h2><span class="n">06</span>状态卫生：跨请求、跨步骤有没有漏东西</h2>
+      <p class="lead">
+        这套东西在请求之间不重置任何状态：tail slot 留着上一位租客的 token，slot
+        表留着它的 key 和时钟，回收的 block 留着前一个占用者的字节。这是故意的——
+        急着回收正是丢 tail 的原因——但它意味着每个请求都跑在前面请求留下的状态上。
+      </p>
+      <div class="gate-row">
+        <span class="gate-badge pass">200 / 200</span>
+        <span class="gate-desc">连续 200 个请求。同一批 100 题作为第 1–100 与第 101–200 个请求两次通过同一引擎，<strong>逐 token 完全相同</strong>。</span>
+      </div>
+      <div class="gate-row">
+        <span class="gate-badge pass">error_code 0</span>
+        <span class="gate-desc">slot 表的 sticky 错误字全程为 0。它是 sticky 的，所以结束时读一次覆盖全部 200 个请求。</span>
+      </div>
+      <div class="gate-row">
+        <span class="gate-badge pass">每 slot 多次换手</span>
+        <span class="gate-desc">在设备上用影子副本比对 key 变化来数，不读回主机，所以计数本身不扰动被计数的东西。</span>
+      </div>
+      <div class="gate-row">
+        <span class="gate-badge pass">0 次同步</span>
+        <span class="gate-desc"><code>set_sync_debug_mode</code> 只在本包代码在栈上时布防，23 个 decode step 一次没响。vLLM 自己在 sampler 里每步都同步，那不是我们的。</span>
+      </div>
+      <h3>拷贝差量</h3>
+      <p>
+        DtoH/HtoD 写成与 BF16 引擎的差量，且那条 BF16 臂走同一个 backend，所以
+        cache 精度是唯一变量：
+      </p>
+      <table>
+        <thead><tr><th>23 个 decode step</th><th class="num">DtoH</th><th class="num">HtoD</th></tr></thead>
+        <tbody>
+          <tr><td>NVFP4</td><td class="num">48</td><td class="num">52</td></tr>
+          <tr><td>BF16（同一 backend）</td><td class="num">48</td><td class="num">52</td></tr>
+          <tr class="totalrow"><td>自定义路径的增量</td><td class="num good">0</td><td class="num good">0</td></tr>
+        </tbody>
+      </table>
+      <p>
+        launch 次数也与设计一致：control 1/step、promotion 1/step、<code>write_kv</code>
+        每层一次、<code>layout.carve</code> 预热后 0/step。
+      </p>
+    </section>
+
+    <section id="speed">
+      <h2><span class="n">07</span>速度账：三条臂，两笔账</h2>
+      <p class="lead">
+        一条被服务的 NVFP4 引擎每步比 BF16 慢，而这个差里折着两笔完全不同的成本。
+        NVFP4 路径拒绝 CUDA graph capture（promotion 在 capture 下未验证，护栏只收
+        <code>CUDAGraphMode.NONE</code>），而生产上的 BF16 部署是开 graph 的。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th class="num">µs/step</th><th>是什么</th></tr></thead>
+        <tbody>
+          <tr><td>BF16 + CUDA graph</td><td class="num">3,807</td><td>BF16 部署实际跑的配置</td></tr>
+          <tr><td>BF16 eager</td><td class="num">13,695</td><td>同样的算术，去掉 graph</td></tr>
+          <tr><td>NVFP4 eager</td><td class="num">23,142</td><td>我们</td></tr>
+        </tbody>
+      </table>
+      <div class="bar-row">
+        <span>BF16 + graph</span>
+        <div class="bar-track"><div class="bar-fill mint" style="width:16.4%"></div></div>
+        <span class="num">3,807</span>
+      </div>
+      <div class="bar-row">
+        <span>BF16 eager</span>
+        <div class="bar-track"><div class="bar-fill amber" style="width:59.2%"></div></div>
+        <span class="num">13,695</span>
+      </div>
+      <div class="bar-row">
+        <span>NVFP4 eager</span>
+        <div class="bar-track"><div class="bar-fill crimson" style="width:100%"></div></div>
+        <span class="num">23,142</span>
+      </div>
+      <table>
+        <thead><tr><th>这一笔</th><th class="num">µs/step</th><th>算谁头上</th><th>怎么拿回来</th></tr></thead>
+        <tbody>
+          <tr><td>不能用 CUDA graph</td><td class="num">+9,888</td><td>不算这个项目的量化代价</td><td>做完 capture 验证</td></tr>
+          <tr><td>四个 bit</td><td class="num">+9,447</td><td class="warn">算这个项目头上</td><td>见下两节</td></tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <span class="lab">为什么没有第四条臂</span>
+        没有「BF16 走 CUSTOM backend」的延迟臂：在 <code>nvfp4</code> 以外的 cache
+        dtype 下 <code>forward</code> 第一行就 <code>return super().forward(...)</code>，
+        builder 也是 pass-through，量到的只会是一个 Python 分支。
+      </div>
+    </section>
+
+    <section id="gpu">
+      <h2><span class="n">08</span>一步 decode 的 GPU 账：+9,447 里只有 239 在这</h2>
+      <p class="lead">
+        用与速度账相同的两点差分逐 kernel 相减，得到一步 decode 的 GPU 时间。
+        这是本报告最要紧的一张表。
+      </p>
+      <table>
+        <thead><tr><th>bucket</th><th class="num">BF16 µs</th><th class="num">NVFP4 µs</th><th class="num">delta</th><th class="num">BF16 launch</th><th class="num">FP4 launch</th><th>是什么</th></tr></thead>
+        <tbody>
+          <tr><td>attention</td><td class="num">589.8</td><td class="num">381.5</td><td class="num good">−208.2</td><td class="num">64</td><td class="num">64</td><td>读 KV cache 做注意力</td></tr>
+          <tr><td>q_quant</td><td class="num">0.0</td><td class="num">201.5</td><td class="num bad">+201.5</td><td class="num">0</td><td class="num">32</td><td>把这一步的 query 量化成 FP4</td></tr>
+          <tr><td>scratch</td><td class="num">3.9</td><td class="num">196.2</td><td class="num bad">+192.4</td><td class="num">3</td><td class="num">131</td><td class="warn">给每层重新申请的临时缓冲清零</td></tr>
+          <tr><td>kv_write</td><td class="num">87.1</td><td class="num">112.1</td><td class="num">+25.0</td><td class="num">32</td><td class="num">33</td><td>把这一步的 K/V 写进 cache</td></tr>
+          <tr><td>promotion</td><td class="num">0.0</td><td class="num">10.0</td><td class="num">+10.0</td><td class="num">0</td><td class="num">2</td><td>把满页封成 FP4</td></tr>
+          <tr><td>control</td><td class="num">15.2</td><td class="num">18.4</td><td class="num">+3.3</td><td class="num">3</td><td class="num">4</td><td>slot 表与 metadata</td></tr>
+          <tr><td>gemm</td><td class="num">3,051.3</td><td class="num">3,058.1</td><td class="num">+6.8</td><td class="num">225</td><td class="num">225</td><td>模型主体 GEMM</td></tr>
+          <tr><td>model_other</td><td class="num">493.9</td><td class="num">497.2</td><td class="num">+3.3</td><td class="num">132</td><td class="num">132</td><td>RMSNorm、RoPE、SiLU、采样</td></tr>
+          <tr><td>copy</td><td class="num">10.2</td><td class="num">9.4</td><td class="num">−0.8</td><td class="num">4</td><td class="num">4</td><td>Memcpy</td></tr>
+          <tr><td>other</td><td class="num">31.9</td><td class="num">37.8</td><td class="num">+5.9</td><td class="num">10</td><td class="num">11</td><td>未归类</td></tr>
+          <tr class="totalrow"><td>GPU 合计</td><td class="num">4,283.2</td><td class="num">4,522.2</td><td class="num">+239.0</td><td class="num">473</td><td class="num">638</td><td>+5.6% GPU，+35% launch</td></tr>
+        </tbody>
+      </table>
+      <div class="callout win">
+        <span class="lab">attention 自己是赚的</span>
+        FP4 attention 381.5&nbsp;µs 对 BF16 FA4 的 589.8&nbsp;µs，<strong>快
+        208.2&nbsp;µs</strong>，时间比 0.647。拆开正好是 FP4 decode kernel 本体
+        307.0&nbsp;µs（32 次）加 split-K combine 74.2&nbsp;µs（32 次）。少搬 3.56 倍
+        的字节，确实换成了时间——项目的前提是成立的。
+      </div>
+      <div class="callout fail">
+        <span class="lab">但两笔支出把它吃掉了</span>
+        <strong>query 量化 201.5&nbsp;µs</strong> 和 <strong>临时缓冲清零
+        196.2&nbsp;µs</strong>，合计 397.7&nbsp;µs，正好抹平 attention 省下的 208
+        还倒欠。第二笔是纯浪费：<code>quantize_query</code> 每次调用都
+        <code>torch.zeros</code> 出两个新张量，一层一次、一步 32 层，于是每步多出
+        <strong>128 次</strong> fill launch——占了全部 165 次额外 launch 的四分之三。
+      </div>
+      <div class="callout info">
+        <span class="lab">这张表可信到什么程度</span>
+        GPU 时间是在 profiler 下测的，会略微偏高。一个自检：BF16+graph 那条臂不带
+        profiler 的 wall 是 3,807&nbsp;µs，而这里给 BF16 记的 GPU 合计是
+        4,283&nbsp;µs——graph 下 wall 应当约等于 GPU 时间，两者差 12%，这就是这张表
+        的误差量级。它不影响结论：239 与 9,447 差着一个半数量级。
+      </div>
+    </section>
+
+    <section id="host">
+      <h2><span class="n">09</span>剩下的 97.5% 在 host</h2>
+      <p class="lead">
+        把 GPU 账放回墙钟里。两条臂的 wall 来自不带 profiler 的速度账，GPU 来自上一节，
+        差额就是 host 没能跑在设备前面的时间。
+      </p>
+      <table>
+        <thead><tr><th>臂</th><th class="num">wall µs</th><th class="num">GPU µs</th><th class="num">host gap</th><th class="num">gap 占比</th><th class="num">launch</th><th class="num">µs/launch</th></tr></thead>
+        <tbody>
+          <tr><td>BF16 eager</td><td class="num">13,695</td><td class="num">4,283</td><td class="num">9,412</td><td class="num">68.7%</td><td class="num">473</td><td class="num">19.9</td></tr>
+          <tr><td>NVFP4 eager</td><td class="num">23,142</td><td class="num">4,522</td><td class="num">18,620</td><td class="num">80.5%</td><td class="num">638</td><td class="num">29.2</td></tr>
+          <tr class="totalrow"><td>delta</td><td class="num">+9,447</td><td class="num">+239</td><td class="num bad">+9,208</td><td class="num">97.5%</td><td class="num">+165</td><td class="num">—</td></tr>
+        </tbody>
+      </table>
+      <div class="diagram">一步 decode，按时间轴摊开（BF16 eager 对 NVFP4 eager）
+
+BF16   ├─ host 9,412 µs ─────────────────────────┤├ GPU 4,283 ┤   = 13,695
+FP4    ├─ host 18,620 µs ─────────────────────────────────────┤├ GPU 4,522 ┤   = 23,142
+                          ↑
+                  多出来的 9,208 µs 全在这一段，
+                  而 GPU 那一段只长了 239 µs
+
+作为对照，BF16 + CUDA graph = 3,807 µs，host 段几乎消失。</div>
+      <p>
+        两条臂的 host 段都远大于 GPU 段——<strong>eager 模式下 vLLM 自己就有
+        68.7% 的时间不在 GPU 上</strong>。我们把这个比例推到 80.5%：既因为 launch
+        多了 35%（473 → 638），也因为每次 launch 更贵（19.9 → 29.2&nbsp;µs 平均）。
+      </p>
+      <h3>host 时间去哪了</h3>
+      <p>
+        再采一组带 CPU 记录的 profile 做归因。绝对值被 profiler 抬高了（NVFP4 的
+        wall 从 23,142 变成 30,288，BF16 从 13,695 变成 16,394），所以下表只能当
+        <strong>排序和占比</strong>读，不能当绝对时间读。
+      </p>
+      <table>
+        <thead><tr><th>Self-CPU scope</th><th class="num">BF16 µs</th><th class="num">NVFP4 µs</th><th class="num">delta</th><th class="num">占 delta</th><th>是什么</th></tr></thead>
+        <tbody>
+          <tr><td><code>vllm::unified_attention_with_output</code></td><td class="num">3,517</td><td class="num">10,449</td><td class="num bad">+6,932</td><td class="num">56.8%</td><td>我们 <code>forward</code> 里的 Python / CuTeDSL 前端，不含任何子算子</td></tr>
+          <tr><td><code>vllm::unified_kv_cache_update</code></td><td class="num">590</td><td class="num">2,403</td><td class="num">+1,813</td><td class="num">14.8%</td><td><code>write_kv</code>、control、promotion 的主机侧</td></tr>
+          <tr><td>CUDA launch API</td><td class="num">2,232</td><td class="num">3,403</td><td class="num">+1,171</td><td class="num">9.6%</td><td>469 → 634 次调用，与 kernel launch 数一致</td></tr>
+          <tr><td><code>aten::empty/zeros/fill_</code></td><td class="num">587</td><td class="num">1,593</td><td class="num">+1,006</td><td class="num">8.2%</td><td>上一节那 128 次清零的主机侧</td></tr>
+          <tr class="totalrow"><td>Self-CPU 合计</td><td class="num">11,366</td><td class="num">23,580</td><td class="num">+12,214</td><td class="num">89.4%</td><td>四项合计解释了 delta 的 89.4%</td></tr>
+        </tbody>
+      </table>
+      <div class="callout fail">
+        <span class="lab">头号支出</span>
+        <code>unified_attention_with_output</code> 的 <strong>self</strong> CPU 时间
+        （PyTorch profiler 的 self 不含被记录的子算子，所以这是纯前端时间）多了
+        6,932&nbsp;µs，占 host delta 的 56.8%。把这个占比套回不带 profiler 的
+        9,208&nbsp;µs，约合 <strong>5.2&nbsp;ms/step</strong>——一步里最大的一笔，
+        而它一行 GPU 代码都不是。
+      </div>
+      <div class="callout info">
+        <span class="lab">和上一代实现比，这个病轻了两个数量级</span>
+        旧仓库的同类报告里，64 个 decode token 花了 586.96 秒而所有 CUDA kernel
+        合计只有 389.29 毫秒，wall / Self-CUDA ≈ <strong>1,508×</strong>。这里
+        NVFP4 是 <strong>5.12×</strong>，BF16 eager 自己是 3.20×，BF16+graph 是
+        0.89×（即已经是 GPU-bound）。同一个病，但从「不可用」变成「与 vLLM 自身
+        eager 开销同一量级」。
+      </div>
+    </section>
+
+    <section id="kernel">
+      <h2><span class="n">10</span>kernel 层：单看 kernel 我们快一倍</h2>
+      <p class="lead">
+        另一条轴。<code>docs/reports/1.decode-baseline-comparison.md</code> 在 47 个
+        配置上把这个 FP4 decode kernel 和 FA4 BF16 单独对拍过，双方都拿已经量化好的
+        输入，用 CUDA graph replay 计时，不含 host dispatch。
+      </p>
+      <table>
+        <thead><tr><th>配置</th><th class="num">group</th><th class="num">我们峰值 TB/s</th><th class="num">FA4 峰值 TB/s</th><th class="num">vs FA4 时间比</th></tr></thead>
+        <tbody>
+          <tr><td>MHA 32:32</td><td class="num">1</td><td class="num">6.58</td><td class="num">6.61</td><td class="num good">0.304</td></tr>
+          <tr><td class="good">GQA 32:8（本文的模型）</td><td class="num">4</td><td class="num">5.55</td><td class="num">6.53</td><td class="num good">0.380</td></tr>
+          <tr><td>GQA 32:4</td><td class="num">8</td><td class="num">4.13</td><td class="num">6.57</td><td class="num">0.474</td></tr>
+          <tr><td>MQA 32:1</td><td class="num">32</td><td class="num">1.52</td><td class="num">6.33</td><td class="num warn">0.907</td></tr>
+          <tr class="totalrow"><td>全部 47 个配置</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">0.476 几何平均</td></tr>
+        </tbody>
+      </table>
+      <p>
+        FA4 那一列几乎是水平的，它把这台机器的 DRAM 天花板标在 6.33–6.61&nbsp;TB/s，
+        与 head 配置无关。这给了一把绝对的尺子：NVFP4 每 token-head 搬 144 字节、
+        BF16 搬 512 字节，所以一个跑满带宽的 FP4 kernel 相对 FA4 的时间比应该是
+        <strong>0.281</strong>。
+      </p>
+      <div class="callout warn">
+        <span class="lab">本文最值得记住的一处反差</span>
+        隔离测：我们的 kernel 是 FA4 BF16 的 <strong>0.380</strong> 倍时间（快 2.6 倍）。<br>
+        引擎内：同一个 kernel 是 BF16 attention 的 <strong>0.647</strong> 倍（快 1.5 倍）。<br>
+        端到端：整步是 BF16 eager 的 <strong>1.69</strong> 倍（慢 69%）。<br>
+        每往外走一层，优势就被上一层的开销吃掉一截，最后翻成劣势。<strong>慢从来不在
+        kernel 里。</strong>
+      </div>
+      <p>
+        隔离的 0.380 与引擎内的 0.647 之间的差距不是矛盾，是口径不同：引擎内这一栏
+        含 split-K combine（74.2 µs），而且这里的序列只有约 1,000–1,288 token，远短于
+        对拍网格的 4,096–65,536。序列越短，kernel 越是被 setup 而不是被带宽支配。
+      </p>
+    </section>
+
+    <section id="limits">
+      <h2><span class="n">11</span>边界与下一步</h2>
+      <h3>本报告确立了什么</h3>
+      <ul>
+        <li>内存目标达成，且扣掉 tail buffer 之后仍然达成（3.5433 净，按 32 slot 上限）。</li>
+        <li>把比值花在长上下文上是真的：65,536 下 61.3 条对 17.3 条，32 路全部返回。</li>
+        <li>四个 bit 的准确率代价是 3.0 个点，比同机唯一的另一个 4-bit cache 好 5.5 个点。</li>
+        <li>没有跨请求污染，没有自定义的 host 同步与拷贝增量。</li>
+        <li>每步慢的 9,447&nbsp;µs 里，GPU 只占 239&nbsp;µs（2.5%），attention kernel 自身反而快 208&nbsp;µs。</li>
+      </ul>
+      <h3>没解决的，按性价比排序</h3>
+      <table>
+        <thead><tr><th>#</th><th>问题</th><th class="num">量级</th><th>做法</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="num">1</td>
+            <td>attention wrapper 的 Python/CuTeDSL 前端</td>
+            <td class="num">≈5.2 ms/step</td>
+            <td>host delta 的 56.8%，最大的一笔。需要先做单变量分解，确认是 CuTeDSL 调用约定还是我们自己的参数编排。</td>
+          </tr>
+          <tr>
+            <td class="num">2</td>
+            <td><code>quantize_query</code> 每层重新分配并清零缓冲</td>
+            <td class="num">196 µs GPU<br>128 launch/step</td>
+            <td class="good">最便宜的一项：改成 persistent scratch。占全部额外 launch 的四分之三，GPU 与 host 两头都省。</td>
+          </tr>
+          <tr>
+            <td class="num">3</td>
+            <td>CUDA graph capture 未验证</td>
+            <td class="num">9,888 µs/step</td>
+            <td>单独一笔、与量化无关，但它是三条臂里最大的一个数。promotion 已谓词化，还需验证 buffer 地址与 launch 稳定性。</td>
+          </tr>
+          <tr>
+            <td class="num">4</td>
+            <td>kernel 在 group size 大时塌陷</td>
+            <td class="num">MQA 0.907</td>
+            <td>与本文模型（group 4）无关，但决定这套东西能否用在 MQA 模型上。</td>
+          </tr>
+          <tr>
+            <td class="num">5</td>
+            <td>FP4 → BF16 dequant kernel 缺失</td>
+            <td class="num">—</td>
+            <td>它挡着 chunked prefill、prefix caching、多轮，也就挡着接训练侧 rollout。不是性能项，是功能项。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <span class="lab">下一个受控实验</span>
+        先做第 2 项，因为它便宜且可证伪：改成 persistent scratch 之后，
+        每步 launch 应当从 638 掉到约 510，GPU 从 4,522 掉到约 4,326，
+        wall 应当掉多于 196&nbsp;µs（因为还省了主机侧的分配）。如果 wall 不动，
+        说明 host gap 不是按 launch 数线性的，第 1 项的归因就要重做。
+      </div>
+      <h3>这份报告不能说明什么</h3>
+      <ul>
+        <li>只测了一个模型（Llama-3.1-8B，GQA 32:8）。group size 变了 kernel 那一侧的结论就会变。</li>
+        <li>延迟只在 batch 8 / prompt 1,000 上测过。host gap 按步长固定，batch 越大它被摊得越薄，所以大 batch 下劣势应当收窄——没有测。</li>
+        <li>准确率 N=200 的差分标准差约 0.03，所以 3.0 个点这个数本身就在一倍标准差上，只能说「小」，不能说「精确等于 3.0」。</li>
+        <li>CPU 归因那张表是在 profiler 下采的，只当排序读。</li>
+      </ul>
+    </section>
+
+    <section id="artifacts">
+      <h2><span class="n">12</span>复现</h2>
+      <pre><span class="com"># 引擎层的全部数字（内存、并发、准确率、周转、稳态、速度账）</span>
+<span class="cmd">bash scripts/run_tests.sh e2e -- -s -k "kv_cache_memory or long_context or \
+  speed_account or request_turnover or steady_state"</span>
+
+<span class="com"># 四条臂的 GSM8K，N=200</span>
+<span class="cmd">NVFP4_GSM8K_N=200 bash scripts/run_tests.sh e2e -- -s -k vllm_integration</span>
+
+<span class="com"># 配对 profile：两条臂各一张卡，同时跑</span>
+<span class="cmd">CUDA_VISIBLE_DEVICES=0 python tests/kernel_profile/profile_engine.py \
+  --arm nvfp4 --out /tmp/prof_nvfp4.json
+CUDA_VISIBLE_DEVICES=1 python tests/kernel_profile/profile_engine.py \
+  --arm bf16  --out /tmp/prof_bf16.json</span>
+
+<span class="com"># 归类成上面第 08 节那张表，并对回墙钟</span>
+<span class="cmd">python tests/kernel_profile/compare_engine.py /tmp/prof_nvfp4.json /tmp/prof_bf16.json</span>
+
+<span class="com"># host 归因（第 09 节下半张表），--host 会抬高 wall，只读排序</span>
+<span class="cmd">python tests/kernel_profile/profile_engine.py --arm nvfp4 --host --out /tmp/host_nvfp4.json</span>
+
+<span class="ok">73 kernel + 111 e2e + 4 soak passed</span></pre>
+      <table>
+        <thead><tr><th>相关文档</th><th>讲什么</th></tr></thead>
+        <tbody>
+          <tr><td><code>docs/tasks/1.vllm_v1_design.md</code></td><td>设计与逐阶段验收，本文所有引擎层数字的出处（§9.10）。</td></tr>
+          <tr><td><code>docs/reports/1.decode-baseline-comparison.md</code></td><td>kernel 层横向对拍：本仓库 vs trtllm-gen vs FlashInfer FA2 vs FA4 BF16，47 个配置。</td></tr>
+          <tr><td><code>docs/tasks/2.fp4_decode_speedup.md</code></td><td>kernel 侧提速计划，group size 塌陷的根因分析。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer class="foot">
+      NVFP4 KV cache vs BF16 vLLM · 全部数字为实测 · Llama-3.1-8B-Instruct · SM100 · 2026-08-01
+    </footer>
+  </main>
+</div>
+</body>
+</html>
