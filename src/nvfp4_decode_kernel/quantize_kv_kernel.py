@@ -270,13 +270,13 @@ def _launch_key_pages(
     scale_bases_ptr,
     pages_shape: Tuple[Int32, Int32, Int32, Int32],
     pages_strides: Tuple[Int32, Int32, Int32, Int32],
-    fp4_shape: Tuple[Int32, Int32, Int32, Int32],
-    fp4_strides: Tuple[Int32, Int32, Int32, Int32],
+    fp4_shape: Tuple[Int64, Int64, Int64, Int64],
+    fp4_strides: Tuple[Int64, Int64, Int64, Int64],
     scales_shape: Tuple[
-        Int32, Int32, Int32, Int32, Int32, Int32, Int32
+        Int64, Int64, Int64, Int64, Int64, Int64, Int64
     ],
     scales_strides: Tuple[
-        Int32, Int32, Int32, Int32, Int32, Int32, Int32
+        Int64, Int64, Int64, Int64, Int64, Int64, Int64
     ],
     heads: cutlass.Constexpr[int],
     work: Int32,
@@ -326,13 +326,13 @@ def _launch_value_pages(
     scale_bases_ptr,
     pages_shape: Tuple[Int32, Int32, Int32, Int32],
     pages_strides: Tuple[Int32, Int32, Int32, Int32],
-    fp4_shape: Tuple[Int32, Int32, Int32, Int32],
-    fp4_strides: Tuple[Int32, Int32, Int32, Int32],
+    fp4_shape: Tuple[Int64, Int64, Int64, Int64],
+    fp4_strides: Tuple[Int64, Int64, Int64, Int64],
     scales_shape: Tuple[
-        Int32, Int32, Int32, Int32, Int32, Int32, Int32
+        Int64, Int64, Int64, Int64, Int64, Int64, Int64
     ],
     scales_strides: Tuple[
-        Int32, Int32, Int32, Int32, Int32, Int32, Int32
+        Int64, Int64, Int64, Int64, Int64, Int64, Int64
     ],
     heads: cutlass.Constexpr[int],
     work: Int32,
@@ -607,10 +607,15 @@ def _compile_and_launch(
         Int32(value)
         for value in (token_stride, token_stride) + pages.stride()[1:]
     )
-    fp4_shape = tuple(Int32(value) for value in pages_fp4.shape)
-    fp4_strides = tuple(Int32(value) for value in pages_fp4.stride())
-    scales_shape = tuple(Int32(value) for value in scales.shape)
-    scales_strides = tuple(Int32(value) for value in scales.stride())
+    # 64-bit on the destination side only. A page index times a block pitch
+    # passes 2^31 at 14563 blocks, which is 2 GiB of a cache that a served
+    # model sizes in the hundreds; the wrapped offset then writes somewhere
+    # else entirely. The source is a batch of activations or one layer's tail,
+    # neither of which comes close.
+    fp4_shape = tuple(Int64(value) for value in pages_fp4.shape)
+    fp4_strides = tuple(Int64(value) for value in pages_fp4.stride())
+    scales_shape = tuple(Int64(value) for value in scales.shape)
+    scales_strides = tuple(Int64(value) for value in scales.stride())
     tensor_args = (
         pages_ptr,
         fp4_ptr,

@@ -262,6 +262,47 @@ def test_a_base_table_sends_each_layer_to_its_own_allocation(direction):
             )
 
 
+def test_a_page_more_than_two_gibibytes_in_is_still_the_right_page():
+    """A block index times a block pitch has to be computed in 64 bits.
+
+    In 32 it wraps at 14563 blocks, which is 2 GiB — a served cache is sized
+    in the hundreds of those, and every block past the first 2 GiB would be
+    written somewhere else. The pitch here is a real NVFP4 block, and the page
+    is the first one whose byte offset does not fit, so this fails the moment
+    any index in the destination narrows again.
+    """
+    pitch = 100 * 1024
+    page = 2**31 // pitch + 1
+    blocks = page + 1
+    needed = blocks * pitch
+    free, _ = torch.cuda.mem_get_info()
+    if needed > free // 2:
+        pytest.skip(f"{needed >> 30} GiB of destination does not fit")
+
+    cache = torch.zeros(blocks, pitch, dtype=torch.uint8, device="cuda")
+    packed = cache.as_strided(
+        (blocks, PAGE_SIZE, HEADS, HEAD_DIM // 2),
+        (pitch, HEADS * HEAD_DIM // 2, HEAD_DIM // 2, 1),
+        0,
+    )
+    scales = cache.as_strided(
+        (blocks, 32, 4, 1, 4, 2, HEADS),
+        (pitch, 16, 4, 1024, 1, 512, 1024),
+        PAGE_SIZE * HEADS * HEAD_DIM // 2,
+    )
+
+    tokens = _tokens(PAGE_SIZE)
+    quantize_key_tokens_into(
+        tokens, packed, scales, _as_int32([0]), _as_int32([page])
+    )
+    expected_packed, expected_scales = quantize_key_pages(tokens.unsqueeze(0))
+
+    assert torch.equal(packed[page], expected_packed[0])
+    assert torch.equal(
+        scales[page].view(torch.float8_e4m3fn), expected_scales[0]
+    )
+
+
 def test_a_source_that_does_not_divide_into_layers_is_refused():
     """The per-layer source stride comes from the buffer, so it must divide.
 
