@@ -1053,6 +1053,99 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
     assert torch.equal(returned[:rows], allocated)
 
 
+@pytest.mark.parametrize(
+    "pages, wants_split",
+    [(1, False), (64, True)],
+    ids=["single-tile", "split-k"],
+)
+@pytest.mark.parametrize(
+    "damage, complaint",
+    [
+        ("dtype", "out must be contiguous BF16"),
+        ("short", "out needs at least 2 rows"),
+        ("heads", "out must be contiguous BF16"),
+    ],
+)
+def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
+    pages: int,
+    wants_split: bool,
+    damage: str,
+    complaint: str,
+) -> None:
+    """The ``out`` contract holds on the split path too.
+
+    ``_kernel.py`` checks a split dispatch by calling ``decode_fp4`` with
+    ``validate_only``, so those checks are all that stands between a caller's
+    mistake and a silent write into the wrong buffer: split-K hands ``out``
+    to the combine, which will happily truncate a short one or accept a
+    wrongly shaped one.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    from nvfp4_decode_kernel import _decode
+
+    torch.manual_seed(0x0BAD)
+    rows, heads_q, heads_kv, head_dim = 2, 16, 1, 128
+    query = torch.randn(
+        rows, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        pages,
+        _PAGE_SIZE,
+        heads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    page_table = torch.arange(
+        pages, device="cuda", dtype=torch.int32
+    ).repeat(rows, 1)
+    seqused_fp4 = torch.full(
+        (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
+    )
+
+    # Naming a case "split-k" does not make it one, and a rejection on the
+    # single-tile path would look exactly the same.
+    sms = torch.cuda.get_device_properties(
+        query.device
+    ).multi_processor_count
+    splits = _decode.split_k_heuristic(rows, heads_kv, pages, sms=sms)
+    assert (splits > 1) is wants_split, (
+        f"{pages} pages on {sms} SMs was meant to reach "
+        f"{'split-K' if wants_split else 'the single tile'}, but the "
+        f"heuristic chose {splits} splits"
+    )
+
+    shape = {
+        "dtype": (rows, heads_q, head_dim),
+        "short": (rows - 1, heads_q, head_dim),
+        "heads": (rows, heads_q + 1, head_dim),
+    }[damage]
+    out = torch.zeros(
+        shape,
+        device="cuda",
+        dtype=torch.float16 if damage == "dtype" else torch.bfloat16,
+    )
+
+    with pytest.raises(ValueError, match=complaint):
+        fp4_decode(
+            query,
+            key_pages_fp4,
+            key_scales,
+            value_pages_fp4,
+            value_scales,
+            page_table,
+            seqused_fp4,
+            out=out,
+        )
+
+
 def test_prequantized_query_contract_rejects_partial_or_ambiguous_inputs(
     contract_decode_inputs: ContractDecodeInputs,
 ) -> None:

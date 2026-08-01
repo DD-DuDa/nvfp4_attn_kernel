@@ -171,6 +171,8 @@ def fp4_decode_impl(
             seqused_residual=seqused_residual,
             has_bf16=has_bf16,
             softmax_scale=softmax_scale,
+            out=out,
+            out_indices=out_indices,
             trusted_metadata=trusted_metadata,
             validate_only=True,
         )

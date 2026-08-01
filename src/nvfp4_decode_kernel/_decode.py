@@ -808,10 +808,9 @@ def decode_fp4(
             "has_bf16 requires the BF16 residual cache arguments"
         )
 
-    if validate_only:
-        return None
-
-    packed_query_scales = query_scales
+    # These run before the validate_only exit because the split dispatcher in
+    # _kernel.py borrows this function for its contract checks and then writes
+    # into the same caller buffer, where nothing else would catch a bad out.
     if out is None and out_indices is not None:
         raise ValueError("out_indices needs the out it indexes into")
     if out is not None:
@@ -849,6 +848,12 @@ def decode_fp4(
                     (out_indices < 0) | (out_indices >= out.shape[0]),
                     "out_indices contains an out-of-range output row",
                 )
+
+    if validate_only:
+        return None
+
+    packed_query_scales = query_scales
+    if out is not None:
         # A scatter needs every row it might land on; without one the kernel
         # sizes its grid from this, so it must be exactly the batch.
         output_4d = (out if out_indices is not None else out[:rows]).unsqueeze(
