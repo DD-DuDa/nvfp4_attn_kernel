@@ -21,6 +21,7 @@ write instead.
 from __future__ import annotations
 
 import torch
+from nvfp4_decode_kernel import RESIDUAL_ROW_TILE
 
 from . import layout
 
@@ -54,14 +55,13 @@ class LayerRuntime:
             shape, dtype=torch.bfloat16, device=device
         )
 
-        # The residual MMA reads the query through a page-tall tile of which
-        # decode fills only the first row. Zeroed once here and never again:
-        # the quantizer writes row 0 and nothing writes the rest, so the
-        # padding stays valid for the life of the process. Shared by every
-        # layer, since a layer is done with it before the next one runs.
+        # Zeroed once here and never again, which is the contract fp4_decode
+        # asks of a caller-owned buffer: the quantizer writes row 0 of each
+        # tile and nothing writes the rest. Shared by every layer, since a
+        # layer is done with it before the next one runs.
         self.query_padded = torch.zeros(
             num_slots,
-            PAGE_SIZE,
+            RESIDUAL_ROW_TILE,
             num_heads,
             head_dim,
             dtype=torch.bfloat16,

@@ -812,12 +812,10 @@ def decode_fp4(
         return None
 
     packed_query_scales = query_scales
-    use_out_indices = out is not None or out_indices is not None
-    if use_out_indices and (out is None or out_indices is None):
-        raise ValueError("out and out_indices must be provided together")
-    if out is not None and out_indices is not None:
+    if out is None and out_indices is not None:
+        raise ValueError("out_indices needs the out it indexes into")
+    if out is not None:
         _require_cuda_tensor(out, "out", device=device)
-        _require_cuda_tensor(out_indices, "out_indices", device=device)
         if (
             out.dtype is not torch.bfloat16
             or out.ndim != 3
@@ -828,20 +826,34 @@ def decode_fp4(
                 "out must be contiguous BF16 with shape "
                 "[output_rows, heads_q, 128]"
             )
-        if (
-            out_indices.dtype is not torch.int32
-            or tuple(out_indices.shape) != (rows,)
-            or not out_indices.is_contiguous()
-        ):
-            raise ValueError(
-                "out_indices must be contiguous INT32 with shape [rows]"
-            )
-        if not trusted_metadata:
-            _check_device_values(
-                (out_indices < 0) | (out_indices >= out.shape[0]),
-                "out_indices contains an out-of-range output row",
-            )
-        output_4d = out.unsqueeze(1)
+        if out_indices is None:
+            # Row i of the batch lands in row i of out, so out cannot be
+            # shorter than the batch.
+            if out.shape[0] < rows:
+                raise ValueError(
+                    f"out needs at least {rows} rows when no out_indices say "
+                    f"where they go, found {out.shape[0]}"
+                )
+        else:
+            _require_cuda_tensor(out_indices, "out_indices", device=device)
+            if (
+                out_indices.dtype is not torch.int32
+                or tuple(out_indices.shape) != (rows,)
+                or not out_indices.is_contiguous()
+            ):
+                raise ValueError(
+                    "out_indices must be contiguous INT32 with shape [rows]"
+                )
+            if not trusted_metadata:
+                _check_device_values(
+                    (out_indices < 0) | (out_indices >= out.shape[0]),
+                    "out_indices contains an out-of-range output row",
+                )
+        # A scatter needs every row it might land on; without one the kernel
+        # sizes its grid from this, so it must be exactly the batch.
+        output_4d = (out if out_indices is not None else out[:rows]).unsqueeze(
+            1
+        )
     else:
         output_4d = torch.empty(
             rows,
@@ -979,6 +991,7 @@ def decode_fp4_split(
     residual_page_ids: torch.Tensor | None = None,
     seqused_residual: torch.Tensor | None = None,
     has_bf16: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run split-K decode, with an optional residual tail, and combine partials."""
     if num_splits <= 1:
@@ -998,6 +1011,7 @@ def decode_fp4_split(
             seqused_residual=seqused_residual,
             has_bf16=has_bf16,
             softmax_scale=softmax_scale,
+            out=out,
         )
 
     # Reuse the core validator before allocating the split workspace.
@@ -1017,10 +1031,17 @@ def decode_fp4_split(
         (seqused_fp4, "seqused_fp4"),
     ):
         _require_cuda_tensor(tensor, name, device=device)
-    # A split that owns no page leaves its slice of this untouched, and the
-    # combine still reads it, scaled by the zero its -inf LSE produces. Zero
-    # times a leftover infinity is a NaN, so what the allocator happened to
-    # hand back would decide whether the answer survives.
+    # Both of these have to start defined, because the combine reads splits it
+    # was never given work for. It accumulates over the contiguous prefix
+    # [0, max_valid_split], and takes that bound as the longest of the rows a
+    # thread happens to own — so a short row batched with a long one is walked
+    # across splits that never wrote its output, each weighted by the zero its
+    # -inf LSE produces. Zero times a leftover infinity is a NaN, which would
+    # leave the answer up to what the allocator last put there.
+    #
+    # The kernel does write every LSE slot, so -inf here is the belt to that
+    # brace; it is also what the combine reads as "this split contributed
+    # nothing", which is why it rather than zero.
     output_partial = torch.zeros(
         num_splits,
         rows,
@@ -1030,10 +1051,6 @@ def decode_fp4_split(
         dtype=torch.float32,
         device=device,
     )
-    # -inf is what a split with no work publishes, and it is what the combine
-    # reads as "this split contributes nothing". Starting from it means a slot
-    # nobody wrote is indistinguishable from an empty one, rather than being
-    # whatever the allocator last left in that block.
     lse_partial = torch.full(
         (num_splits, rows, heads_q, 1),
         float("-inf"),
@@ -1139,6 +1156,9 @@ def decode_fp4_split(
     output, _ = flash_attn_combine(
         output_partial,
         lse_partial.transpose(-1, -2),
+        # The combine carries the single-token axis the partials have, so a
+        # caller's [rows, heads, dim] buffer is viewed with it put back.
+        out=None if out is None else out[:rows].unsqueeze(1),
         out_dtype=torch.bfloat16,
         return_lse=False,
     )

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from flash_attn.cute import flash_attn_func
 from nvfp4_decode_kernel import _quantize
-from nvfp4_decode_kernel import fp4_decode
+from nvfp4_decode_kernel import RESIDUAL_ROW_TILE, fp4_decode
 
 
 FP4_MIN_COSINE = 0.99
@@ -1119,17 +1119,15 @@ def test_query_padded_scratch_matches_internal_allocation(
     # max_num_seqs and reuses it for whatever the step happens to bring.
     scratch = torch.zeros(
         rows + 5,
-        128,
+        RESIDUAL_ROW_TILE,
         inputs.query.shape[1],
         inputs.query.shape[2],
         dtype=torch.bfloat16,
         device=inputs.query.device,
     )
-    with torch.no_grad():
-        allocated = fp4_decode(inputs.query, **call)
-        first = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
-        second = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
-    torch.cuda.synchronize()
+    allocated = fp4_decode(inputs.query, **call)
+    first = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
+    second = fp4_decode(inputs.query, **call, query_padded_scratch=scratch)
     assert torch.equal(first, allocated)
     assert torch.equal(second, allocated)
     assert not scratch[:, 1:].any()
@@ -1149,26 +1147,25 @@ def test_query_padded_scratch_is_validated(
         )
 
     for wrong in (
-        buffer(rows - 1, 128, heads, head_dim),
-        buffer(rows, 64, heads, head_dim),
-        buffer(rows, 128, heads - 1, head_dim),
+        buffer(rows - 1, RESIDUAL_ROW_TILE, heads, head_dim),
+        buffer(rows, RESIDUAL_ROW_TILE // 2, heads, head_dim),
+        buffer(rows, RESIDUAL_ROW_TILE, heads - 1, head_dim),
     ):
         with pytest.raises(ValueError, match="query_padded_scratch"):
             fp4_decode(inputs.query, **call, query_padded_scratch=wrong)
 
-    compact_query = inputs.query.index_select(
-        0, inputs.query_row_indices.long()
-    )
-    query_fp4, query_scales = _quantize.quantize_query(
-        compact_query, heads_kv=inputs.key_pages_fp4.shape[2]
-    )
+    # The FP4-query path rejects a scratch before it looks at the query, so
+    # placeholders are enough and a real quantize would only cost time.
     del call["query_row_indices"]
+    placeholder = torch.empty(0, device=inputs.query.device)
     with pytest.raises(ValueError, match="query_padded_scratch applies only"):
         fp4_decode(
             **call,
-            query_fp4=query_fp4,
-            query_scales=query_scales,
-            query_padded_scratch=buffer(rows, 128, heads, head_dim),
+            query_fp4=placeholder,
+            query_scales=placeholder,
+            query_padded_scratch=buffer(
+                rows, RESIDUAL_ROW_TILE, heads, head_dim
+            ),
         )
 
 

@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import torch
 
-
-# Rows of the tile the residual MMA reads the BF16 query through. Only row 0 of
-# each tile holds a real query, since decode has one token per row.
-_RESIDUAL_ROW_TILE = 128
+from .interface import RESIDUAL_ROW_TILE
 
 
 def _padded_query_buffer(
@@ -17,34 +14,35 @@ def _padded_query_buffer(
 ) -> torch.Tensor:
     """The BF16 query padded to the residual MMA's row tile.
 
-    The quantizer writes only ``[row, 0, head, :]``, so the rest of each tile
-    has to be zero. A freshly allocated buffer gets that from ``zeros``; a
-    caller-owned one has to have been zeroed when it was created, and stays
-    valid forever because nothing ever writes those positions.
+    Deliberately not cached here. A framework that sizes its KV cache from the
+    memory left over after a profiling run — vLLM does — would find a buffer
+    grown on a later call coming out of memory already promised to the cache.
+    Leaving the allocation to the caller lets it happen during profiling, at
+    the price of the contract ``fp4_decode`` documents: zeroed once, because
+    the quantizer writes ``[row, 0, head, :]`` and nothing writes the rest.
     """
     heads, head_dim = query.shape[1], query.shape[2]
     if scratch is None:
         return torch.zeros(
             rows,
-            _RESIDUAL_ROW_TILE,
+            RESIDUAL_ROW_TILE,
             heads,
             head_dim,
             dtype=torch.bfloat16,
             device=query.device,
         )
-    expected = (_RESIDUAL_ROW_TILE, heads, head_dim)
     if (
         scratch.dtype is not torch.bfloat16
         or scratch.device != query.device
         or scratch.ndim != 4
         or scratch.shape[0] < rows
-        or tuple(scratch.shape[1:]) != expected
+        or tuple(scratch.shape[1:]) != (RESIDUAL_ROW_TILE, heads, head_dim)
         or not scratch.is_contiguous()
     ):
         raise ValueError(
             "query_padded_scratch must be a contiguous BF16 tensor on the "
-            f"query's device shaped [at least {rows}, "
-            f"{', '.join(str(extent) for extent in expected)}]"
+            f"query's device shaped [at least {rows}, {RESIDUAL_ROW_TILE}, "
+            f"{heads}, {head_dim}]"
         )
     return scratch[:rows]
 
@@ -141,9 +139,11 @@ def fp4_decode_impl(
         all(argument is None for argument in residual_arguments)
         and has_bf16 is None
     ) or (complete_residual and query_padded_bf16 is not None)
-    direct_scatter = out is not None or out_indices is not None
+    # Only a scatter by index forces the single-tile path; the split path can
+    # write into a caller's buffer, it just cannot reorder rows on the way.
+    scatter_by_index = out_indices is not None
     num_splits = 1
-    if splittable and not direct_scatter:
+    if splittable and not scatter_by_index:
         device = query_fp4.device
         num_splits = split_k_heuristic(
             query_fp4.shape[0],
@@ -191,6 +191,7 @@ def fp4_decode_impl(
             residual_page_ids=residual_page_ids,
             seqused_residual=seqused_residual,
             has_bf16=has_bf16,
+            out=out,
         )
 
     return decode_fp4(

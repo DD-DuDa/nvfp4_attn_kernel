@@ -5,6 +5,11 @@ from __future__ import annotations
 import torch
 
 
+# Rows of the tile the residual MMA reads the BF16 query through. Only row 0 of
+# each tile holds a real query, since decode has one token per row.
+RESIDUAL_ROW_TILE = 128
+
+
 class KernelNotAvailableError(RuntimeError):
     """Raised when the kernel implementation has not been installed."""
 
@@ -61,22 +66,23 @@ def fp4_decode(
             ``head_dim**-0.5`` when omitted.
         query_row_indices: Optional INT32 mapping from compact decode rows to
             rows in a full 3-D query tensor.
-        out: Optional full BF16 output tensor in ``[rows, heads_q, head_dim]``
-            layout. It must be supplied together with ``out_indices``.
+        out: Optional BF16 output tensor in ``[rows, heads_q, head_dim]``
+            layout, written in place instead of a fresh allocation. Row i of
+            the batch lands in row i unless ``out_indices`` says otherwise.
         out_indices: Optional INT32 mapping from compact decode rows to rows
-            in ``out``. When supplied, the kernel scatters directly into
-            ``out``.
-        query_padded_scratch: Optional BF16 buffer shaped
-            ``[at least rows, 128, heads_q, head_dim]`` that holds the query
-            padded to the residual MMA's row tile. Only the first row of each
-            tile is written, so a caller-owned buffer has to be zeroed once and
-            never again. Supplying one avoids reallocating and rezeroing it on
-            every call, which matters when a residual is present on every layer
-            of every step.
+            in ``out``. Costs split-K, which cannot reorder rows on its way
+            out, so pass it only when the rows really do have to move.
+        query_padded_scratch: Optional BF16 buffer shaped ``[at least rows,
+            RESIDUAL_ROW_TILE, heads_q, head_dim]`` that holds the query padded
+            to the residual MMA's row tile. Only the first row of each tile is
+            written, so a caller-owned buffer has to be zeroed once and never
+            again. Supplying one avoids reallocating and rezeroing it on every
+            call, which matters when a residual is present on every layer of
+            every step.
 
     Returns:
-        The supplied ``out`` tensor when direct scatter is enabled; otherwise
-        a compact BF16 output corresponding to the selected query rows.
+        The supplied ``out`` tensor when there is one; otherwise a compact
+        BF16 output corresponding to the selected query rows.
     """
     try:
         from ._kernel import fp4_decode_impl
