@@ -29,6 +29,7 @@ from nvfp4_vllm.control import (
     ERR_CONTINUATION_PREFILL,
     ERR_DUPLICATE_KEY,
     ERR_NO_FREE_SLOT,
+    ERR_PROMOTION_COLUMN,
     ERR_SLOT_LOST,
     ERR_STALE_SLOT_HISTORY,
     FREE_KEY,
@@ -41,6 +42,10 @@ from nvfp4_vllm.control import (
 
 NUM_SLOTS = 8
 MAX_TOKENS = 4096
+# Columns in the block table the steps below hand to the kernel. Wide enough
+# that a promotion column is in range for the lengths used here, and the one
+# test that wants it out of range says so.
+BLOCK_COLUMNS = 8
 
 
 pytestmark = pytest.mark.skipif(
@@ -59,6 +64,7 @@ class Step:
     block0: list[int]
     seq_lens: list[int]
     query_lens: list[int]
+    columns: int = BLOCK_COLUMNS
 
     @property
     def query_start_loc(self) -> list[int]:
@@ -66,6 +72,18 @@ class Step:
         for length in self.query_lens:
             starts.append(starts[-1] + length)
         return starts
+
+    @property
+    def block_table(self) -> list[list[int]]:
+        """Column 0 is the request's key; the rest are distinct made-up ids.
+
+        Distinct because promotion answers with one of them, and a table of
+        zeros would let a wrong column pass for the right one.
+        """
+        return [
+            [key] + [key * 1000 + column for column in range(1, self.columns)]
+            for key in self.block0
+        ]
 
 
 def decodes(block0: list[int], seq_lens: list[int]) -> Step:
@@ -157,6 +175,23 @@ class ReferenceSlotTable:
             for _ in range(step.query_lens[row])
         ]
 
+        # Promotion is answered for the whole table, not just the batch, so
+        # that its launch shape does not follow the batch.
+        table = step.block_table
+        sources = [0] * self.num_slots
+        pages = [-1] * self.num_slots
+        for row in range(num_reqs):
+            if not live[row]:
+                continue
+            sources[row] = slot_of[row] * self.page
+            if step.seq_lens[row] % self.page:
+                continue
+            column = step.seq_lens[row] // self.page - 1
+            if column >= len(table[row]):
+                self.errors |= ERR_PROMOTION_COLUMN
+                continue
+            pages[row] = table[row][column]
+
         return {
             "row_to_slot": slot_of,
             "token_to_slot": token_to_slot,
@@ -165,10 +200,8 @@ class ReferenceSlotTable:
                 length - base if alive else 0
                 for length, base, alive in zip(step.seq_lens, fp4, live)
             ],
-            "promotion_mask": [
-                alive and length % self.page == 0
-                for length, alive in zip(step.seq_lens, live)
-            ],
+            "promotion_source_tokens": sources,
+            "promotion_pages": pages,
             "error_code": self.errors,
         }
 
@@ -180,12 +213,10 @@ def run(plane: ControlPlane, step: Step) -> dict:
     def to_gpu(values: list[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int32, device=device)
 
-    # Padded to three columns so the kernel's strided read of column 0 is
-    # exercised rather than accidentally reading a contiguous vector.
-    block_table = to_gpu([[key, 0, 0] for key in step.block0]).reshape(-1, 3)
-
+    # Several columns wide so the kernel's strided reads are exercised rather
+    # than accidentally landing on a contiguous vector.
     outputs = plane.prepare(
-        block_table=block_table,
+        block_table=to_gpu(step.block_table),
         seq_lens=to_gpu(step.seq_lens),
         query_start_loc=to_gpu(step.query_start_loc),
         num_reqs=len(step.block0),
@@ -196,7 +227,8 @@ def run(plane: ControlPlane, step: Step) -> dict:
         "token_to_slot": outputs.token_to_slot.tolist(),
         "seqused_fp4": outputs.seqused_fp4.tolist(),
         "seqused_residual": outputs.seqused_residual.tolist(),
-        "promotion_mask": outputs.promotion_mask.tolist(),
+        "promotion_source_tokens": outputs.promotion_source_tokens.tolist(),
+        "promotion_pages": outputs.promotion_pages.tolist(),
         "error_code": int(outputs.error_code.item()),
     }
 
@@ -235,7 +267,11 @@ def test_lengths_split_at_the_last_whole_page(plane, reference):
     answer = check(plane, reference, prefills([11, 12, 13], [300, 128, 256]))
     assert answer["seqused_fp4"] == [256, 0, 128]
     assert answer["seqused_residual"] == [44, 128, 128]
-    assert answer["promotion_mask"] == [False, True, True]
+    # Rows 1 and 2 fill their tail page exactly, so promotion has somewhere to
+    # put it: the block holding logical page 0 for row 1, page 1 for row 2.
+    # Both ids are the row's own, from the column its length picks out.
+    assert answer["promotion_pages"][:3] == [-1, 12, 13001]
+    assert answer["promotion_source_tokens"][:3] == [0, 128, 256]
 
 
 def test_a_slot_follows_its_request_across_a_row_move(plane, reference):
@@ -292,7 +328,8 @@ def test_dead_rows_read_as_attending_to_nothing(plane):
     assert plane.row_to_slot.tolist()[1:] == [INACTIVE_ROW] * (NUM_SLOTS - 1)
     assert plane.seqused_fp4.tolist()[1:] == [0] * (NUM_SLOTS - 1)
     assert plane.seqused_residual.tolist()[1:] == [0] * (NUM_SLOTS - 1)
-    assert plane.promotion_mask.tolist()[1:] == [False] * (NUM_SLOTS - 1)
+    assert plane.promotion_pages.tolist()[1:] == [INACTIVE_ROW] * (NUM_SLOTS - 1)
+    assert plane.promotion_source_tokens.tolist()[1:] == [0] * (NUM_SLOTS - 1)
 
 
 def test_a_padded_row_is_not_a_request(plane, reference):
@@ -349,6 +386,19 @@ def test_a_lost_slot_is_reported(plane, reference):
     check(plane, reference, Step([2, 3, 4, 5, 6, 7, 8, 99], [15] * 7 + [8], [1] * 7 + [8]))
     answer = check(plane, reference, decodes([1, 2, 3, 4, 5, 6, 7], [11] + [16] * 6))
     assert answer["error_code"] & ERR_SLOT_LOST
+
+
+def test_a_promotion_column_past_the_block_table_is_reported(plane, reference):
+    # Not reachable through vLLM, which allocated the block holding the row's
+    # last token before the step ran. It is checked because the gather is
+    # masked, not bounds-checked: a column one past the end reads the next
+    # row's block id, and promotion would then write a whole page of one
+    # request's history over another's. Nothing downstream could tell.
+    answer = check(
+        plane, reference, Step([11], [1024], [1024], columns=4)
+    )
+    assert answer["error_code"] & ERR_PROMOTION_COLUMN
+    assert answer["promotion_pages"][0] == INACTIVE_ROW
 
 
 def test_a_recycled_key_carrying_history_is_reported(plane, reference):
@@ -486,11 +536,15 @@ def test_the_kernel_agrees_with_the_reference_under_random_scheduling(
     plane, reference, seed
 ):
     simulator = Simulator(random.Random(seed), skip_probability=0.25)
+    crossings = 0
     for index in range(300):
         step = simulator.step()
         if not step.block0:
             continue
-        assert run(plane, step) == reference.prepare(step), f"step {index} diverged"
+        answer = run(plane, step)
+        assert answer == reference.prepare(step), f"step {index} diverged"
+        crossings += sum(page >= 0 for page in answer["promotion_pages"])
+    assert crossings, "no row filled a tail page, so promotion agreed vacuously"
 
 
 class Simulator:

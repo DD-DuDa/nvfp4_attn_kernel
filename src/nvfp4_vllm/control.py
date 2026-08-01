@@ -73,6 +73,7 @@ ERR_SLOT_LOST = 2
 ERR_STALE_SLOT_HISTORY = 4
 ERR_NO_FREE_SLOT = 8
 ERR_DUPLICATE_KEY = 16
+ERR_PROMOTION_COLUMN = 32
 
 _TOKEN_BLOCK = 256
 
@@ -85,12 +86,14 @@ _E_SLOT_LOST = tl.constexpr(ERR_SLOT_LOST)
 _E_STALE_SLOT_HISTORY = tl.constexpr(ERR_STALE_SLOT_HISTORY)
 _E_NO_FREE_SLOT = tl.constexpr(ERR_NO_FREE_SLOT)
 _E_DUPLICATE_KEY = tl.constexpr(ERR_DUPLICATE_KEY)
+_E_PROMOTION_COLUMN = tl.constexpr(ERR_PROMOTION_COLUMN)
 
 
 @triton.jit
 def _control_kernel(
     block_table_ptr,
     block_table_stride,
+    block_table_columns,
     seq_lens_ptr,
     query_start_loc_ptr,
     slot_keys_ptr,
@@ -101,7 +104,8 @@ def _control_kernel(
     token_to_slot_ptr,
     seqused_fp4_ptr,
     seqused_residual_ptr,
-    promotion_mask_ptr,
+    promotion_source_tokens_ptr,
+    promotion_pages_ptr,
     error_code_ptr,
     num_reqs,
     num_actual_tokens,
@@ -223,7 +227,6 @@ def _control_kernel(
         _E_DUPLICATE_KEY,
         0,
     )
-    tl.atomic_or(error_code_ptr, errors)
 
     # Slot state follows its owner. Slots nobody claimed keep their old key so
     # a request that sits out a step can still find its tail. Min again, so a
@@ -255,7 +258,42 @@ def _control_kernel(
     fp4 = tl.where(live, ((seq_safe - 1) // PAGE) * PAGE, 0)
     tl.store(seqused_fp4_ptr + idx, fp4, mask=is_slot)
     tl.store(seqused_residual_ptr + idx, tl.where(live, seq - fp4, 0), mask=is_slot)
-    tl.store(promotion_mask_ptr + idx, live & (seq % PAGE == 0), mask=is_slot)
+
+    # Where promotion would read and write, were this the step that filled the
+    # tail. Derived here because everything it needs is already in registers:
+    # one more gather beats a second kernel launch on a path taken every step.
+    #
+    # ``column`` is the logical page the tail is filling, and a tail that is
+    # exactly a page long is that page, complete. The other rows answer -1,
+    # which is what tells the quantizer to leave them alone.
+    column = fp4 // PAGE
+    crossing = live & (seq % PAGE == 0)
+    # Reaching past the block table would gather the next row's block id and
+    # promote a whole page onto some other request's cache. Structurally that
+    # cannot happen — vLLM allocated the block holding the row's last token —
+    # but it is exactly the kind of damage nothing downstream could attribute.
+    in_bounds = column < block_table_columns
+    errors += tl.where(
+        tl.sum((crossing & (in_bounds == 0)).to(tl.int32), axis=0) > 0,
+        _E_PROMOTION_COLUMN,
+        0,
+    )
+    tl.store(
+        promotion_source_tokens_ptr + idx,
+        tl.where(live, slot * PAGE, 0),
+        mask=is_slot,
+    )
+    tl.store(
+        promotion_pages_ptr + idx,
+        tl.load(
+            block_table_ptr + idx * block_table_stride + column,
+            mask=crossing & in_bounds,
+            other=_INACTIVE,
+        ),
+        mask=is_slot,
+    )
+
+    tl.atomic_or(error_code_ptr, errors)
 
     # Bounded by the tokens actually present, so a steady-state decode step
     # runs one iteration.
@@ -286,7 +324,10 @@ class ControlOutputs:
     token_to_slot: torch.Tensor
     seqused_fp4: torch.Tensor
     seqused_residual: torch.Tensor
-    promotion_mask: torch.Tensor
+    # Full width, unlike everything above: promotion launches over the whole
+    # table so that its shape does not follow the batch.
+    promotion_source_tokens: torch.Tensor
+    promotion_pages: torch.Tensor
     error_code: torch.Tensor
 
 
@@ -337,7 +378,8 @@ class ControlPlane:
         self.row_to_slot = _slots(torch.int32, INACTIVE_ROW)
         self.seqused_fp4 = _slots(torch.int32, 0)
         self.seqused_residual = _slots(torch.int32, 0)
-        self.promotion_mask = _slots(torch.bool, False)
+        self.promotion_source_tokens = _slots(torch.int32, 0)
+        self.promotion_pages = _slots(torch.int32, INACTIVE_ROW)
         self.error_code = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.token_to_slot = torch.full(
             (max_num_batched_tokens,),
@@ -387,6 +429,7 @@ class ControlPlane:
         _control_kernel[(1,)](
             block_table,
             block_table.stride(0),
+            block_table.shape[1],
             seq_lens,
             query_start_loc,
             self.slot_keys,
@@ -397,7 +440,8 @@ class ControlPlane:
             self.token_to_slot,
             self.seqused_fp4,
             self.seqused_residual,
-            self.promotion_mask,
+            self.promotion_source_tokens,
+            self.promotion_pages,
             self.error_code,
             num_reqs,
             num_actual_tokens,
@@ -413,6 +457,7 @@ class ControlPlane:
             token_to_slot=self.token_to_slot[:num_actual_tokens],
             seqused_fp4=self.seqused_fp4[:num_reqs],
             seqused_residual=self.seqused_residual[:num_reqs],
-            promotion_mask=self.promotion_mask[:num_reqs],
+            promotion_source_tokens=self.promotion_source_tokens,
+            promotion_pages=self.promotion_pages,
             error_code=self.error_code,
         )

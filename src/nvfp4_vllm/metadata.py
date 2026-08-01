@@ -44,9 +44,17 @@ class NVFP4Metadata(FlashAttentionMetadata):
     """``[num_reqs]`` int32. Tokens of each sequence that live in the BF16
     tail. Together with ``seqused_fp4`` this sums to the sequence length."""
 
-    promotion_mask: torch.Tensor
-    """``[num_reqs]`` bool. Rows whose tail filled a whole page this step and
-    must be quantized into the FP4 cache before the next one."""
+    promotion_source_tokens: torch.Tensor
+    """``[max_num_seqs]`` int32. First token of each row's tail, as an index
+    into one layer's tail buffer."""
+
+    promotion_pages: torch.Tensor
+    """``[max_num_seqs]`` int32. Block that a row's tail must be quantized into
+    before the next step, -1 for a row whose tail did not fill a page.
+
+    Full width rather than ``num_reqs`` wide, unlike the fields above: this
+    pair is the promotion launch's grid, and a grid that followed the batch
+    would put a host branch back on a path that has none."""
 
     decode_prefix_rows: int
     """How many rows of this batch emit exactly one token. vLLM has already
@@ -116,7 +124,8 @@ class NVFP4Metadata(FlashAttentionMetadata):
             token_to_slot=outputs.token_to_slot,
             seqused_fp4=outputs.seqused_fp4,
             seqused_residual=outputs.seqused_residual,
-            promotion_mask=outputs.promotion_mask,
+            promotion_source_tokens=outputs.promotion_source_tokens,
+            promotion_pages=outputs.promotion_pages,
             decode_prefix_rows=decode_prefix_rows,
             decode_prefix_tokens=decode_prefix_tokens,
             prefill_query_start_loc=prefill_query_start_loc,

@@ -164,7 +164,7 @@ def session() -> Session:
         if self.layer_index == 0:
             # Kept as a device tensor and read once at the end: this runs on
             # every step, and .item() here would synchronize on every one.
-            promotion_flags.append(metadata.promotion_mask.any())
+            promotion_flags.append((metadata.promotion_pages >= 0).any())
 
     def record_decode(self, rows, query, kv_cache, attn_metadata, output):
         original_decode(self, rows, query, kv_cache, attn_metadata, output)
@@ -299,16 +299,17 @@ def test_decode_ran_on_the_fp4_cache(session: Session):
 def test_no_row_crossed_a_page_boundary(session: Session):
     """The premise the prompt length was chosen for.
 
-    Crossing a boundary sets ``promotion_mask``, and nothing consumes it yet,
-    so the tail would start dropping tokens. Per-step cosine would not
-    necessarily notice, because the oracle reads the same tail. Changing
+    Every oracle comparison below is set up with ``FP4_TOKENS`` as the size of
+    the FP4 prefix, which a crossing would move. The comparison would then be
+    against attention over the wrong history, and the cosine might well still
+    pass, because the oracle reads the same tail the kernel did. Changing
     ``PROMPT_TOKENS`` or ``GENERATED_TOKENS`` without redoing the arithmetic
-    lands here.
+    lands here. What happens on a crossing is ``test_promotion.py``'s subject.
     """
     assert session.promotion_flags, "no step was observed"
     promoted = torch.stack(session.promotion_flags).any().item()
     assert not promoted, (
-        "a row filled a page during the run, which S7 has no answer for"
+        "a row filled a page during the run, so the FP4 prefix moved"
     )
 
 
