@@ -79,9 +79,10 @@ class NVFP4Metadata(FlashAttentionMetadata):
 
     decode_page_columns: int
     """How many page-table columns the decode kernel has to walk. The kernel
-    reads the table's width as the longest row it could see and picks a split
-    count from it, so a table left at the model's capacity makes a short batch
-    look long and buys splits that own no page.
+    reads the table's width as the longest row it could see, which is the
+    length it validates ``seqused_fp4`` against and the extent its tile
+    scheduler is sized for, so a table left at the model's capacity makes a
+    short batch look long.
 
     The batch's longest row, not the decodes' own: the per-row lengths live on
     the device, and vLLM's host-side copy is materialized by a transfer that
