@@ -84,28 +84,40 @@ a batch containing other rows with nonzero residual lengths.
 
 ## Verification
 
-Run all tests:
+Use `scripts/run_tests.sh`. The `python` on `PATH` cannot run any suite: its
+CuTeDSL has no `iket`, which `fp4_decode_kernel.py` imports at module scope,
+and it has no compiled vLLM. The script points at an environment that has
+both.
 
 ```bash
-PYTHONPATH=src python -m pytest -q tests/kernel
-```
-
-Run query byte-equality tests:
-
-```bash
-PYTHONPATH=src python -m pytest -q tests/kernel/test_quantize_query.py
-```
-
-Run decode tests:
-
-```bash
-PYTHONPATH=src python -m pytest -q tests/kernel/test_fp4_decode_correctness.py
+scripts/run_tests.sh kernel          # kernel numerics
+scripts/run_tests.sh e2e             # vLLM integration, no soak
+scripts/run_tests.sh soak            # slot reuse, many requests
+scripts/run_tests.sh all
+scripts/run_tests.sh kernel -- -k residual -x   # after --, pytest's own
 ```
 
 The decode suite checks BF16 FlashAttention quality, hybrid FP4
 FlashAttention, the independent PyTorch FP4 oracle, zero-length residual rows,
 and indexed query rows. Current numerical gates are defined in the test file;
 do not relax them to hide a kernel regression.
+
+### Known failure, deliberately not fixed
+
+`tests/kernel` is not green. `test_prequantized_query_matches_bf16_query_exactly[32-1]`
+fails, so a clean run is **1 failed, 72 passed**. Judge a change by whether it
+adds a failure, not by whether the suite is green.
+
+The case asserts that feeding a pre-quantized FP4 query reproduces the BF16
+query path bitwise. It fails only at MQA (`heads_kv = 1`); the MHA and GQA
+parametrizations pass. It is also order-dependent: it passes when run alone and
+fails when it runs after the other two, which means something survives between
+calls in one process. That state dependence is the part worth chasing, since
+CUDA graph capture and persistent scratch buffers both amplify it.
+
+`pytest-randomly` is installed, so test order — and therefore this failure —
+varies run to run. Pass `-p no:randomly` whenever comparing two runs, or the
+comparison is meaningless.
 
 FlashAttention and FlashInfer are test dependencies only. Production code must
 not require either package.
