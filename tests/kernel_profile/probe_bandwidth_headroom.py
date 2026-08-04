@@ -192,12 +192,19 @@ class BandwidthProbe(psc.ProbeKernel):
             cute.copy(tma_atom_sf, tXgSF_cur, tXsSF_cur, tma_bar_ptr=mbar_full_ptr + stage)
 
 
-_BASE_SPLIT_HEURISTIC = decode_mod.split_k_heuristic
-
-
 def _clear_caches() -> None:
     decode_mod._decode_compile_cache.clear()
     decode_mod._split_decode_compile_cache.clear()
+
+
+def config_splits(cfg: dict) -> int:
+    """Split count for a configuration; absent means production's single tile.
+
+    The count is not a knob on the kernel class, it is an argument to
+    ``fp4_decode``, so the harness has to build the runner for it rather than
+    install it here.
+    """
+    return int(cfg.get("splits") or 1)
 
 
 def apply_config(cfg: dict) -> None:
@@ -209,16 +216,11 @@ def apply_config(cfg: dict) -> None:
         {"_cfg": cfg, "_force_q_stage_1": bool(cfg.get("q_stage1", False))},
     )
     decode_mod.FP4DecodeKernel = probe_cls
-    splits = cfg.get("splits")
-    decode_mod.split_k_heuristic = (
-        _BASE_SPLIT_HEURISTIC if splits is None else (lambda *a, **k: int(splits))
-    )
     _clear_caches()
 
 
 def restore_production() -> None:
     decode_mod.FP4DecodeKernel = FP4DecodeKernel
-    decode_mod.split_k_heuristic = _BASE_SPLIT_HEURISTIC
     _clear_caches()
 
 
@@ -238,14 +240,20 @@ _SMEM_RE = re.compile(r"Total shared memory used: ([0-9.]+) KB")
 def measure_config(
     name: str,
     cfg: dict,
-    run: Callable[[], object],
+    make_run: Callable[[int], Callable[[], object]],
     iters: int,
     warmup: int,
     reference: Optional[torch.Tensor] = None,
 ) -> dict:
     LAST_SETUP.clear()
     apply_config(cfg)
-    record: dict[str, object] = {"config": name, "cfg": dict(cfg)}
+    splits = config_splits(cfg)
+    run = make_run(splits)
+    record: dict[str, object] = {
+        "config": name,
+        "cfg": dict(cfg),
+        "num_splits": splits,
+    }
     captured = io.StringIO()
     try:
         # The kernel prints its shared-memory budget while tracing; capturing
@@ -288,7 +296,16 @@ def run_case(
     checkpoint: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     inputs = bd.build_inputs(case, device, quantize_chunk_pages=quantize_chunk_pages)
-    run_fp4 = bd.make_fp4(inputs, hybrid=False, prequantized_query=True)
+
+    def make_run(num_splits: int) -> Callable[[], object]:
+        return bd.make_fp4(
+            inputs,
+            hybrid=False,
+            prequantized_query=True,
+            num_splits=num_splits,
+        )
+
+    run_fp4 = make_run(1)
 
     tokens = case.batch * case.seqlen * case.heads_kv
     fp4_bytes = tokens * FP4_BYTES_PER_TOKEN_HEAD
@@ -331,7 +348,7 @@ def run_case(
 
     rows = []
     for name, cfg in configs.items():
-        record = measure_config(name, cfg, run_fp4, iters, warmup, reference)
+        record = measure_config(name, cfg, make_run, iters, warmup, reference)
         if record["status"] == "ok":
             ms = record["kernel_ms"]
             record["tbps"] = fp4_bytes / (ms * 1e-3) / 1e12
@@ -344,6 +361,7 @@ def run_case(
                 f"  {record['vs_fa4']:5.2f}x FA4"
                 f"  q{setup.get('q_stage')}/kv{setup.get('kv_stage')}"
                 f"/epi{setup.get('epi_stage')}/n{setup.get('n_block_size')}"
+                f"/s{record['num_splits']}"
                 f"  smem={record['smem_kb']}"
                 + (f"  cos={cosine:.4f}" if cosine is not None else ""),
                 flush=True,
@@ -384,7 +402,15 @@ def parse_config_name(name: str) -> dict:
         elif token.startswith("epi") and token[3:].isdigit():
             cfg["epi_stage"] = int(token[3:])
         elif token.startswith("s") and token[1:].isdigit():
-            cfg["splits"] = int(token[1:])
+            splits = int(token[1:])
+            # fp4_decode takes a positive power of two and raises otherwise;
+            # rejecting it here fails the sweep at argument parsing instead of
+            # partway through a case.
+            if splits < 1 or splits & (splits - 1):
+                raise SystemExit(
+                    f"split count must be a positive power of two, got {splits}"
+                )
+            cfg["splits"] = splits
         elif token.startswith("n") and token[1:].isdigit():
             cfg["n_block"] = int(token[1:])
         elif token == "pink":

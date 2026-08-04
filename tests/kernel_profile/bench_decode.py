@@ -3,6 +3,9 @@
 Clean performance gates use CUDA events. ``--breakdown`` is a separate
 Torch-Profiler pass for per-kernel attribution and must not run under IKET.
 FA4 always uses the varlen entry point so split-K keeps pack-GQA enabled.
+``fp4_decode`` splits only as far as its ``num_splits`` argument says, so
+``--fp4-splits`` passes that count explicitly and the reported ``num_splits``
+is the count that ran.
 """
 
 from __future__ import annotations
@@ -214,6 +217,41 @@ def fa4_auto_splits(case: Case, device: torch.device) -> int:
     return max(1, num_splits_heuristic(total_mblocks, sms, num_n_blocks, 128))
 
 
+def fp4_auto_splits(case: Case, device: torch.device) -> int:
+    """The split count ``split_k_heuristic`` would pick for this case.
+
+    ``fp4_decode`` does not consult the heuristic; it splits only as far as its
+    ``num_splits`` argument says. A caller that wants the heuristic's answer has
+    to ask for it here and pass the same value on, so that what is reported and
+    what runs are one number.
+    """
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return split_k_heuristic(
+        case.batch,
+        case.heads_kv,
+        case.seqlen // PAGE_SIZE,
+        sms=sms,
+    )
+
+
+def parse_split_request(value: str) -> str | int:
+    """Parse a split-count request: ``auto`` or an explicit power of two."""
+    if value == "auto":
+        return "auto"
+    splits = int(value) if value.isdigit() else 0
+    if splits < 1 or splits & (splits - 1):
+        raise SystemExit(
+            f"split count must be 'auto' or a positive power of two, got {value!r}"
+        )
+    return splits
+
+
+def resolve_fp4_splits(
+    request: str | int, case: Case, device: torch.device
+) -> int:
+    return fp4_auto_splits(case, device) if request == "auto" else int(request)
+
+
 def make_fa4(inputs: Inputs, num_splits: int) -> Callable[[], object]:
     case = inputs.case
 
@@ -236,7 +274,7 @@ def make_fa4(inputs: Inputs, num_splits: int) -> Callable[[], object]:
 
 
 def make_fp4(
-    inputs: Inputs, hybrid: bool, *, prequantized_query: bool
+    inputs: Inputs, hybrid: bool, *, prequantized_query: bool, num_splits: int = 1
 ) -> Callable[[], torch.Tensor]:
     def run_pure():
         return fp4_decode(
@@ -249,6 +287,7 @@ def make_fp4(
             seqused_fp4=inputs.seqused_fp4_full,
             softmax_scale=inputs.softmax_scale,
             trusted_metadata=True,
+            num_splits=num_splits,
         )
 
     def run_hybrid():
@@ -267,6 +306,7 @@ def make_fp4(
             has_bf16=inputs.has_bf16,
             softmax_scale=inputs.softmax_scale,
             trusted_metadata=True,
+            num_splits=num_splits,
         )
 
     def run_prequantized():
@@ -281,6 +321,7 @@ def make_fp4(
             query_scales=inputs.query_scales,
             softmax_scale=inputs.softmax_scale,
             trusted_metadata=True,
+            num_splits=num_splits,
         )
 
     if prequantized_query:
@@ -397,30 +438,31 @@ def query_quantization_ms(kernels: dict[str, float]) -> float:
 
 
 def variant_factory(
-    name: str, inputs: Inputs, device: torch.device
+    name: str,
+    inputs: Inputs,
+    device: torch.device,
+    fp4_splits: str | int = 1,
 ) -> tuple[Callable[[], object] | None, int | None, str | None]:
+    """Build a variant's runner and the split count it will actually use.
+
+    The returned count is the one handed to the kernel, not a prediction of
+    what it might choose, so a reported ``num_splits`` always describes the
+    measured run.
+    """
     if name == "fa4_bf16":
         return make_fa4(inputs, num_splits=1), 1, None
     if name == "fa4_split":
         splits = fa4_auto_splits(inputs.case, device)
         return make_fa4(inputs, num_splits=splits), splits, None
-    if name == "fp4_pure_bf16q":
+    if name in ("fp4_pure_bf16q", "fp4_hybrid_bf16q", "fp4_pure_fp4q"):
+        splits = resolve_fp4_splits(fp4_splits, inputs.case, device)
+        hybrid = name == "fp4_hybrid_bf16q"
+        prequantized_query = name.endswith("_fp4q")
         return make_fp4(
-            inputs, hybrid=False, prequantized_query=False
-        ), 1, None
-    if name == "fp4_hybrid_bf16q":
-        return make_fp4(
-            inputs, hybrid=True, prequantized_query=False
-        ), 1, None
-    if name == "fp4_pure_fp4q":
-        splits = split_k_heuristic(
-            inputs.case.batch,
-            inputs.case.heads_kv,
-            inputs.case.seqlen // PAGE_SIZE,
-            sms=torch.cuda.get_device_properties(device).multi_processor_count,
-        )
-        return make_fp4(
-            inputs, hybrid=False, prequantized_query=True
+            inputs,
+            hybrid=hybrid,
+            prequantized_query=prequantized_query,
+            num_splits=splits,
         ), splits, None
     raise KeyError(name)
 
@@ -433,6 +475,38 @@ DEFAULT_VARIANTS = (
 )
 
 
+def input_contract(variant: str) -> str:
+    if variant.startswith("fa4"):
+        return "bf16_q_bf16_kv"
+    if variant.endswith("_fp4q"):
+        return "fp4_q_fp4_kv"
+    return "bf16_q_fp4_kv"
+
+
+def unavailable_row(
+    case: Case, variant: str, num_splits: int | None, reason: str | None
+) -> dict:
+    return {
+        **asdict(case),
+        "attention_type": case.attention_type,
+        "variant": variant,
+        "input_contract": input_contract(variant),
+        "status": "unavailable",
+        "unavailable_reason": reason,
+        "num_splits": num_splits,
+        "gpu_ms": None,
+        "gpu_ms_spread": None,
+        "wall_ms": None,
+        "kv_gib": kv_bytes(case, variant) / 2**30,
+        "kv_gbps": None,
+        "cosine_vs_fa4": None,
+        "kernels": {},
+        "query_quantization_ms": None,
+        "query_quantization_fraction": None,
+        "case_peak_memory_bytes": None,
+    }
+
+
 def run_case(
     case: Case,
     device: torch.device,
@@ -442,6 +516,7 @@ def run_case(
     breakdown: bool,
     structural_only: bool,
     quantize_chunk_pages: int,
+    fp4_splits: str | int = 1,
 ) -> list[dict]:
     torch.cuda.reset_peak_memory_stats(device)
     inputs = build_inputs(
@@ -453,32 +528,23 @@ def run_case(
 
     rows: list[dict] = []
     for name in variants:
-        run, num_splits, unavailable_reason = variant_factory(name, inputs, device)
+        run, num_splits, unavailable_reason = variant_factory(
+            name, inputs, device, fp4_splits
+        )
         if run is None:
-            rows.append(
-                {
-                    **asdict(case),
-                    "attention_type": case.attention_type,
-                    "variant": name,
-                    "input_contract": "fp4_q_fp4_kv",
-                    "status": "unavailable",
-                    "unavailable_reason": unavailable_reason,
-                    "num_splits": num_splits,
-                    "gpu_ms": None,
-                    "gpu_ms_spread": None,
-                    "wall_ms": None,
-                    "kv_gib": kv_bytes(case, name) / 2**30,
-                    "kv_gbps": None,
-                    "cosine_vs_fa4": None,
-                    "kernels": {},
-                    "query_quantization_ms": None,
-                    "query_quantization_fraction": None,
-                    "case_peak_memory_bytes": None,
-                }
-            )
+            print(f"  {name}: unavailable ({unavailable_reason})", flush=True)
+            rows.append(unavailable_row(case, name, num_splits, unavailable_reason))
             continue
 
-        out = _output(run()).reshape(case.batch, case.heads_q, HEAD_DIM)
+        # A split count the kernel cannot serve for this variant is refused at
+        # the call, not silently downgraded, so one unservable request must not
+        # end the sweep.
+        try:
+            out = _output(run()).reshape(case.batch, case.heads_q, HEAD_DIM)
+        except ValueError as error:
+            print(f"  {name}: unavailable ({error})", flush=True)
+            rows.append(unavailable_row(case, name, num_splits, str(error)))
+            continue
         gpu_ms, gpu_ms_spread = (
             (None, None)
             if structural_only
@@ -492,18 +558,12 @@ def run_case(
         )
         quant_ms = query_quantization_ms(kernels)
         moved = kv_bytes(case, name)
-        if name.startswith("fa4"):
-            input_contract = "bf16_q_bf16_kv"
-        elif name.endswith("_fp4q"):
-            input_contract = "fp4_q_fp4_kv"
-        else:
-            input_contract = "bf16_q_fp4_kv"
         rows.append(
             {
                 **asdict(case),
                 "attention_type": case.attention_type,
                 "variant": name,
-                "input_contract": input_contract,
+                "input_contract": input_contract(name),
                 "status": "ok",
                 "unavailable_reason": None,
                 "num_splits": num_splits,
@@ -713,7 +773,7 @@ def format_table(rows: list[dict]) -> str:
             else "-"
         )
         bf16q_text = (
-            f"{bf16q['gpu_ms']:.4f}"
+            f"{bf16q['gpu_ms']:.4f} s{bf16q['num_splits']}"
             if (
                 bf16q
                 and bf16q["status"] == "ok"
@@ -722,7 +782,7 @@ def format_table(rows: list[dict]) -> str:
             else "-"
         )
         fp4q_text = (
-            f"{fp4q['gpu_ms']:.4f}"
+            f"{fp4q['gpu_ms']:.4f} s{fp4q['num_splits']}"
             if (
                 fp4q
                 and fp4q["status"] == "ok"
@@ -853,6 +913,16 @@ def main() -> None:
     )
     parser.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS)
     parser.add_argument(
+        "--fp4-splits",
+        type=parse_split_request,
+        default="auto",
+        help=(
+            "split count handed to every FP4 variant: 'auto' for what "
+            "split_k_heuristic would pick, or a power of two; the reported "
+            "num_splits is this value, not a prediction"
+        ),
+    )
+    parser.add_argument(
         "--breakdown",
         action="store_true",
         help="run a separate Torch-Profiler pass; never use under IKET",
@@ -892,6 +962,7 @@ def main() -> None:
     print(f"device: {torch.cuda.get_device_name(device)} (cuda:{args.device})")
     print(f"head_configs={head_configs} head_dim={HEAD_DIM}")
     print(f"iters={args.iters} warmup={args.warmup}")
+    print(f"fp4_splits={args.fp4_splits}")
     print()
 
     torch.manual_seed(0)
@@ -925,6 +996,7 @@ def main() -> None:
                         args.breakdown,
                         args.structural_only,
                         args.quantize_chunk_pages,
+                        args.fp4_splits,
                     )
                 )
 

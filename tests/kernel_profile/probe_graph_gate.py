@@ -7,6 +7,9 @@ the eager ratio a function of which internal path each side happened to pick,
 which is not what the gate is trying to measure. Graph replay removes host
 dispatch from both sides and is also how a serving stack runs decode.
 
+Both sides take their split count as an argument, so a row's reported
+``fp4_splits`` and ``fa4_splits`` are the counts that ran.
+
 Timing sections take an advisory file lock so this can share the GPU with other
 work; input construction and teardown stay outside it.
 
@@ -35,32 +38,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode as bd  # noqa: E402
 
 LOCK_PATH = "/tmp/nvfp4_gpu1.lock"
-
-
-def install_relaxed_heuristic(min_pages_per_split: int) -> None:
-    """Patch split_k_heuristic with a different guard, leaving the rest intact.
-
-    Only the ``min_pages_per_split`` constant changes. Everything else, in
-    particular the ``target`` occupancy computation, is reproduced exactly so
-    the comparison isolates the guard.
-    """
-    import math
-
-    from nvfp4_decode_kernel import _decode as decode_mod
-
-    def patched(rows, heads_kv, max_pages_per_row, *, sms):
-        if rows < 1 or heads_kv < 1 or max_pages_per_row < 2 or sms < 1:
-            return 1
-        unsplit_ctas = rows * heads_kv
-        if unsplit_ctas >= sms:
-            return 1
-        target = max(2, math.ceil(sms / unsplit_ctas))
-        for splits in (32, 16, 8, 4, 2):
-            if splits <= target and splits * min_pages_per_split <= max_pages_per_row:
-                return splits
-        return 1
-
-    decode_mod.split_k_heuristic = patched
 
 
 @contextlib.contextmanager
@@ -117,20 +94,38 @@ def run_case(
     repeats: int,
     hybrid: bool = False,
     bf16_query: bool = False,
+    fp4_splits: str | int = "auto",
 ) -> dict:
     inputs = bd.build_inputs(case, device, quantize_chunk_pages=4096)
     # A fused residual page has no pre-quantized-query benchmark, so it implies
     # the bf16-query entry point. The two are separable otherwise.
+    splits = bd.resolve_fp4_splits(fp4_splits, case, device)
     fp4_run = bd.make_fp4(
-        inputs, hybrid=hybrid, prequantized_query=not (hybrid or bf16_query)
+        inputs,
+        hybrid=hybrid,
+        prequantized_query=not (hybrid or bf16_query),
+        num_splits=splits,
     )
 
     record: dict[str, object] = {
         "case": case.label,
         "batch": case.batch,
         "seqlen": case.seqlen,
+        "fp4_splits": splits,
     }
     with gpu_lock(LOCK_PATH):
+        # fp4_decode refuses a split it cannot serve instead of downgrading to
+        # one tile, so an unservable request is reported and skipped rather
+        # than left to abort the sweep.
+        try:
+            fp4_run()
+            torch.cuda.synchronize()
+        except ValueError as error:
+            record["fp4_unavailable"] = f"{type(error).__name__}: {error}"
+            del inputs, fp4_run
+            gc.collect()
+            torch.cuda.empty_cache()
+            return record
         record["fp4_graph_us"], record["fp4_error"] = graph_us(
             fp4_run, warmup, iters, repeats
         )
@@ -176,12 +171,15 @@ def main() -> None:
     parser.add_argument("--batches", type=str, default="1,4,16,64")
     parser.add_argument("--max-kv-tokens", type=int, default=8_400_000)
     parser.add_argument(
-        "--min-pages-per-split",
-        type=int,
-        default=None,
+        "--splits",
+        dest="fp4_splits",
+        type=bd.parse_split_request,
+        default="auto",
         help=(
-            "override the guard in split_k_heuristic; the shipped value is 8, "
-            "which was calibrated against eager-mode host overhead"
+            "split count handed to fp4_decode: 'auto' for what "
+            "split_k_heuristic would pick, or a power of two; graph replay "
+            "removes the host dispatch the shipped heuristic was calibrated "
+            "against, so the two need not agree"
         ),
     )
     parser.add_argument(
@@ -199,9 +197,6 @@ def main() -> None:
 
     device = torch.device(f"cuda:{args.device}")
     torch.cuda.set_device(device)
-
-    if args.min_pages_per_split is not None:
-        install_relaxed_heuristic(args.min_pages_per_split)
 
     rows = []
     for seqlen in (int(value) for value in args.seqlens.split(",")):
@@ -222,20 +217,32 @@ def main() -> None:
                 args.repeats,
                 args.hybrid,
                 args.bf16_query,
+                args.fp4_splits,
             )
             rows.append(record)
+            if "fp4_unavailable" in record:
+                print(
+                    f"{case.label:<30} skipped at splits={record['fp4_splits']}:"
+                    f" {record['fp4_unavailable']}",
+                    flush=True,
+                )
+                continue
             print(
                 f"{case.label:<30}"
                 f" graph fp4 {record['fp4_graph_us']:8.1f} us"
+                f" (s{record['fp4_splits']})"
                 f"  fa4 {record['fa4_graph_us']:8.1f} us"
                 f"  ratio {record['graph_ratio']:6.3f}"
                 f"   | event ratio {record['event_ratio']:6.3f}",
                 flush=True,
             )
 
+    # Skipped cases stay in the written rows as evidence, but they have no
+    # ratio to average.
+    timed = [row for row in rows if "fp4_unavailable" not in row]
     print("\nper-seqlen geometric mean of fp4/fa4 (lower is better, gate is 0.5):")
-    for seqlen in sorted({row["seqlen"] for row in rows}):
-        group = [row for row in rows if row["seqlen"] == seqlen]
+    for seqlen in sorted({row["seqlen"] for row in timed}):
+        group = [row for row in timed if row["seqlen"] == seqlen]
         graph_gm = statistics.geometric_mean([row["graph_ratio"] for row in group])
         event_gm = statistics.geometric_mean([row["event_ratio"] for row in group])
         print(
