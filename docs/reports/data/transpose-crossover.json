@@ -1,0 +1,62 @@
+[
+ {
+  "heads_q": 32,
+  "heads_kv": 8,
+  "group": 4,
+  "batch": 16,
+  "seqlen": 16384,
+  "transposed_us": 68.73439848423004,
+  "untransposed_us": 245.72160243988037,
+  "untransposed_over_transposed": 3.5749436651614412
+ },
+ {
+  "heads_q": 32,
+  "heads_kv": 8,
+  "group": 4,
+  "batch": 16,
+  "seqlen": 131072,
+  "transposed_us": 493.7863826751709,
+  "untransposed_us": 1901.7312049865723,
+  "untransposed_over_transposed": 3.851323713472257
+ },
+ {
+  "heads_q": 64,
+  "heads_kv": 8,
+  "group": 8,
+  "batch": 16,
+  "seqlen": 16384,
+  "transposed_us": 87.76479959487915,
+  "untransposed_us": 245.8367943763733,
+  "untransposed_over_transposed": 2.8010864892434304
+ },
+ {
+  "heads_q": 64,
+  "heads_kv": 8,
+  "group": 8,
+  "batch": 16,
+  "seqlen": 131072,
+  "transposed_us": 637.6879930496216,
+  "untransposed_us": 1902.4544715881348,
+  "untransposed_over_transposed": 2.983362541436617
+ },
+ {
+  "heads_q": 128,
+  "heads_kv": 8,
+  "group": 16,
+  "batch": 16,
+  "seqlen": 16384,
+  "transposed_us": 131.032794713974,
+  "untransposed_us": 245.8359956741333,
+  "untransposed_over_transposed": 1.8761409783768896
+ },
+ {
+  "heads_q": 128,
+  "heads_kv": 8,
+  "group": 16,
+  "batch": 16,
+  "seqlen": 131072,
+  "transposed_us": 983.7791919708252,
+  "untransposed_us": 1901.6183853149414,
+  "untransposed_over_transposed": 1.932972765469241
+ }
+]
