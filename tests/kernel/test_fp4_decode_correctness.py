@@ -944,13 +944,13 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
     monkeypatch: pytest.MonkeyPatch,
     with_residual: bool,
 ) -> None:
-    """An ``out`` without ``out_indices`` keeps split-K and writes in place.
+    """An ``out`` without ``out_indices`` reaches split-K and writes in place.
 
-    This is the path every vLLM decode step takes: ``impl.py`` hands over
-    ``out=output[:rows]`` and no indices, which leaves the heuristic free to
-    split. The only other test that passes ``out`` also passes ``out_indices``,
-    and that forces the single-tile path, so the split branch's write into a
-    caller's buffer is otherwise never executed.
+    This is the path every vLLM decode step takes, bar the split count:
+    ``impl.py`` hands over ``out=output[:rows]`` and no indices. The only
+    other test that passes ``out`` also passes ``out_indices``, and that
+    forces the single-tile path, so the split branch's write into a caller's
+    buffer is otherwise never executed.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -982,16 +982,8 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
         (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
     )
 
-    sms = torch.cuda.get_device_properties(
-        query.device
-    ).multi_processor_count
-    heuristic_splits = _decode.split_k_heuristic(
-        rows, heads_kv, pages, sms=sms
-    )
-    assert heuristic_splits > 1, (
-        "these shapes have to reach split-K for this test to mean anything, "
-        f"but the heuristic chose {heuristic_splits} splits for {sms} SMs"
-    )
+    # Eight splits over these 64 pages leaves every split a real main loop.
+    num_splits = 8
 
     residual = {}
     if with_residual:
@@ -1006,8 +998,8 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
             ),
         }
 
-    # The heuristic agreeing is not evidence that the call took that branch,
-    # so record what the dispatcher actually handed the split implementation.
+    # Asking for a split is not evidence that the call took that branch, so
+    # record what the dispatcher actually handed the split implementation.
     calls = []
     run_split = _decode.decode_fp4_split
 
@@ -1036,11 +1028,19 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
         seqused_fp4,
     )
     with torch.no_grad():
-        allocated = fp4_decode(query, *decode_arguments, **residual)
-        returned = fp4_decode(query, *decode_arguments, out=out, **residual)
+        allocated = fp4_decode(
+            query, *decode_arguments, num_splits=num_splits, **residual
+        )
+        returned = fp4_decode(
+            query,
+            *decode_arguments,
+            out=out,
+            num_splits=num_splits,
+            **residual,
+        )
     torch.cuda.synchronize()
 
-    assert [splits for splits, _ in calls] == [heuristic_splits] * 2
+    assert [splits for splits, _ in calls] == [num_splits] * 2
     assert calls[0][1] is None
     assert calls[1][1] is out
 
@@ -1054,9 +1054,59 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
     assert torch.equal(returned, allocated)
 
 
+def test_num_splits_refuses_what_the_split_path_cannot_serve(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """A split that cannot be honoured raises instead of decoding with one.
+
+    Every test that reaches split-K through this entry does so by asking for
+    it, so a request quietly downgraded to a single tile would leave those
+    tests passing while covering nothing.
+    """
+    inputs = contract_decode_inputs
+    common = (
+        inputs.key_pages_fp4,
+        inputs.key_scales,
+        inputs.value_pages_fp4,
+        inputs.value_scales,
+        inputs.page_table,
+        inputs.seqused_fp4,
+    )
+    query = inputs.query[:3]
+
+    for splits in (0, -2, 3, 6):
+        with pytest.raises(ValueError, match="positive power of two"):
+            fp4_decode(query, *common, num_splits=splits)
+
+    with pytest.raises(ValueError, match="cannot be combined with out_indices"):
+        fp4_decode(
+            query,
+            *common,
+            out=torch.zeros_like(query),
+            out_indices=torch.arange(3, device="cuda", dtype=torch.int32),
+            num_splits=2,
+        )
+
+    # A residual reaches the split path only through the BF16 query, which is
+    # what pads it to the residual MMA's row tile.
+    query_fp4, query_scales = _quantize.quantize_query(query, heads_kv=8)
+    with pytest.raises(ValueError, match="complete residual on the BF16 query"):
+        fp4_decode(
+            None,
+            *common,
+            query_fp4=query_fp4,
+            query_scales=query_scales,
+            residual_key_pages_bf16=inputs.key_pages_bf16,
+            residual_value_pages_bf16=inputs.value_pages_bf16,
+            residual_page_ids=inputs.residual_page_ids[:3],
+            seqused_residual=inputs.seqused_residual[:3],
+            num_splits=2,
+        )
+
+
 @pytest.mark.parametrize(
-    "pages, wants_split",
-    [(1, False), (64, True)],
+    "pages, num_splits",
+    [(1, 1), (64, 8)],
     ids=["single-tile", "split-k"],
 )
 @pytest.mark.parametrize(
@@ -1069,7 +1119,7 @@ def test_out_alone_keeps_split_k_and_writes_in_place(
 )
 def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
     pages: int,
-    wants_split: bool,
+    num_splits: int,
     damage: str,
     complaint: str,
 ) -> None:
@@ -1080,13 +1130,16 @@ def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
     mistake and a silent write into the wrong buffer: split-K hands ``out``
     to the combine, which will happily truncate a short one or accept a
     wrongly shaped one.
+
+    Naming a case "split-k" does not make it one; matching the complaint
+    does. A ``num_splits`` the dispatcher will not serve raises about
+    ``num_splits``, so a case that raises about ``out`` reached the branch it
+    is named for.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("SM100 is required")
-
-    from nvfp4_decode_kernel import _decode
 
     torch.manual_seed(0x0BAD)
     rows, heads_q, heads_kv, head_dim = 2, 16, 1, 128
@@ -1111,18 +1164,6 @@ def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
         (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
     )
 
-    # Naming a case "split-k" does not make it one, and a rejection on the
-    # single-tile path would look exactly the same.
-    sms = torch.cuda.get_device_properties(
-        query.device
-    ).multi_processor_count
-    splits = _decode.split_k_heuristic(rows, heads_kv, pages, sms=sms)
-    assert (splits > 1) is wants_split, (
-        f"{pages} pages on {sms} SMs was meant to reach "
-        f"{'split-K' if wants_split else 'the single tile'}, but the "
-        f"heuristic chose {splits} splits"
-    )
-
     shape = {
         "dtype": (rows, heads_q, head_dim),
         "short": (rows - 1, heads_q, head_dim),
@@ -1144,6 +1185,7 @@ def test_a_bad_out_is_refused_whether_or_not_split_k_runs(
             page_table,
             seqused_fp4,
             out=out,
+            num_splits=num_splits,
         )
 
 
@@ -1154,13 +1196,13 @@ def test_a_single_tile_out_returns_only_the_rows_it_wrote() -> None:
     the caller's whole buffer, rows it never wrote included. ``out_indices``
     stays the exception, since a scatter can land anywhere in the buffer and
     only the whole of it describes where the results went.
+
+    Passing no ``num_splits`` is what puts the call on the single-tile path.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("SM100 is required")
-
-    from nvfp4_decode_kernel import _decode
 
     torch.manual_seed(0x1717)
     rows, heads_q, heads_kv, pages, head_dim = 2, 16, 1, 1, 128
@@ -1187,15 +1229,6 @@ def test_a_single_tile_out_returns_only_the_rows_it_wrote() -> None:
         torch.full(
             (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
         ),
-    )
-
-    sms = torch.cuda.get_device_properties(
-        query.device
-    ).multi_processor_count
-    splits = _decode.split_k_heuristic(rows, heads_kv, pages, sms=sms)
-    assert splits == 1, (
-        "this test is about the path split-K does not take, but the "
-        f"heuristic chose {splits} splits for {sms} SMs"
     )
 
     spare_rows = 3

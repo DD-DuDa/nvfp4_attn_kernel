@@ -110,13 +110,26 @@ def fp4_decode_impl(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
+    num_splits: int = 1,
     query_padded_scratch: torch.Tensor | None = None,
     query_fp4_scratch: torch.Tensor | None = None,
     query_scales_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prepare either query contract and run the shared decode core."""
-    from ._decode import decode_fp4, decode_fp4_split, split_k_heuristic
+    from ._decode import decode_fp4, decode_fp4_split
     from ._quantize import quantize_query
+
+    # Powers of two keep one compiled kernel per occupancy tier and match the
+    # combine's fixed workspace contract. Checked before any quantization so a
+    # bad value costs nothing.
+    if (
+        not isinstance(num_splits, int)
+        or num_splits < 1
+        or num_splits & (num_splits - 1)
+    ):
+        raise ValueError(
+            f"num_splits must be a positive power of two, got {num_splits!r}"
+        )
 
     has_bf16_query = query is not None
     has_fp4_query = query_fp4 is not None or query_scales is not None
@@ -208,14 +221,19 @@ def fp4_decode_impl(
     # Only a scatter by index forces the single-tile path; the split path can
     # write into a caller's buffer, it just cannot reorder rows on the way.
     scatter_by_index = out_indices is not None
-    num_splits = 1
-    if splittable and not scatter_by_index:
-        device = query_fp4.device
-        num_splits = split_k_heuristic(
-            query_fp4.shape[0],
-            key_pages_fp4.shape[2],
-            fp4_page_table.shape[1],
-            sms=torch.cuda.get_device_properties(device).multi_processor_count,
+    # A split the dispatcher cannot serve is refused rather than served with
+    # one tile, so that a caller asking for the split path either gets it or
+    # hears why not.
+    if num_splits > 1 and not splittable:
+        raise ValueError(
+            "num_splits > 1 needs either no residual argument at all or a "
+            "complete residual on the BF16 query path; this combination "
+            "runs on the single-tile path only"
+        )
+    if num_splits > 1 and scatter_by_index:
+        raise ValueError(
+            "num_splits > 1 cannot be combined with out_indices, because the "
+            "split path's combine writes the batch's rows in order"
         )
     if num_splits > 1:
         # Keep the single public entry's full contract checks when dispatching

@@ -35,6 +35,7 @@ def fp4_decode(
     out: torch.Tensor | None = None,
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
+    num_splits: int = 1,
     query_padded_scratch: torch.Tensor | None = None,
     query_fp4_scratch: torch.Tensor | None = None,
     query_scales_scratch: torch.Tensor | None = None,
@@ -74,6 +75,22 @@ def fp4_decode(
         out_indices: Optional INT32 mapping from compact decode rows to rows
             in ``out``. Costs split-K, which cannot reorder rows on its way
             out, so pass it only when the rows really do have to move.
+        num_splits: How many key partitions the decode is split across, as a
+            positive power of two. One, the default, is the production
+            answer: split-K measures as a consistent 13-23% overhead on this
+            kernel, and under CUDA graph capture the page table is frozen at
+            the model's maximum length, so any count derived from it would be
+            an inflated one baked into every later replay, along with the
+            zero-filled FP32 partials and LSE the split path allocates. The
+            parameter exists so the split implementation stays reachable
+            through this entry from tests.
+
+            A value above one is honoured only where the split path can serve
+            it: no residual argument at all, or a complete residual on the
+            BF16 query path, and never together with ``out_indices``, whose
+            reordering the combine cannot perform. Asking for a split
+            anywhere else raises, because a request quietly downgraded to one
+            tile would look exactly like a split that ran.
         query_padded_scratch: Optional BF16 buffer shaped ``[at least rows,
             RESIDUAL_ROW_TILE, heads_q, head_dim]`` that holds the query padded
             to the residual MMA's row tile. Only the first row of each tile is
@@ -158,6 +175,7 @@ def fp4_decode(
         out=out,
         out_indices=out_indices,
         trusted_metadata=trusted_metadata,
+        num_splits=num_splits,
         query_padded_scratch=query_padded_scratch,
         query_fp4_scratch=query_fp4_scratch,
         query_scales_scratch=query_scales_scratch,
