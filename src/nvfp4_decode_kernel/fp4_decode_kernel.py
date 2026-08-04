@@ -143,7 +143,6 @@ class FP4DecodeKernel:
         is_varlen_q: bool = False,
         sf_dtype: Optional[Type[cutlass.Numeric]] = None,
         sf_vec_size: Optional[int] = None,
-        bf16_q_input: bool = False,
         fused_residual_first_block: bool = False,
         residual_source: str = "contiguous",
         use_out_indices: bool = False,
@@ -152,7 +151,6 @@ class FP4DecodeKernel:
         transpose_s: bool = False,
     ):
         assert sf_vec_size == 16 and sf_dtype == cutlass.Float8E4M3FN, "Only support NVFP4 for now"
-        self.bf16_q_input = bf16_q_input
         self.fused_residual_first_block = fused_residual_first_block
         # The residual is a single block, so under split-k exactly one split may
         # count it. The others run the block with a length of zero, which the
@@ -461,10 +459,7 @@ class FP4DecodeKernel:
         smem_mbar = 512  # generous upper bound for mbarrier storage
         smem_tmem = 4  # Int32
         smem_sScale = align_up(max(self.q_stage * self.m_block_size * 2, self.m_block_size * 4) * 4, align)  # Float32
-        q_smem_dtype_width = (
-            cutlass.BFloat16.width if self.bf16_q_input else self.q_dtype.width
-        )
-        smem_q_per_stage = self.m_block_size * self.head_dim_padded * q_smem_dtype_width // 8
+        smem_q_per_stage = self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
         smem_o_per_stage = self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
         # When the two overlap, sQ is widened to cover sO rather than sO being
         # dropped, so the budget has to charge the wider of the two.
@@ -671,24 +666,10 @@ class FP4DecodeKernel:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         self.compute_sp1 = const_expr(compute_sp1)
-        if const_expr(self.bf16_q_input):
-            assert mSFQ is None, "bf16_q_input=True requires mSFQ=None (kernel produces SFQ)"
-            self.q_input_dtype = self.q_dtype
-            assert self.q_input_dtype == cutlass.BFloat16, (
-                f"bf16_q_input=True requires BF16 mQ, got {self.q_input_dtype}"
-            )
-            # Pin q_dtype to FP4 for all downstream MMA-side code (sQ_layout,
-            # tiled_mma_qk, sfq_smem_layout_staged, etc.). A parallel BF16
-            # pathway is added below for the TMA load + staging.
-            self.q_dtype = cutlass.Float4E2M1FN
-            # quant_qk must be True: the kernel writes SFQ internally.
-            self.quant_qk = True
-        else:
-            self.q_input_dtype = self.q_dtype
-            if const_expr(mSFQ is None):
-                assert self.q_dtype.width >= 8
-                assert const_expr(mSFK is None), "Must provide both QK sfs or None"
-            self.quant_qk = const_expr(mSFQ is not None)
+        if const_expr(mSFQ is None):
+            assert self.q_dtype.width >= 8
+            assert const_expr(mSFK is None), "Must provide both QK sfs or None"
+        self.quant_qk = const_expr(mSFQ is not None)
         self.quant_pv = const_expr(mSFV is not None)
         assert not (not self.quant_qk and self.quant_pv)
 
@@ -712,7 +693,6 @@ class FP4DecodeKernel:
                     self.quant_pv,
                     self.pack_gqa,
                     self.seqlen_q_static_one,
-                    not self.bf16_q_input,
                     not self.compute_sp1,
                     not self.is_causal,
                     not self.is_local,
@@ -830,7 +810,7 @@ class FP4DecodeKernel:
             if const_expr(mSFV is not None):
                 self.v_dtype = cutlass.Float4E2M1FN
 
-        if const_expr(not self.bf16_q_input and self.q_dtype != self.k_dtype):
+        if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(mSFV is not None and self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
@@ -944,23 +924,6 @@ class FP4DecodeKernel:
             self.q_dtype,
             self.q_stage,
         )
-        sQ_bf16_layout = None
-        tiled_mma_qk_bf16 = None
-        if const_expr(self.bf16_q_input):
-            tiled_mma_qk_bf16 = sm100_utils_basic.make_trivial_tiled_mma(
-                cutlass.BFloat16,
-                self.q_major_mode,
-                self.k_major_mode,
-                self.qk_acc_dtype,
-                self.cta_group,
-                self.mma_tiler_qk[:2],
-            )
-            sQ_bf16_layout = sm100_utils_basic.make_smem_layout_a(
-                tiled_mma_qk_bf16,
-                self.mma_tiler_qk,
-                cutlass.BFloat16,
-                self.q_stage,
-            )
         sK_layout = make_k_smem_layout(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -1098,25 +1061,17 @@ class FP4DecodeKernel:
                     mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
                 )
 
-        if const_expr(self.bf16_q_input):
-            self.tma_copy_bytes = {
-                "Q": cute.size_in_bytes(cutlass.BFloat16, cute.select(sQ_bf16_layout, mode=[0, 1, 2])),
-                "K": cute.size_in_bytes(mK.element_type, cute.select(sK_layout, mode=[0, 1, 2])),
-                "V": cute.size_in_bytes(mV.element_type, cute.select(sV_layout, mode=[0, 1, 2])),
-            }
-        else:
-            self.tma_copy_bytes = {
-                name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
-                for name, mX, layout in [
-                    ("Q", mQ, sQ_layout),
-                    ("K", mK, sK_layout),
-                    ("V", mV, sV_layout),
-                ]
-            }
+        self.tma_copy_bytes = {
+            name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
+            for name, mX, layout in [
+                ("Q", mQ, sQ_layout),
+                ("K", mK, sK_layout),
+                ("V", mV, sV_layout),
+            ]
+        }
         # Add scale factor copy bytes to Q/K/V since they use the same barrier
-        if const_expr(self.quant_qk and not self.bf16_q_input):
-            self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]))
         if const_expr(self.quant_qk):
+            self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]))
             self.tma_copy_bytes["K"] += cute.size_in_bytes(mSFK.element_type, cute.select(sfk_smem_layout_staged, mode=[0, 1, 2]))
         if const_expr(self.quant_pv):
             self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
@@ -1125,32 +1080,20 @@ class FP4DecodeKernel:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
         mQ_shape = mQ.shape
-        if const_expr(self.bf16_q_input):
-            tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mQ,
-                cute.select(sQ_bf16_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk_bf16,
-                self.cluster_layout_vmnk.shape,
-            )
-        else:
-            # The FP4 Q tile is the B operand once S is transposed. The BF16
-            # staging buffer above keeps its own untransposed MMA because it
-            # only feeds the quantizer, never the tensor core.
-            make_q_tma_atom = (
-                cute.nvgpu.make_tiled_tma_atom_B
-                if const_expr(self.transpose_s)
-                else cute.nvgpu.make_tiled_tma_atom_A
-            )
-            tma_atom_Q, mQ = make_q_tma_atom(
-                tma_load_op,
-                mQ,
-                cute.select(sQ_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                self.cluster_layout_vmnk.shape,
-            )
+        # The FP4 Q tile is the B operand once S is transposed.
+        make_q_tma_atom = (
+            cute.nvgpu.make_tiled_tma_atom_B
+            if const_expr(self.transpose_s)
+            else cute.nvgpu.make_tiled_tma_atom_A
+        )
+        tma_atom_Q, mQ = make_q_tma_atom(
+            tma_load_op,
+            mQ,
+            cute.select(sQ_layout, mode=[0, 1, 2]),
+            self.mma_tiler_qk,
+            tiled_mma_qk,
+            self.cluster_layout_vmnk.shape,
+        )
 
         tma_atom_K = None
         tma_atom_V = None
@@ -1181,7 +1124,9 @@ class FP4DecodeKernel:
                 self.cluster_layout_vmnk.shape,
             )
 
+        tiled_mma_qk_bf16 = None
         tiled_mma_pv_bf16 = None
+        sQ_bf16_layout = None
         sK_bf16_layout = None
         sV_bf16_layout = None
         tP_bf16_layout = None
@@ -1343,7 +1288,7 @@ class FP4DecodeKernel:
         tma_tensor_sfk = None
         tma_atom_sfv = None
         tma_tensor_sfv = None
-        if const_expr(self.quant_qk and not self.bf16_q_input):
+        if const_expr(self.quant_qk):
             sfq_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mQ_shape_unpacked, (2, 1, 3, 4))
             sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
@@ -1378,8 +1323,6 @@ class FP4DecodeKernel:
 
         if const_expr(self.quant_qk):
             # Setup TMA load for SFK (scale factor for K, like SFB).
-            # Hoisted out of the SFQ block so it runs even when bf16_q_input=True
-            # (in that mode SFQ is produced in-kernel but SFK is still TMA-loaded).
             sfk_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
@@ -1588,12 +1531,7 @@ class FP4DecodeKernel:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
-        if const_expr(self.bf16_q_input):
-            sQ_bf16_size_in_fp4 = (
-                cute.cosize(sQ_bf16_layout) * cutlass.BFloat16.width // self.q_dtype.width
-            )
-            sQ_size = cutlass.max(sQ_size, sQ_bf16_size_in_fp4)
-        
+
         # Calculate scale factor shared memory sizes
         # Use size 1 as minimum to avoid alignment issues when size is 0
         sfq_smem_size = cute.cosize(sfq_smem_layout_staged) if const_expr(self.quant_qk) else 1
@@ -1719,10 +1657,7 @@ class FP4DecodeKernel:
         )
         print(f"Total shared memory used: {total_smem_bytes / 1024:.2f} KB")
         sO_bytes = cute.size_in_bytes(self.o_dtype, sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
-        if const_expr(self.bf16_q_input):
-            sQ_bytes = cute.size_in_bytes(cutlass.BFloat16, sQ_bf16_layout)
-        else:
-            sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
+        sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
         sK_bytes = cute.size_in_bytes(self.k_dtype, sK_layout)
         sV_bytes = cute.size_in_bytes(self.v_dtype, sV_layout)
         sfq_bytes = cute.size_in_bytes(cutlass.Uint8, sfq_smem_layout_staged)
@@ -2054,14 +1989,9 @@ class FP4DecodeKernel:
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sQ_bf16 = None
         sQ_uint8 = None
-        if const_expr(self.bf16_q_input):
-            sQ_bf16 = cute.make_tensor(
-                cute.recast_ptr(sQ.iterator, sQ_bf16_layout.inner, cutlass.BFloat16),
-                sQ_bf16_layout.outer,
-            )
-        # Byte view of the FP4 Q tile. Quantizing from BF16 needs it to place
-        # nibble pairs; replicating a pre-quantized Q needs it to move rows.
-        if const_expr(self.bf16_q_input or self.q_replicate > 1):
+        # Byte view of the FP4 Q tile, which is how replication moves rows: a
+        # thread owns whole bytes, never a single nibble.
+        if const_expr(self.q_replicate > 1):
             uint8_swizzle = cute.make_swizzle(2, 4, 3)
             # FP4 atom_K (per kH) = head_dim_padded//2 elements; Uint8
             # atom_K_byte = atom_K_FP4 // 2 = head_dim_padded // 4.
@@ -2144,7 +2074,6 @@ class FP4DecodeKernel:
                 )
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
-        thr_mma_qk_bf16 = tiled_mma_qk_bf16.get_slice(0) if const_expr(self.bf16_q_input) else None
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
 
         qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
@@ -2412,7 +2341,6 @@ class FP4DecodeKernel:
                 sfv_smem_layout_staged,
                 sSFV,
                 sQ_bf16=sQ_bf16,
-                thr_mma_qk_bf16=thr_mma_qk_bf16,
                 sQ_uint8=sQ_uint8,
                 mResidualK_t=mResidualK,
                 mResidualV_t=mResidualV,
@@ -2661,8 +2589,6 @@ class FP4DecodeKernel:
         sfv_smem_layout_staged: Optional[cute.ComposedLayout] = None,
         sSFV: Optional[cute.Tensor] = None,
         sQ_bf16: Optional[cute.Tensor] = None,
-        # BF16 trivial MMA's thread slice (for partitioning the BF16 gQ).
-        thr_mma_qk_bf16: Optional[cute.ThrMma] = None,
         sQ_uint8: Optional[cute.Tensor] = None,
         mResidualK_t: Optional[cute.Tensor] = None,
         mResidualV_t: Optional[cute.Tensor] = None,
@@ -2712,21 +2638,13 @@ class FP4DecodeKernel:
                 gV = cute.local_tile(
                     mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                 )
-            if const_expr(self.bf16_q_input):
-                tSgQ = thr_mma_qk_bf16.partition_A(gQ)
-            else:
-                tSgQ = thr_mma_qk.partition_A(gQ)
+            tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
 
-            if const_expr(self.bf16_q_input):
-                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ_bf16
-                )
-            else:
-                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
-                )
+            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
+            )
 
             if const_expr(self.use_tma_KV):
                 tKsK, tKgK = cpasync.tma_partition(
@@ -2766,7 +2684,7 @@ class FP4DecodeKernel:
                 tVsV, tVgV = None, None
 
             load_SFQ_fn = None
-            if const_expr(self.quant_qk and not self.bf16_q_input):
+            if const_expr(self.quant_qk):
                 tma_tensor_sfq_cur = seqlen.offset_batch_Q(tma_tensor_sfq, batch_idx, dim=3)[None, None, head_idx]
                 gSFQ = cute.local_tile(tma_tensor_sfq_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
                 tSgSFQ = thr_mma_qk.partition_A(gSFQ)
@@ -2833,24 +2751,12 @@ class FP4DecodeKernel:
                 phase=q_producer_phase,
                 load_SFQ_fn=load_SFQ_fn if const_expr(tma_atom_sfq is not None) else None,
             )
-            quantize_Q = None
-            if const_expr(self.bf16_q_input):
-                quantize_Q = partial(
-                    self.quantize_Q_bf16_to_fp4,
-                    sQ,
-                    sQ_bf16,
-                    sQ_uint8,
-                    sSFQ,
-                    mbar_ptr + self.mbar_load_q_full_offset,
-                    mbar_ptr + self.mbar_q_fp4_ready_offset,
-                    phase=q_producer_phase ^ 1,  # waits for the just-issued TMA
-                    tidx=tidx,
-                )
-            elif const_expr(self.q_replicate > 1):
-                # A pre-quantized Q has no in-kernel transform to fold the
-                # replication into, so it gets its own pass over the tile. It
-                # signals the same barrier the quantizing path does.
-                quantize_Q = partial(
+            replicate_Q = None
+            if const_expr(self.q_replicate > 1):
+                # Replication gets its own pass over the tile between the TMA
+                # and the first MMA, signalling mbar_q_fp4_ready when the tile
+                # is whole.
+                replicate_Q = partial(
                     self.replicate_Q_fp4_rows,
                     sQ_uint8,
                     sSFQ,
@@ -3021,9 +2927,9 @@ class FP4DecodeKernel:
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
                         load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1 + SFQ1
-                    if const_expr(self.bf16_q_input or self.q_replicate > 1):
+                    if const_expr(self.q_replicate > 1):
                         for qs in cutlass.range_constexpr(self.q_stage):
-                            quantize_Q(stage=qs)
+                            replicate_Q(stage=qs)
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0 + SFV0
                     kv_producer_state.advance()
@@ -3416,7 +3322,7 @@ class FP4DecodeKernel:
                     residual_kv_full_phase ^= 1
                 for stage in cutlass.range_constexpr(self.q_stage):
                     iket.range_push("mma_wait_qk")
-                    if const_expr(self.bf16_q_input or self.q_replicate > 1):
+                    if const_expr(self.q_replicate > 1):
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_q_fp4_ready_offset + stage,
                             mma_q_consumer_phase,
@@ -5753,201 +5659,6 @@ class FP4DecodeKernel:
         # Load scale factor for Q if provided
         if const_expr(load_SFQ_fn is not None):
             load_SFQ_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
-
-    @cute.jit
-    def quantize_Q_bf16_to_fp4(
-        self,
-        sQ: cute.Tensor,         # FP4-typed view of staging region (write target)
-        sQ_bf16: cute.Tensor,    # BF16-typed view of the same physical bytes
-        sQ_uint8: cute.Tensor,   # Uint8-typed view (for swizzle-aware byte addressing)
-        sSFQ: cute.Tensor,       # SF SMEM (write target)
-        mbar_full_ptr: cute.Pointer,    # mbar_load_q_full (BF16 TMA arrival)
-        mbar_ready_ptr: cute.Pointer,   # mbar_q_fp4_ready  (FP4-Q-ready signal)
-        stage: int,
-        phase: Int32,
-        tidx: Int32,
-    ):
-        """Quantize the BF16 Q tile to FP4 cooperatively in shared memory.
-
-        Runs after the BF16 TMA load and uses max-abs over each
-        SF_VEC=16 chunk -> E4M3 SF byte -> packed FP4 nibbles), but reads
-        from swizzled SMEM and writes to swizzled SMEM in-place.
-
-        Tile geometry (m_block_size=128, head_dim=128, sf_vec_size=16):
-          rows M=128, SF groups per row = 8 -> 1024 SF cells total.
-          With 32 load-warp threads, each thread owns 32 cells, striding
-          over the (m, sf_group) plane. Per cell: 1 SF byte + 8 FP4 bytes
-          (=16 nibbles).
-
-        SMEM tensor shapes (from `make_smem_layout_a` / `make_smem_layout_sfa`):
-          sQ_bf16: ((M=128, atomK=16), 1, (kQ=4, kH=2), STAGE)
-                   stride ((64, 1), 0, (16, 8192), 0); Swizzle<3,4,3>
-          sQ_fp4 : ((M=128, atomK=64), 1, kH=2, STAGE)
-                   stride ((128, 1), 0, 64, 0); Swizzle<2,4,3>
-          sSFQ   : ((((lane=32, warp=4), 1), (j_in_vec=16, k_inst=4)), 1, mma_k=2, STAGE)
-                   stride ((((16, 4), 0), (0, 1)), 0, 512, 1024)
-
-        Indexing recipe (logical (m, sf_group) where sf_group in [0, 8)):
-          k_in_atom_bf16 = k % 16       # per BF16 atom_K
-          kQ             = (k // 16) % 4
-          kH             = (k // 16) // 4 == k // 64
-          k_in_atom_fp4  = k % 64       # per FP4 atom_K
-          For SFQ: lane=m%32, warp=m//32, mma_k=sf_group//4, k_inst=sf_group%4
-        """
-        # Wait for BF16 TMA arrival.
-        cute.arch.mbarrier_wait(mbar_full_ptr + stage, phase)
-
-        m_block_size = const_expr(self.m_block_size)
-        head_dim = const_expr(self.head_dim_padded)
-        sf_vec = const_expr(self.sf_vec_size)
-        sf_groups_per_row = const_expr(head_dim // sf_vec)
-        total_cells = const_expr(m_block_size * sf_groups_per_row)
-        num_threads = const_expr(len(self.load_warp_ids) * cute.arch.WARP_SIZE)
-
-        inv6 = Float32(1.0 / 6.0)
-
-        # Slice per stage. The 4D logical-to-staged dimension is the last axis.
-        sQ_bf16_stg = sQ_bf16[None, None, None, stage]
-        sQ_fp4_stg = sQ[None, None, None, stage]
-        sSFQ_stg = sSFQ[None, None, None, stage]
-        # Recast sSFQ_stg to Uint8 for raw byte writes (sSFQ element_type is
-        # Float8E4M3FN which doesn't accept i8 stores directly).
-        sSFQ_u8_stg = cute.recast_tensor(sSFQ_stg, cutlass.Uint8)
-
-        # Iterate cells; each thread strides through `total_cells` by `num_threads`.
-        # PHASE 1: each thread reads its 32 cells' BF16 lanes into rmem AND
-        # computes the SF byte. We persist the SF byte (which we re-decode to
-        # FP32 divisor) and the 16 scaled-FP32 values per cell across phases.
-        # All BF16 reads complete before any FP4 nibble write, BUT we cannot
-        # mix reads and writes within the loop because cross-thread RAW races
-        # exist (thread A writing FP4 to bytes shared with thread B's later
-        # BF16 reads). Unify: read all BF16 + compute all scaled values,
-        # warp-sync, then write all FP4.
-        cells_per_thread = const_expr(total_cells // num_threads)
-        # Persistent rmem for `cells_per_thread` SF-packed words and scaled-fp32
-        # values. Each cell holds: 1 packed_lo Int32 + 1 packed_hi Int32.
-        packed_lo_rmem = cute.make_rmem_tensor(
-            cute.make_layout(cells_per_thread), cutlass.Int32
-        )
-        packed_hi_rmem = cute.make_rmem_tensor(
-            cute.make_layout(cells_per_thread), cutlass.Int32
-        )
-
-        # Phase 1: read all BF16 + write SF byte + compute packed FP4 in rmem.
-        for c in cutlass.range_constexpr(cells_per_thread):
-            cell = tidx + c * num_threads
-            m = cell // sf_groups_per_row
-            sf_group = cell % sf_groups_per_row
-            # Under Q replication the destination row m carries query row
-            # m // q_replicate. Reading the source row here is the whole cost of
-            # replicating on this path: the tile is quantized row by row anyway,
-            # and rows that used to be an out-of-range TMA's zeros now repeat a
-            # real query. Phase 1 reads every source row before phase 2 writes
-            # any FP4 byte, so the aliasing between the two views is unaffected.
-            m_src = m // const_expr(self.q_replicate)
-
-            # Read 16 BF16 lanes for this (m, sf_group) into FP32 register file.
-            vals_f32 = cute.make_rmem_tensor(
-                cute.make_layout(sf_vec), Float32
-            )
-            local_max = Float32(0.0)
-            for j in cutlass.range_constexpr(sf_vec):
-                k = sf_group * sf_vec + j
-                k_in_atom_bf16 = k % sf_vec    # k % 16
-                kQ = (k // sf_vec) % 4
-                kH = k // (sf_vec * 4)
-                v = Float32(
-                    sQ_bf16_stg[(m_src, k_in_atom_bf16), 0, (kQ, kH)]
-                )
-                vals_f32[j] = v
-                a = cute.arch.fmax(v, -v)
-                local_max = cute.arch.fmax(local_max, a)
-
-            # SF byte = max/6 cast to E4M3, then re-decoded to FP32 as divisor.
-            sf_pre = local_max * inv6
-            # Pack 4-elem FP32 -> 4-byte E4M3 packed uint32; we only use the
-            # low byte as the SF byte for this group (other bytes are zero).
-            sf_packed = packed_float_to_ue4m3(
-                sf_pre, Float32(0.0), Float32(0.0), Float32(0.0)
-            )
-            sf_byte_low = sf_packed & 0xFF
-
-            # Canonical SFA mapping: lane = m % 32, warp = m // 32 (CuTe column-major
-            # linearization of the (32 lane, 4 warp) M-atom). This matches the
-            # host-side _pack_sfq_for_gqa formula r = 32*m2 + m1 in interface.py.
-            lane = m % 32
-            warp = m // 32
-            mma_k = sf_group // 4
-            k_inst = sf_group % 4
-            # sSFQ element type is Float8E4M3FN; write via the Uint8-recast view.
-            sSFQ_u8_stg[(((lane, warp), 0), (0, k_inst)), 0, mma_k] = (
-                cutlass.Uint8(sf_byte_low)
-            )
-
-            # Re-decode E4M3 SF to FP32 divisor (matches host-side flashinfer
-            # rounding — divisor is the post-cast SF value).
-            sf_e4m3_rmem = cute.make_rmem_tensor(
-                cute.make_layout(4), cutlass.Float8E4M3FN
-            )
-            sf_e4m3_as_u32 = cute.recast_tensor(sf_e4m3_rmem, cutlass.Int32)
-            sf_e4m3_as_u32[0] = sf_packed
-            sf_post_ssa = sf_e4m3_rmem.load().to(Float32)
-            sf_post = sf_post_ssa[0]
-
-            # Quantize 16 BF16 -> 16 FP4 nibbles, packed 8 per uint32 word.
-            inv_sf = Float32(1.0) / (sf_post + Float32(1.0e-30))
-            scaled = [Float32(0.0)] * 16
-            for j in cutlass.range_constexpr(sf_vec):
-                scaled[j] = vals_f32[j] * inv_sf
-            packed_lo = packed_float_to_e2m1(
-                scaled[0], scaled[1], scaled[2], scaled[3],
-                scaled[4], scaled[5], scaled[6], scaled[7],
-            )
-            packed_hi = packed_float_to_e2m1(
-                scaled[8],  scaled[9],  scaled[10], scaled[11],
-                scaled[12], scaled[13], scaled[14], scaled[15],
-            )
-
-            # Stash packed FP4 words in rmem for phase 2 (after warp sync).
-            packed_lo_rmem[c] = packed_lo
-            packed_hi_rmem[c] = packed_hi
-
-        # Phase 1.5: warp-sync to ensure all threads have completed BF16 reads
-        # before any thread writes FP4 nibbles back to the same physical bytes.
-        cute.arch.sync_warp()
-
-        # Phase 2: write all FP4 nibble pairs to sQ.
-        # Use the swizzle-aware tensor `[]=` operator (per-byte) instead of
-        # raw iterator arithmetic. `cute.crd2idx(coord, ComposedLayout)`
-        # returns the LOGICAL pre-swizzle offset; bypassing the swizzle
-        # corrupts SMEM at all but a few aligned coords. The tensor's
-        # `[]=` does the right thing because it goes through the
-        # ComposedLayout's swizzle.
-        sQ_uint8_stg = sQ_uint8[None, None, None, stage]
-        for c in cutlass.range_constexpr(cells_per_thread):
-            cell = tidx + c * num_threads
-            m = cell // sf_groups_per_row
-            sf_group = cell % sf_groups_per_row
-            k_byte_base = sf_group * (sf_vec // 2)  # in [0, 64) bytes per row
-            kH_fp4 = k_byte_base // 32              # ∈ {0, 1}
-            packed_lo = packed_lo_rmem[c]
-            packed_hi = packed_hi_rmem[c]
-            for b_in in cutlass.range_constexpr(8):
-                # Bytes 0..3 come from packed_lo, 4..7 from packed_hi.
-                src = packed_lo if const_expr(b_in < 4) else packed_hi
-                shift = (b_in % 4) * 8
-                byte_val = cutlass.Uint8((src >> shift) & 0xFF)
-                atom_K_b = (k_byte_base + b_in) % 32
-                sQ_uint8_stg[(m, atom_K_b), 0, kH_fp4] = byte_val
-
-        # Memory fence so MMA warp's sQ/sSFQ reads see our writes.
-        # All 32 threads in the load warp participate in the quant; sync them
-        # before the elected-one arrive so every thread's writes are visible.
-        cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
-
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive(mbar_ready_ptr + stage)
 
     @cute.jit
     def replicate_Q_fp4_rows(
