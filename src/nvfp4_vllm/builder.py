@@ -7,16 +7,23 @@ it decides which BF16 tail slot each request owns, and every layer downstream
 reads that decision rather than recomputing it.
 
 The step counter inside the control plane therefore has to track scheduler
-steps exactly. Two configurations would break that and are refused in
-``guards``: microbatching builds metadata per ubatch, and full CUDA graphs
-build metadata during capture, neither of which is a step.
+steps exactly. One configuration would break that and is refused in
+``guards``: microbatching builds metadata per ubatch, which is not a step.
+
+CUDA graph capture also builds metadata that is not a step, and is allowed
+anyway. Every row of a capture batch keys on the null block, so the control
+plane judges all of them not live and no slot changes hands; on top of that,
+``build_for_cudagraph_capture`` records that it ran and the first real
+``build`` afterwards resets the table, which leaves nothing of capture behind
+without anyone having to reason about what capture did.
 
 Startup is not covered by those guards and does not need to be. Sizing the KV
 cache and warming the kernels both run batches through this path before any
 request exists, so the control plane sees a few steps before serving begins.
 The dummy batch among them keys on the null block and is ignored; the warmup
 batches look exactly like real requests, take slots, and are then abandoned,
-which is the case lazy reclamation already handles.
+which is the case lazy reclamation already handles — and, when graphs are on,
+the reset after capture erases even that.
 """
 
 from __future__ import annotations
@@ -25,7 +32,10 @@ import os
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    CommonAttentionMetadata,
+)
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
@@ -61,6 +71,14 @@ def decode_split(
     happened. Without it, a vLLM that stopped reordering would have the decode
     kernel attend to prefill rows' caches with decode rows' queries, which is
     wrong everywhere and loud nowhere.
+
+    A batch dispatched to a full CUDA graph is padded out to the captured
+    width with rows carrying no token at all. Those rows stay inside the
+    returned prefix, because the kernels have to keep the shape the graph was
+    captured at, and the control plane gives them no slot and no length. They
+    are only ever a suffix: vLLM pads a uniform decode batch and nothing else,
+    so a zero-length row among the real ones would mean something other than
+    padding put it there.
     """
     num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
         common_attn_metadata, decode_threshold=1
@@ -69,11 +87,16 @@ def decode_split(
     query_lens = query_start_loc[1 : common_attn_metadata.num_reqs + 1] - (
         query_start_loc[: common_attn_metadata.num_reqs]
     )
-    # The second condition is the one that can fire. vLLM counts the prefix by
+    decode_lens = query_lens[:num_decodes]
+    # Where the padding starts, if there is any. Comparing only below it also
+    # decides that the zero-length rows are contiguous at the end, since a zero
+    # anywhere earlier falls inside the compared range.
+    scheduled = int((decode_lens > 0).sum())
+    # The last condition is the one that can fire. vLLM counts the prefix by
     # scanning one-token rows from the front, so an unsorted batch gives a
     # prefix that is too short rather than a wrong one, and what gives it away
     # is a one-token row left behind among the prefills.
-    if not bool((query_lens[:num_decodes] == 1).all()) or not bool(
+    if not bool((decode_lens[:scheduled] == 1).all()) or not bool(
         (query_lens[num_decodes:] > 1).all()
     ):
         raise ValueError(
@@ -99,6 +122,27 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
     batch; see ``decode_split``.
     """
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        """How much of a batch this backend can have captured.
+
+        FlashAttention answers ``ALWAYS`` on FA3, which claims a mixed
+        prefill+decode batch can go into one graph. That is true of it and not
+        of us: an NVFP4 prefill runs varlen FlashAttention over a token count
+        that changes every step, so only the uniform one-token decode batches
+        can be frozen. vLLM reads this before any builder is constructed, so
+        the cache dtype has to come from the configuration rather than from
+        ``self.nvfp4``.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config is None or cache_config.cache_dtype != NVFP4:
+            return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -110,6 +154,11 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
 
         cache_config = vllm_config.cache_config
         self.nvfp4 = cache_config is not None and cache_config.cache_dtype == NVFP4
+        # Raised once capture has asked for metadata, and read by the first
+        # ``build`` that is a real step again. ``capturing`` distinguishes the
+        # builds capture drives from that step, since both reach ``build``.
+        self.built_for_capture = False
+        self.capturing = False
         if not self.nvfp4:
             self.plane = None
             return
@@ -144,6 +193,30 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
             device=device,
         )
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashAttentionMetadata:
+        """Metadata for a batch being recorded into a graph, not served.
+
+        Nothing here differs from a normal build; the point is the record that
+        it happened, so that ``build`` can throw away whatever capture left in
+        the slot table. Capture is expected to leave nothing — every row of a
+        capture batch keys on the null block and is not live — but this is the
+        one moment in an engine's life when no request exists to lose, so the
+        cheap thing to do is not rely on that.
+        The base implementation routes straight back into ``build``, so the
+        flag is raised only once that has returned. Raising it first would
+        have ``build`` consume it on the way through and leave it low when
+        capture ends, which is the one moment it has to be high.
+        """
+        self.capturing = True
+        try:
+            return super().build_for_cudagraph_capture(common_attn_metadata)
+        finally:
+            self.capturing = False
+            if self.nvfp4:
+                self.built_for_capture = True
+
     def build(
         self,
         common_prefix_len: int,
@@ -153,6 +226,15 @@ class NVFP4MetadataBuilder(FlashAttentionMetadataBuilder):
         base = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if not self.nvfp4:
             return base
+
+        if self.built_for_capture and not self.capturing:
+            # First step after capture, and only that one: the builds capture
+            # itself makes arrive through here too, and clearing the table
+            # between them would just be undone by the next one. The table
+            # goes back to the state it had before the engine warmed up,
+            # including the step counter each captured size advanced.
+            self.built_for_capture = False
+            self.plane.reset()
 
         # seq_lens is read as num_computed_tokens + num_scheduled_tokens, and
         # the FP4/BF16 page split is derived from it, so the other reading would

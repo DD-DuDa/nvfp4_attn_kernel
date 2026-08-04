@@ -25,7 +25,7 @@ import gc
 import os
 
 import pytest
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 
 from nvfp4_vllm.guards import MAX_SLOTS, UnsupportedConfigError, check_supported
 
@@ -53,7 +53,6 @@ def _config(cache_dtype: str = "nvfp4", **overrides) -> VllmConfig:
     config.cache_config.block_size = PAGE_SIZE
     config.scheduler_config.max_num_seqs = MAX_SLOTS
     config.scheduler_config.enable_chunked_prefill = False
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
     for name, value in overrides.items():
         for section in (
@@ -82,11 +81,18 @@ REJECTED = {
     "dual_batch_overlap": {"enable_dbo": True},
     "ubatch_size": {"ubatch_size": 2},
     "pipeline_parallel": {"pipeline_parallel_size": 2},
-    "cudagraphs": {"cudagraph_mode": CUDAGraphMode.PIECEWISE},
 }
 
 
 def test_default_configuration_is_accepted():
+    """vLLM's own default, which asks for graphs, is one of the accepted ones.
+
+    Whether a graph mode can be served is not this function's call to make:
+    the backend declares how much of a batch it can have captured and vLLM's
+    resolver narrows the mode to match, with an error that names the backend
+    if a mode was forced that cannot be narrowed to. A second refusal here
+    would only be a differently worded version of that one.
+    """
     check_supported(_config())
 
 

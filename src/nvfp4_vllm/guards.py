@@ -9,7 +9,7 @@ runs once per layer per engine and is not cached.
 
 from __future__ import annotations
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.v1.attention.backend import AttentionImpl, AttentionType
 
 from .control import MAX_SUPPORTED_SLOTS
@@ -113,17 +113,6 @@ def check_supported(vllm_config: VllmConfig) -> None:
             "is not supported by the NVFP4 KV cache: page promotion is driven "
             "from the last attention layer, which a pipeline stage does not "
             "own. Pass pipeline_parallel_size=1."
-        )
-
-    compilation_config = vllm_config.compilation_config
-    if (
-        compilation_config is not None
-        and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-    ):
-        raise UnsupportedConfigError(
-            f"cudagraph_mode={compilation_config.cudagraph_mode.name} is not "
-            "supported by the NVFP4 KV cache: graph capture over the promotion "
-            "path is unverified. Pass enforce_eager=True."
         )
 
 
