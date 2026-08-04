@@ -119,16 +119,6 @@ assert (
 # splitting eight and thirty-two rows four ways wins 5 and 10 percent.
 MIN_ROWS_PER_SOFTMAX_GROUP = 2
 
-# Which group owns a query row decides the tensor-memory column its softmax
-# reads S from, and above this many query rows moving a row to a different
-# group stops being numerically neutral: at 32 rows the rows whose column
-# offset moves come out about one percent different from the untransposed
-# path, which tests/kernel compares against exactly. At 16 rows and below the
-# wider split is bit-exact for every head configuration measured. Two groups
-# stays available above the cap because that is the split those tiles already
-# ran with.
-MAX_EXACT_SOFTMAX_SPLIT_ROWS = 16
-
 
 class FP4DecodeKernel:
     arch = 100
@@ -440,8 +430,6 @@ class FP4DecodeKernel:
             return 1
         if self.transposed_query_rows < 2:
             return 1
-        if self.transposed_query_rows > MAX_EXACT_SOFTMAX_SPLIT_ROWS:
-            return 2
         return min(
             MAX_SOFTMAX_ROW_GROUPS,
             max(2, self.transposed_query_rows // MIN_ROWS_PER_SOFTMAX_GROUP),
