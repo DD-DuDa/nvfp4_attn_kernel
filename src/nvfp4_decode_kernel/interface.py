@@ -36,6 +36,8 @@ def fp4_decode(
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
     query_padded_scratch: torch.Tensor | None = None,
+    query_fp4_scratch: torch.Tensor | None = None,
+    query_scales_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run paged NVFP4 decode attention.
 
@@ -79,6 +81,32 @@ def fp4_decode(
             again. Supplying one avoids reallocating and rezeroing it on every
             call, which matters when a residual is present on every layer of
             every step.
+        query_fp4_scratch: Optional UINT8 buffer shaped ``[at least rows, 1,
+            heads_q, head_dim // 2]`` that receives the packed E2M1 query. The
+            quantizer rewrites every byte of it, so whatever it arrives
+            holding is irrelevant.
+        query_scales_scratch: Optional UINT8 buffer shaped ``[at least rows,
+            1, heads_q, head_dim // 64, 32, 4, 4]`` that receives the E4M3
+            query scale factors. Unlike ``query_fp4_scratch`` this one carries
+            the same obligation as ``query_padded_scratch``, and for a
+            sharper reason: the layout reserves ``32 * 4`` scale slots per KV
+            head and only the ``heads_q // heads_kv`` of them that carry a
+            query head are ever written. Nothing clears the others, so a
+            buffer zeroed once is byte-for-byte what an internal allocation
+            would have produced, while one handed over uninitialized feeds the
+            MMA whatever it found for as long as it is reused. No shape check
+            can catch that.
+
+            For the same reason a buffer belongs to one ``(heads_q, heads_kv,
+            head_dim)`` triple for its whole life. Its shape says nothing
+            about ``heads_kv``, so the shape check cannot notice the reuse,
+            but ``heads_q // heads_kv`` is exactly what picks the slots that
+            get written: at ``heads_kv == 1`` query head ``h`` lands in slot
+            ``h`` of the single KV head's tile, and at ``heads_kv == 8`` in
+            slot ``h % (heads_q // 8)`` of tile ``h // (heads_q // 8)``.
+            Handing the first buffer to the second geometry leaves the slots
+            only the first one wrote still holding its scales, where the
+            second needs zeros.
 
     Returns:
         A compact BF16 output for the selected query rows. It is a view of
@@ -131,4 +159,6 @@ def fp4_decode(
         out_indices=out_indices,
         trusted_metadata=trusted_metadata,
         query_padded_scratch=query_padded_scratch,
+        query_fp4_scratch=query_fp4_scratch,
+        query_scales_scratch=query_scales_scratch,
     )

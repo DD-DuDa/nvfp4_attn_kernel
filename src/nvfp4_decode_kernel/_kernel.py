@@ -47,6 +47,48 @@ def _padded_query_buffer(
     return scratch[:rows]
 
 
+def _check_quantizer_scratch(
+    scratch: torch.Tensor | None,
+    name: str,
+    rows: int,
+    trailing: tuple[int, ...],
+    device: torch.device,
+) -> None:
+    """Vet a caller-owned buffer for one of the quantizer's two outputs.
+
+    Same bargain as ``_padded_query_buffer``, and made for the same reason: a
+    framework that sizes its KV cache around what profiling left free wants
+    every decode buffer to exist before that measurement, and wants the step
+    itself to neither allocate nor fill. Only the row count may exceed what
+    this batch needs, since rows are dim 0 and everything the decode kernel
+    checks about the scale layout is an inner stride.
+
+    Both buffers reach kernels compiled with ``assumed_align=16``, so the
+    requirement is really on the address rather than on the layout. Demanding
+    storage offset zero buys that without an alignment test: offset zero is
+    the start of a PyTorch allocation, which the caching allocator hands out
+    aligned to 512 bytes, far past the 16 the kernels assume. A contiguous
+    view onto the middle of somebody else's tensor carries no such guarantee.
+    """
+    if scratch is None:
+        return
+    if (
+        scratch.dtype is not torch.uint8
+        or scratch.device != device
+        or scratch.ndim != 1 + len(trailing)
+        or scratch.shape[0] < rows
+        or tuple(scratch.shape[1:]) != trailing
+        or not scratch.is_contiguous()
+        or scratch.storage_offset() != 0
+    ):
+        extents = ", ".join(str(extent) for extent in trailing)
+        raise ValueError(
+            f"{name} must be a contiguous UINT8 tensor on the query's device "
+            f"shaped [at least {rows}, {extents}], starting at storage "
+            "offset zero"
+        )
+
+
 def fp4_decode_impl(
     query: torch.Tensor | None,
     key_pages_fp4: torch.Tensor,
@@ -69,6 +111,8 @@ def fp4_decode_impl(
     out_indices: torch.Tensor | None = None,
     trusted_metadata: bool = False,
     query_padded_scratch: torch.Tensor | None = None,
+    query_fp4_scratch: torch.Tensor | None = None,
+    query_scales_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prepare either query contract and run the shared decode core."""
     from ._decode import decode_fp4, decode_fp4_split, split_k_heuristic
@@ -99,11 +143,28 @@ def fp4_decode_impl(
             if residual_key_pages_bf16 is not None
             else None
         )
+        heads, head_dim = query.shape[1], query.shape[2]
+        _check_quantizer_scratch(
+            query_fp4_scratch,
+            "query_fp4_scratch",
+            rows,
+            (1, heads, head_dim // 2),
+            query.device,
+        )
+        _check_quantizer_scratch(
+            query_scales_scratch,
+            "query_scales_scratch",
+            rows,
+            (1, heads, head_dim // 64, 32, 4, 4),
+            query.device,
+        )
         query_fp4, query_scales = quantize_query(
             query,
             row_indices=query_row_indices,
             query_padded_out=query_padded_bf16,
             heads_kv=key_pages_fp4.shape[2],
+            query_fp4_scratch=query_fp4_scratch,
+            query_scales_scratch=query_scales_scratch,
         )
     else:
         if query_fp4 is None or query_scales is None:
@@ -114,10 +175,15 @@ def fp4_decode_impl(
             raise ValueError(
                 "query_row_indices applies only to the BF16 query path"
             )
-        if query_padded_scratch is not None:
-            raise ValueError(
-                "query_padded_scratch applies only to the BF16 query path"
-            )
+        for name, scratch in (
+            ("query_padded_scratch", query_padded_scratch),
+            ("query_fp4_scratch", query_fp4_scratch),
+            ("query_scales_scratch", query_scales_scratch),
+        ):
+            if scratch is not None:
+                raise ValueError(
+                    f"{name} applies only to the BF16 query path"
+                )
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         query_padded_bf16 = None

@@ -17,8 +17,25 @@ def quantize_query(
     row_indices: torch.Tensor | None = None,
     query_padded_out: torch.Tensor | None = None,
     heads_kv: int | None = None,
+    query_fp4_scratch: torch.Tensor | None = None,
+    query_scales_scratch: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize BF16 decode rows with the CuTeDSL query kernel."""
+    """Quantize BF16 decode rows with the CuTeDSL query kernel.
+
+    Both outputs may come from the caller instead of a fresh allocation, and
+    may be wider than this batch. Rows are dim 0 of each, so the prefix slice
+    taken here leaves every inner stride alone and the scale view still comes
+    out with the layout the decode kernel insists on. A supplied scale buffer
+    must arrive zeroed: the layout reserves 128 scale slots per KV head and
+    the kernel writes only the ``heads // heads_kv`` of them that carry a
+    query head. Nothing clears the rest, so a buffer that starts out zeroed
+    is byte-for-byte what a fresh allocation would have produced, and one
+    that does not stays wrong for as long as it is reused. Which slots those
+    are follows ``heads // heads_kv`` while the storage shape does not, so a
+    scale buffer also belongs to one ``(heads, heads_kv, head_dim)`` triple
+    for its whole life: carrying it across a ``heads_kv`` change leaves the
+    previous geometry's scales sitting in slots the new one needs zeroed.
+    """
     if query.dtype is not torch.bfloat16 or not query.is_cuda:
         raise ValueError("query must be a BF16 CUDA tensor")
     if query.ndim != 3 or query.stride(-1) != 1:
@@ -41,26 +58,34 @@ def quantize_query(
     if head_dim % 64 != 0:
         raise ValueError("query head_dim must be divisible by 64")
 
-    query_fp4 = torch.zeros(
-        rows,
-        1,
-        heads,
-        head_dim // 2,
-        dtype=torch.uint8,
-        device=query.device,
+    query_fp4 = (
+        torch.zeros(
+            rows,
+            1,
+            heads,
+            head_dim // 2,
+            dtype=torch.uint8,
+            device=query.device,
+        )
+        if query_fp4_scratch is None
+        else query_fp4_scratch[:rows]
     ).view(torch.float4_e2m1fn_x2)
 
     rest_k = head_dim // 64
-    scale_storage = torch.zeros(
-        rows,
-        1,
-        heads,
-        rest_k,
-        32,
-        4,
-        4,
-        dtype=torch.uint8,
-        device=query.device,
+    scale_storage = (
+        torch.zeros(
+            rows,
+            1,
+            heads,
+            rest_k,
+            32,
+            4,
+            4,
+            dtype=torch.uint8,
+            device=query.device,
+        )
+        if query_scales_scratch is None
+        else query_scales_scratch[:rows]
     )
     native_scales = scale_storage.permute(
         0, 2, 1, 3, 4, 5, 6

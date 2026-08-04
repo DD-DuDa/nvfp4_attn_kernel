@@ -110,14 +110,21 @@ adds a failure, not by whether the suite is green.
 
 The case asserts that feeding a pre-quantized FP4 query reproduces the BF16
 query path bitwise. It fails only at MQA (`heads_kv = 1`); the MHA and GQA
-parametrizations pass. It is also order-dependent: it passes when run alone and
-fails when it runs after the other two, which means something survives between
-calls in one process. That state dependence is the part worth chasing, since
-CUDA graph capture and persistent scratch buffers both amplify it.
+parametrizations pass.
 
-`pytest-randomly` is installed, so test order — and therefore this failure —
-varies run to run. Pass `-p no:randomly` whenever comparing two runs, or the
-comparison is meaningless.
+The cause is that **`heads_q = 32, heads_kv = 1` on the pure-FP4 path does not
+decode reproducibly**: eight repeats of one identical call each differed from
+the first. Adding a residual makes the same geometry stable, and `(8, 8)`,
+`(32, 8)` and `(16, 1)` are stable over sixteen repeats. So the test is not
+wrong and nothing survives between calls — the kernel returns a different
+answer each time in that one configuration. Treat it as a kernel bug, not a
+flaky test.
+
+Two consequences. A bitwise comparison of two decodes must avoid `(32, 1)`;
+`tests/kernel` uses `(16, 1)` for MQA where it needs one. And because the
+failure is a coin flip rather than a fixed outcome, and `pytest-randomly` is
+installed on top of that, pass `-p no:randomly` whenever comparing two runs —
+otherwise a run that happens to come out green reads as a fix.
 
 FlashAttention and FlashInfer are test dependencies only. Production code must
 not require either package.

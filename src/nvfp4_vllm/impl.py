@@ -244,6 +244,8 @@ class NVFP4Impl(FlashAttentionImpl):
             # reading them back, which costs a synchronization per layer.
             trusted_metadata=True,
             query_padded_scratch=self.runtime.query_padded,
+            query_fp4_scratch=self.runtime.query_fp4,
+            query_scales_scratch=self.runtime.query_scales,
             out=output[:rows],
         )
 

@@ -2,10 +2,10 @@
 
 Three things have to outlive a step and be shared by every layer: the BF16 tail
 holding each sequence's partial page, the views that reinterpret a layer's
-block array as NVFP4 regions, and the buffer the decode kernel reads its BF16
-query through. The metadata builder cannot own them, because it has no
-reference to the attention layers, so they are attached to the layers and
-created the first time one of them runs.
+block array as NVFP4 regions, and the buffers a layer quantizes its query
+into. The metadata builder cannot own them, because it has no reference to the
+attention layers, so they are attached to the layers and created the first
+time one of them runs.
 
 That first time is deliberately the profile run, before the KV cache exists.
 vLLM sizes the cache from whatever memory is still free once profiling ends, so
@@ -73,6 +73,32 @@ class LayerRuntime:
             num_heads,
             head_dim,
             dtype=torch.bfloat16,
+            device=device,
+        )
+        # The quantizer's two outputs, sized and shared the same way, so that
+        # quantizing a query allocates and fills nothing. The packed query is
+        # rewritten whole every call and what it holds now does not matter.
+        # The scales need the zeroing more than query_padded does: the layout
+        # gives each KV head 32 * 4 row slots and each 64-element k-atom a
+        # four-byte E4M3 word, and only the num_heads // num_kv_heads slots
+        # that carry a query head are ever written.
+        self.query_fp4 = torch.zeros(
+            num_slots,
+            1,
+            num_heads,
+            head_dim // 2,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self.query_scales = torch.zeros(
+            num_slots,
+            1,
+            num_heads,
+            head_dim // 64,
+            32,
+            4,
+            4,
+            dtype=torch.uint8,
             device=device,
         )
 

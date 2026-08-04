@@ -1451,6 +1451,459 @@ def test_query_padded_scratch_is_validated(
         )
 
 
+def _quantizer_scratch_shapes(
+    rows: int, heads_q: int, head_dim: int
+) -> dict[str, tuple[int, ...]]:
+    """The storage shape of each quantizer output, keyed by argument name."""
+    return {
+        "query_fp4_scratch": (rows, 1, heads_q, head_dim // 2),
+        "query_scales_scratch": (
+            rows,
+            1,
+            heads_q,
+            head_dim // 64,
+            32,
+            4,
+            4,
+        ),
+    }
+
+
+def _quantizer_scratch(
+    rows: int,
+    heads_q: int,
+    head_dim: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """A zeroed pair of caller-owned quantizer buffers, as decode kwargs.
+
+    Zeroed and never refilled, which is the contract: the scale layout
+    reserves slots the quantizer never writes, so their contents are whatever
+    the buffer was born holding.
+    """
+    return {
+        name: torch.zeros(shape, dtype=torch.uint8, device=device)
+        for name, shape in _quantizer_scratch_shapes(
+            rows, heads_q, head_dim
+        ).items()
+    }
+
+
+def _assert_quantizes_identically(
+    query: torch.Tensor,
+    heads_kv: int,
+    scratch: dict[str, torch.Tensor],
+    row_indices: torch.Tensor | None = None,
+    dirty_with: torch.Tensor | None = None,
+) -> None:
+    """Caller-owned buffers must hand back a fresh allocation's exact bytes.
+
+    This is the level the "zeroed once" contract is observable at, and the
+    only one. A decode cannot see a violation: the scale slots nothing writes
+    belong to rows of the 128-row MMA tile that carry no query head, so the
+    tensor core is fed them but the kernel discards their accumulator rows.
+    The bytes still have to be right, because ``quantize_query`` hands them
+    to whoever asked and the prequantized-query path takes them back.
+
+    ``dirty_with`` is quantized through the buffers first, so the comparison
+    starts from an earlier query's bytes. Without it a buffer left holding
+    this very query would agree with a fresh allocation however the reuse
+    contract were broken.
+    """
+    if dirty_with is not None:
+        _quantize.quantize_query(
+            dirty_with, row_indices=row_indices, heads_kv=heads_kv, **scratch
+        )
+    expected_fp4, expected_scales = _quantize.quantize_query(
+        query, row_indices=row_indices, heads_kv=heads_kv
+    )
+    actual_fp4, actual_scales = _quantize.quantize_query(
+        query, row_indices=row_indices, heads_kv=heads_kv, **scratch
+    )
+    assert torch.equal(
+        actual_fp4.view(torch.uint8), expected_fp4.view(torch.uint8)
+    )
+    assert torch.equal(actual_scales, expected_scales)
+
+
+def _shuffled(query: torch.Tensor) -> torch.Tensor:
+    """A query unlike the given one in both row order and magnitude.
+
+    Both matter: reordering changes which row's scales land where, and
+    rescaling changes the E4M3 scales themselves, so nothing a call leaves
+    behind can coincide with what the next one wants.
+    """
+    return (query.flip(0) * 2.5).contiguous()
+
+
+def _residual_call_kwargs_for_rows(
+    inputs: ContractDecodeInputs, rows: int
+) -> dict:
+    """The hybrid contract call narrowed to the first ``rows`` of the batch."""
+    call = _residual_call_kwargs(inputs)
+    call.update(
+        fp4_page_table=inputs.page_table[:rows],
+        seqused_fp4=inputs.seqused_fp4[:rows],
+        residual_page_ids=inputs.residual_page_ids[:rows],
+        seqused_residual=inputs.seqused_residual[:rows],
+        query_row_indices=inputs.query_row_indices[:rows],
+    )
+    return call
+
+
+def test_quantizer_scratch_matches_internal_allocation_after_reuse(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """Caller-owned quantizer buffers must survive having carried a query.
+
+    A pristine buffer proves nothing here: it is zero everywhere the
+    quantizer does not write, which is exactly what an internal allocation
+    would have been. The regression only appears on a later call, once the
+    slots the scale layout reserves but never writes are holding an earlier
+    query's scales, so the buffer has to be dirty before the compared call.
+    """
+    inputs = contract_decode_inputs
+    rows = inputs.page_table.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    call = _residual_call_kwargs(inputs)
+    # Wider than this batch on purpose. Production sizes one buffer from
+    # max_num_seqs and reuses it for whatever the step happens to bring.
+    scratch = _quantizer_scratch(
+        rows + 5, heads, head_dim, inputs.query.device
+    )
+    other_query = _shuffled(inputs.query)
+
+    allocated = fp4_decode(inputs.query, **call)
+    dirtying = fp4_decode(other_query, **call, **scratch)
+    dirty_scales = scratch["query_scales_scratch"].clone()
+    reused = fp4_decode(inputs.query, **call, **scratch)
+
+    assert not torch.equal(dirtying, allocated)
+    assert dirty_scales.any()
+    assert torch.equal(reused, allocated)
+    _assert_quantizes_identically(
+        inputs.query,
+        heads_kv,
+        scratch,
+        inputs.query_row_indices,
+        dirty_with=other_query,
+    )
+
+
+def test_quantizer_scratch_survives_a_shrinking_batch(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """A buffer sized for the widest step has to be right for a narrow one.
+
+    Rows are dim 0 of both buffers, so a smaller batch takes a prefix and
+    leaves the rows above it holding the wider batch's quantized query.
+    """
+    inputs = contract_decode_inputs
+    wide = inputs.page_table.shape[0]
+    narrow = 1
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    scratch = _quantizer_scratch(wide, heads, head_dim, inputs.query.device)
+    narrow_call = _residual_call_kwargs_for_rows(inputs, narrow)
+    other_query = _shuffled(inputs.query)
+
+    allocated = fp4_decode(inputs.query, **narrow_call)
+    fp4_decode(
+        other_query, **_residual_call_kwargs_for_rows(inputs, wide), **scratch
+    )
+    shrunk = fp4_decode(inputs.query, **narrow_call, **scratch)
+
+    assert torch.equal(shrunk, allocated)
+    _assert_quantizes_identically(
+        inputs.query,
+        heads_kv,
+        scratch,
+        inputs.query_row_indices[:narrow],
+        dirty_with=other_query,
+    )
+
+
+@pytest.mark.parametrize(
+    ("heads_q", "heads_kv"),
+    # 16 rather than 32 query heads for MQA: pure FP4 with 32 heads over one
+    # KV head does not decode reproducibly, and every assertion here is a
+    # bitwise comparison of two decodes.
+    [(8, 8), (32, 8), (16, 1)],
+    ids=["mha", "gqa", "mqa"],
+)
+def test_quantizer_scratch_matches_internal_allocation_per_head_geometry(
+    heads_q: int,
+    heads_kv: int,
+) -> None:
+    """``heads_q // heads_kv`` chooses the scale slots, so vary that axis.
+
+    Every geometry allocates its own buffer, which is what ``fp4_decode``
+    asks for: the storage shape depends on ``heads_q`` and ``head_dim`` but
+    not on ``heads_kv``, so one buffer carried across a change of
+    ``heads_kv`` would pass every shape check while leaving the previous
+    geometry's scales in slots this one needs zeroed.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 is required")
+
+    torch.manual_seed(0x5CA1E + heads_kv)
+    rows, pages, head_dim = 3, 2, 128
+    query = torch.randn(
+        rows, heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    ) * 0.3
+    k_pages = torch.randn(
+        rows * pages,
+        _PAGE_SIZE,
+        heads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.3
+    v_pages = torch.randn_like(k_pages) * 0.3
+    key_pages_fp4, key_scales = _quantize.quantize_key_pages(k_pages)
+    value_pages_fp4, value_scales = _quantize.quantize_value_pages(v_pages)
+    call = {
+        "key_pages_fp4": key_pages_fp4,
+        "key_scales": key_scales,
+        "value_pages_fp4": value_pages_fp4,
+        "value_scales": value_scales,
+        "fp4_page_table": torch.arange(
+            rows * pages, device="cuda", dtype=torch.int32
+        ).view(rows, pages),
+        "seqused_fp4": torch.full(
+            (rows,), pages * _PAGE_SIZE, device="cuda", dtype=torch.int32
+        ),
+    }
+    scratch = _quantizer_scratch(rows, heads_q, head_dim, query.device)
+    other_query = _shuffled(query)
+
+    allocated = fp4_decode(query, **call)
+    fp4_decode(other_query, **call, **scratch)
+    reused = fp4_decode(query, **call, **scratch)
+
+    assert torch.equal(reused, allocated)
+    _assert_quantizes_identically(
+        query, heads_kv, scratch, dirty_with=other_query
+    )
+
+
+def test_quantizer_scratch_is_sized_by_query_row_indices(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """With indices the required rows come from them, not from the query.
+
+    The query is wider than the batch here, so a buffer sized to the index
+    tensor is enough, and one sized below it has to be refused rather than
+    quantized past its end.
+    """
+    inputs = contract_decode_inputs
+    indexed_rows = inputs.query_row_indices.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    call = _residual_call_kwargs(inputs)
+    assert indexed_rows < inputs.query.shape[0]
+
+    exact = _quantizer_scratch(
+        indexed_rows, heads, head_dim, inputs.query.device
+    )
+    allocated = fp4_decode(inputs.query, **call)
+    assert torch.equal(fp4_decode(inputs.query, **call, **exact), allocated)
+    _assert_quantizes_identically(
+        inputs.query,
+        heads_kv,
+        exact,
+        inputs.query_row_indices,
+        dirty_with=_shuffled(inputs.query),
+    )
+
+    undersized = _quantizer_scratch(
+        indexed_rows - 1, heads, head_dim, inputs.query.device
+    )
+    for name, wrong in undersized.items():
+        with pytest.raises(ValueError, match=name):
+            fp4_decode(inputs.query, **call, **{name: wrong})
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        ("query_fp4_scratch",),
+        ("query_scales_scratch",),
+        ("query_fp4_scratch", "query_scales_scratch"),
+    ],
+    ids=["packed-only", "scales-only", "both"],
+)
+def test_either_quantizer_scratch_may_be_supplied_alone(
+    contract_decode_inputs: ContractDecodeInputs,
+    supplied: tuple[str, ...],
+) -> None:
+    """Neither buffer depends on the other; the missing one is allocated."""
+    inputs = contract_decode_inputs
+    rows = inputs.page_table.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    call = _residual_call_kwargs(inputs)
+    scratch = _quantizer_scratch(
+        rows + 2, heads, head_dim, inputs.query.device
+    )
+    chosen = {name: scratch[name] for name in supplied}
+
+    allocated = fp4_decode(inputs.query, **call)
+    assert torch.equal(fp4_decode(inputs.query, **call, **chosen), allocated)
+    _assert_quantizes_identically(
+        inputs.query,
+        heads_kv,
+        chosen,
+        inputs.query_row_indices,
+        dirty_with=_shuffled(inputs.query),
+    )
+
+
+def test_a_prefilled_query_scales_scratch_must_not_match_internal_allocation(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """The scale slots nothing writes are real. Do not make this test pass.
+
+    Every other test of these buffers asks a scratch to reproduce a fresh
+    allocation byte for byte, and all of them would pass just as happily if
+    the unwritten slots did not exist, which would make them vacuous. This is
+    the one that shows they do: the same query through a buffer that arrived
+    holding a nonzero pattern instead of zeros must come out different.
+    Zeroing the buffer here would silence the test and take with it the
+    evidence that "zeroed once" is an obligation rather than a superstition.
+
+    Only the scale bytes move. The decode output does not, because the slots
+    in question belong to rows of the 128-row MMA tile that carry no query
+    head, so the tensor core consumes them and the kernel throws their
+    accumulator rows away.
+    """
+    inputs = contract_decode_inputs
+    rows = inputs.query_row_indices.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    prefilled = torch.full(
+        _quantizer_scratch_shapes(rows, heads, head_dim)[
+            "query_scales_scratch"
+        ],
+        0xA5,
+        dtype=torch.uint8,
+        device=inputs.query.device,
+    )
+
+    _, expected_scales = _quantize.quantize_query(
+        inputs.query,
+        row_indices=inputs.query_row_indices,
+        heads_kv=heads_kv,
+    )
+    _, actual_scales = _quantize.quantize_query(
+        inputs.query,
+        row_indices=inputs.query_row_indices,
+        heads_kv=heads_kv,
+        query_scales_scratch=prefilled,
+    )
+
+    assert not torch.equal(actual_scales, expected_scales)
+
+
+def test_a_prefilled_query_fp4_scratch_still_matches_internal_allocation(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    """The packed query is the half that carries no zeroing obligation.
+
+    Every byte of it is rewritten each call, which is why ``fp4_decode`` asks
+    a caller to zero only the scales.
+    """
+    inputs = contract_decode_inputs
+    rows = inputs.query_row_indices.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    heads_kv = inputs.key_pages_fp4.shape[2]
+    prefilled = torch.full(
+        _quantizer_scratch_shapes(rows, heads, head_dim)["query_fp4_scratch"],
+        0xA5,
+        dtype=torch.uint8,
+        device=inputs.query.device,
+    )
+
+    _assert_quantizes_identically(
+        inputs.query,
+        heads_kv,
+        {"query_fp4_scratch": prefilled},
+        inputs.query_row_indices,
+    )
+
+
+def test_quantizer_scratch_is_validated(
+    contract_decode_inputs: ContractDecodeInputs,
+) -> None:
+    inputs = contract_decode_inputs
+    rows = inputs.page_table.shape[0]
+    heads, head_dim = inputs.query.shape[1], inputs.query.shape[2]
+    device = inputs.query.device
+    call = _residual_call_kwargs(inputs)
+    shapes = _quantizer_scratch_shapes(rows, heads, head_dim)
+
+    def reject(name: str, wrong: torch.Tensor) -> None:
+        with pytest.raises(ValueError, match=name):
+            fp4_decode(inputs.query, **call, **{name: wrong})
+
+    for name, shape in shapes.items():
+        reject(
+            name,
+            torch.zeros(
+                (rows - 1, *shape[1:]), dtype=torch.uint8, device=device
+            ),
+        )
+        # Only the row count may differ from what this batch needs; every
+        # inner extent belongs to the layout the decode kernel checks.
+        for axis in range(1, len(shape)):
+            grown = list(shape)
+            grown[axis] += 1
+            reject(name, torch.zeros(grown, dtype=torch.uint8, device=device))
+        reject(name, torch.zeros(shape, dtype=torch.int8, device=device))
+
+        # Contiguous, correctly shaped, and still refused: both buffers reach
+        # kernels compiled with assumed_align=16, and only the start of an
+        # allocation is guaranteed to be that aligned.
+        offset = torch.zeros(
+            (rows + 1, *shape[1:]), dtype=torch.uint8, device=device
+        )[1:]
+        assert offset.is_contiguous() and offset.storage_offset() != 0
+        reject(name, offset)
+
+        strided = torch.zeros(
+            (*shape[:-1], shape[-1] * 2), dtype=torch.uint8, device=device
+        )[..., ::2]
+        assert not strided.is_contiguous()
+        reject(name, strided)
+
+        if torch.cuda.device_count() > 1:
+            reject(
+                name, torch.zeros(shape, dtype=torch.uint8, device="cuda:1")
+            )
+
+    # The FP4-query path rejects a scratch before it looks at the query, so
+    # placeholders are enough and a real quantize would only cost time.
+    del call["query_row_indices"]
+    placeholder = torch.empty(0, device=device)
+    for name, shape in shapes.items():
+        with pytest.raises(
+            ValueError, match=f"{name} applies only to the BF16 query path"
+        ):
+            fp4_decode(
+                **call,
+                query_fp4=placeholder,
+                query_scales=placeholder,
+                **{
+                    name: torch.zeros(
+                        shape, dtype=torch.uint8, device=device
+                    )
+                },
+            )
+
+
 def test_repeated_identical_calls_are_bitwise_identical() -> None:
     """The decode kernel must not depend on how its warps happen to interleave.
 
