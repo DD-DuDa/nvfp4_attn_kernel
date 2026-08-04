@@ -722,13 +722,13 @@ FP4    ├─ host 18,620 µs ────────────────�
             <td class="num">2</td>
             <td><code>quantize_query</code> 每层重新分配并清零缓冲</td>
             <td class="num">196 µs GPU<br>128 launch/step</td>
-            <td class="good">最便宜的一项：改成 persistent scratch。占全部额外 launch 的四分之三，GPU 与 host 两头都省。</td>
+            <td class="good">最便宜的一项：改成 persistent scratch。占全部额外 launch 的四分之三，GPU 与 host 两头都省。<br><strong>已完成</strong>（<code>d37978f</code>）：两个缓冲改由调用方持有，<code>LayerRuntime</code> 在 profile run 里按 <code>max_num_seqs</code> 高水位各分配一次。scale 那块必须分配时清零、此后永不再清——量化器每个 KV head 只写 <code>heads_q&nbsp;//&nbsp;heads_kv</code> 个 slot，其余无人覆盖。</td>
           </tr>
           <tr>
             <td class="num">3</td>
             <td>CUDA graph capture 未验证</td>
             <td class="num">9,888 µs/step</td>
-            <td>单独一笔、与量化无关，但它是三条臂里最大的一个数。promotion 已谓词化，还需验证 buffer 地址与 launch 稳定性。</td>
+            <td>单独一笔、与量化无关，但它是三条臂里最大的一个数。promotion 已谓词化，还需验证 buffer 地址与 launch 稳定性。<br><strong>已完成</strong>（<code>348678c</code>）：builder 在 NVFP4 下声明 <code>UNIFORM_SINGLE_TOKEN_DECODE</code>，护栏那条一刀切拒绝撤掉，<code>cudagraph_mode</code> 自行解析成 <code>FULL_AND_PIECEWISE</code>，用户不用传任何配置。<code>tests/e2e</code> 在图开与图关两种配置下各 120 passed / 1 skipped。计划、验收与第四条臂见 <code>docs/tasks/3.vllm_cudagraph.md</code>。</td>
           </tr>
           <tr>
             <td class="num">4</td>
