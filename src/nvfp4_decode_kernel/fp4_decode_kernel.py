@@ -87,16 +87,47 @@ RESCALE_THRESHOLD = 8.0
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
     # Publishes the per-warp partial row maxima between the four softmax warps
-    # of one warpgroup, once per KV block when S is transposed. The two
-    # warpgroups own disjoint query rows and must not synchronise with each
-    # other, so each takes its own barrier.
+    # of one warpgroup, once per KV block when S is transposed. The warpgroups
+    # own disjoint query rows and must not synchronise with each other, so each
+    # takes its own barrier; there is one slot per possible row group.
     SoftmaxReduce = enum.auto()
     SoftmaxReduce1 = enum.auto()
+    SoftmaxReduce2 = enum.auto()
+    SoftmaxReduce3 = enum.auto()
 #     WarpSchedulerWG1 = enum.auto()
 #     WarpSchedulerWG2 = enum.auto()
 #     WarpSchedulerWG3 = enum.auto()
 #     PFull = enum.auto()
 #     PEmpty = enum.auto()
+
+
+# How many ways the transposed softmax may split the query rows of a tile. The
+# reduction takes one named barrier per group, counting up from SoftmaxReduce,
+# so this many consecutive slots must exist in the enum above.
+MAX_SOFTMAX_ROW_GROUPS = 4
+assert (
+    int(NamedBarrierFwd.SoftmaxReduce) + MAX_SOFTMAX_ROW_GROUPS - 1
+    == int(NamedBarrierFwd.SoftmaxReduce3)
+)
+
+# A group runs one cross-warp reduction per KV tile — a butterfly, a named
+# barrier and a round trip through shared memory — and that cost is per group,
+# not per row, so it does not shrink as the group is handed fewer rows. Below
+# this many rows a group spends more on its own reduction than the shorter
+# serial chain saves: measured at batch 16, seqlen 128k, splitting four query
+# rows four ways is 10 percent slower than splitting them two ways, while
+# splitting eight and thirty-two rows four ways wins 5 and 10 percent.
+MIN_ROWS_PER_SOFTMAX_GROUP = 2
+
+# Which group owns a query row decides the tensor-memory column its softmax
+# reads S from, and above this many query rows moving a row to a different
+# group stops being numerically neutral: at 32 rows the rows whose column
+# offset moves come out about one percent different from the untransposed
+# path, which tests/kernel compares against exactly. At 16 rows and below the
+# wider split is bit-exact for every head configuration measured. Two groups
+# stays available above the cap because that is the split those tiles already
+# ran with.
+MAX_EXACT_SOFTMAX_SPLIT_ROWS = 16
 
 
 class FP4DecodeKernel:
@@ -256,38 +287,8 @@ class FP4DecodeKernel:
             "Paged KV does not support irregular head dim"
         )
 
-        self.softmax0_warp_ids = (0, 1, 2, 3) # stage 0
-        self.softmax1_warp_ids = (4, 5, 6, 7) # stage 1
-        # self.correction_warp_ids = (8, 9)
-        self.correction_warp_ids = (8, 9, 10, 11)
-        # self.mma_warp_id = 10
-        self.mma_warp_id = 12
-        self.epilogue_warp_ids = (13,)
-        self.load_warp_ids = (14,)
-        self.empty_warp_ids = (15, )
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
-
-        self.threads_per_cta = cute.arch.WARP_SIZE * len(
-            (
-                *self.softmax0_warp_ids,
-                *self.softmax1_warp_ids,
-                *self.correction_warp_ids,
-                self.mma_warp_id,
-                *self.load_warp_ids,
-                *self.epilogue_warp_ids,
-                *self.empty_warp_ids,
-            )
-        )
-
-        if not self.use_tma_KV:
-            self.load_warp_ids = (14, 15)
-            self.empty_warp_ids = ()
-        if self.use_correction_warps_for_epi:
-            self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
-            self.epilogue_warp_ids = self.correction_warp_ids
-        elif self.is_varlen_q: # fallback
-            self.epilogue_warp_ids = (13, 14)
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -310,14 +311,16 @@ class FP4DecodeKernel:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
+        # The count a softmax warpgroup was tuned at. A CTA wide enough that it
+        # cannot afford this narrows it; see _assign_warp_roles.
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200
+            self.num_regs_softmax_tuned = 200
             self.num_regs_correction = 64
             self.num_regs_other = 48
         else:
-            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 216
-            # self.num_regs_softmax = 176
+            # self.num_regs_softmax_tuned = 192 if self.is_causal or self.is_local else 184
+            self.num_regs_softmax_tuned = 216
+            # self.num_regs_softmax_tuned = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
@@ -329,6 +332,10 @@ class FP4DecodeKernel:
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
+        # Two softmax warpgroups is the layout every configuration starts from:
+        # one per Q stage. A transposed decode that splits its query rows four
+        # ways asks for four and re-runs this once __call__ has resolved that.
+        self._assign_warp_roles(2)
         self.buffer_align_bytes = 1024
         
         # Scale factor parameters for block-scaled quantization (FP4)
@@ -340,6 +347,105 @@ class FP4DecodeKernel:
             self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2) # each k tile is 256 bits, NVFP4 is half a byte
         else:
             raise ValueError(f"Only support NVFP4 for now")
+
+    # An SM holds this many 32-bit registers, handed out in blocks of eight per
+    # thread, and the kernel runs one CTA per SM.
+    REGISTER_FILE_PER_SM = 65536
+    REGISTER_ALLOC_GRANULARITY = 8
+    WARPS_PER_WARPGROUP = 4
+
+    def _assign_warp_roles(self, num_softmax_warpgroups: int):
+        """Lay out the warp roles for a CTA with this many softmax warpgroups.
+
+        Each softmax warpgroup is a contiguous run of four warps starting on a
+        128-thread boundary, which is what makes ``thread_idx % 128`` the kv
+        position inside the tile that the transposed softmax indexes by. The
+        remaining roles follow: one correction warpgroup, then the mma,
+        epilogue, load and idle warps that share the last warpgroup.
+
+        Widening the CTA costs registers, so the softmax warpgroups split
+        whatever the correction and service warpgroups leave of the CTA's
+        register allocation rather than each keeping the count a narrower CTA
+        could afford.
+        """
+        warps = self.WARPS_PER_WARPGROUP
+        threads_per_warpgroup = warps * cute.arch.WARP_SIZE
+        self.softmax_warp_ids = tuple(
+            tuple(range(g * warps, (g + 1) * warps))
+            for g in range(num_softmax_warpgroups)
+        )
+        self.softmax0_warp_ids = self.softmax_warp_ids[0]  # stage 0
+        self.softmax1_warp_ids = self.softmax_warp_ids[1]  # stage 1
+        service = num_softmax_warpgroups * warps
+        self.correction_warp_ids = tuple(range(service, service + warps))
+        self.mma_warp_id = service + warps
+        self.epilogue_warp_ids = (service + warps + 1,)
+        self.load_warp_ids = (service + warps + 2,)
+        self.empty_warp_ids = (service + warps + 3,)
+        self.threads_per_cta = cute.arch.WARP_SIZE * (service + 2 * warps)
+
+        if not self.use_tma_KV:
+            self.load_warp_ids = self.load_warp_ids + self.empty_warp_ids
+            self.empty_warp_ids = ()
+        if self.use_correction_warps_for_epi:
+            self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
+            self.epilogue_warp_ids = self.correction_warp_ids
+        elif self.is_varlen_q:  # fallback
+            self.epilogue_warp_ids = (service + warps + 1, service + warps + 2)
+
+        # setmaxnreg only redistributes the registers the CTA was given at
+        # launch, which is threads_per_cta times the largest per-thread count
+        # that fits the register file, rounded down to the allocation
+        # granularity. A CTA of 768 threads loses that rounding twice over: the
+        # per-thread count drops to 80 and the CTA's pool with it, so the
+        # arithmetic has to be done against the pool and not against the whole
+        # register file. Over-subscribe it and setmaxnreg.inc waits for
+        # registers no one will release.
+        regs_at_launch = (
+            self.REGISTER_FILE_PER_SM
+            // self.threads_per_cta
+            // self.REGISTER_ALLOC_GRANULARITY
+            * self.REGISTER_ALLOC_GRANULARITY
+        )
+        softmax_pool = regs_at_launch * self.threads_per_cta - threads_per_warpgroup * (
+            self.num_regs_correction + max(self.num_regs_other, self.num_regs_empty)
+        )
+        affordable = (
+            softmax_pool
+            // (threads_per_warpgroup * num_softmax_warpgroups)
+            // self.REGISTER_ALLOC_GRANULARITY
+            * self.REGISTER_ALLOC_GRANULARITY
+        )
+        self.num_regs_softmax = min(self.num_regs_softmax_tuned, affordable)
+
+    def _softmax_row_group_count(self) -> int:
+        """How many ways the transposed softmax splits this tile's query rows.
+
+        A decode carries one Q tile, so only the first softmax warpgroup has a
+        stage to run. Spreading the query rows over more groups shortens the
+        serial chain every thread runs — its butterfly, its exponentials and
+        its packing — and the groups write disjoint rows of P and of the
+        scales. Two groups is what any tile with more than one query row
+        already split into; going past two is worth it only while every group
+        keeps enough rows to amortize its own reduction.
+
+        Plain Python, evaluated while ``__call__`` is traced, so the count and
+        everything derived from it are compile-time constants.
+        """
+        # The residual block clears a P tile that every group would write, and
+        # the per-group reduction barrier cannot order one group's clear
+        # against another's stores, so the split stays off while a residual is
+        # fused. A second Q stage gives the second warpgroup its own work.
+        if self.q_stage != 1 or self.fused_residual_first_block:
+            return 1
+        if self.transposed_query_rows < 2:
+            return 1
+        if self.transposed_query_rows > MAX_EXACT_SOFTMAX_SPLIT_ROWS:
+            return 2
+        return min(
+            MAX_SOFTMAX_ROW_GROUPS,
+            max(2, self.transposed_query_rows // MIN_ROWS_PER_SOFTMAX_GROUP),
+        )
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -645,26 +751,18 @@ class FP4DecodeKernel:
             # rows of the M tile; transposed, they are the only live columns of
             # S and the only rows of O the epilogue can reach.
             self.transposed_query_rows = self.qhead_per_kvhead
-            # A decode carries one Q tile, so the second softmax warpgroup has
-            # nothing to do. Handing it half the query rows halves the
-            # butterfly, the exponentials and the packing every thread runs,
-            # while the two groups write disjoint rows of P and of the scales.
-            # The residual block clears a P tile that both groups would write,
-            # and the per-group reduction barrier cannot order one group's
-            # clear against the other's stores, so the split stays off while a
-            # residual is fused.
-            self.softmax_row_groups = (
-                2
-                if self.q_stage == 1
-                and self.transposed_query_rows % 2 == 0
-                and not self.fused_residual_first_block
-                else 1
-            )
+            self.softmax_row_groups = self._softmax_row_group_count()
+            # transposed_query_rows is a power of two, so the group count
+            # always divides it evenly.
             self.softmax_rows_per_group = (
                 self.transposed_query_rows // self.softmax_row_groups
             )
+            # One softmax warpgroup per row group, except that the CTA never
+            # narrows below the two warpgroups the Q stages need.
+            self._assign_warp_roles(max(2, self.softmax_row_groups))
             # Two buffers per warp per row, so a single named barrier per KV
-            # block suffices for the row reductions.
+            # block suffices for the row reductions. Splitting the rows across
+            # groups moves slots between the groups without changing the total.
             self.softmax_red_slots = (
                 2 * len(self.softmax0_warp_ids) * self.transposed_query_rows
             )
@@ -1863,11 +1961,14 @@ class FP4DecodeKernel:
         if warp_idx == 2:
             for i in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_softmax_corr_empty_offset + i, cute.arch.WARP_SIZE * 4
+                    mbar_ptr + self.mbar_softmax_corr_empty_offset + i,
+                    cute.arch.WARP_SIZE * len(self.correction_warp_ids),
                 )
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + i,
-                    cute.arch.WARP_SIZE * 4 * self.softmax_row_groups,
+                    cute.arch.WARP_SIZE
+                    * len(self.softmax0_warp_ids)
+                    * self.softmax_row_groups,
                 )
         if warp_idx == 3:
             if const_expr(self.s0_s1_barrier):
@@ -1908,15 +2009,15 @@ class FP4DecodeKernel:
                     cute.arch.WARP_SIZE *  len(self.softmax0_warp_ids),
                 )
         if warp_idx == 7:
+            # Every softmax warp in the CTA arrives here once it leaves its
+            # role, whether or not it was handed a row group, and so does every
+            # correction warp.
             cute.arch.mbarrier_init(
                 mbar_ptr + self.mbar_tmem_dealloc_offset,
                 cute.arch.WARP_SIZE
-                * len(
-                    (
-                        *self.softmax0_warp_ids,
-                        *self.softmax1_warp_ids,
-                        *self.correction_warp_ids,
-                    )
+                * (
+                    sum(len(ids) for ids in self.softmax_warp_ids)
+                    + len(self.correction_warp_ids)
                 ),
             )
         if warp_idx == 8:
@@ -2473,14 +2574,20 @@ class FP4DecodeKernel:
                 else:
                     s_off = self.tmem_s_offset[0]
                 tStSi_local = cute.make_tensor(tStS.iterator + s_off, tStS.layout)
-                if const_expr(self.softmax_row_groups == 2):
-                    # Both warpgroups drive the single Q stage; specialising on
-                    # the group keeps its row offset, its scratch and its
-                    # barrier compile-time constants.
-                    if warp_idx < self.softmax1_warp_ids[0]:
-                        softmax_loop(stage=0, tStSi=tStSi_local, tCtSFP=tCtSFP, row_group=0)
-                    else:
-                        softmax_loop(stage=0, tStSi=tStSi_local, tCtSFP=tCtSFP, row_group=1)
+                if const_expr(self.softmax_row_groups > 1):
+                    # Every group drives the same single Q stage over its own
+                    # query rows; specialising on the group keeps its row
+                    # offset, its scratch base and its barrier id compile-time
+                    # constants.
+                    softmax_warpgroup = warp_idx // len(self.softmax0_warp_ids)
+                    for group in cutlass.range_constexpr(self.softmax_row_groups):
+                        if softmax_warpgroup == group:
+                            softmax_loop(
+                                stage=0,
+                                tStSi=tStSi_local,
+                                tCtSFP=tCtSFP,
+                                row_group=group,
+                            )
                 elif const_expr(self.q_stage == 2) or stage == 0:
                     softmax_loop(
                         stage=stage,
