@@ -1,6 +1,6 @@
 """Opt-in end-to-end check of the CUSTOM backend, on a BF16 and an FP4 cache.
 
-The same GSM8K subset is scored four times. ``FLASH_ATTN`` and ``CUSTOM`` both
+The same GSM8K subset is scored five times. ``FLASH_ATTN`` and ``CUSTOM`` both
 run a BF16 KV cache with no quantization anywhere, so they run identical
 arithmetic and greedy decoding must produce the same token ids exactly. The
 BF16 arm additionally has to clear an absolute accuracy floor, or two arms
@@ -26,6 +26,10 @@ answers the question a comparison against BF16 cannot: how much of the loss is
 the cost of four bits, which both arms pay, and how much is the cost of this
 layout, which only ours does.
 
+The fifth arm is the third with CUDA graphs enabled. It is held to the same
+model-quality gates as the eager NVFP4 arm, then compared directly with that
+arm to catch graph-only corruption.
+
 ``CUSTOM`` resolves through the ``vllm.general_plugins`` entry point declared
 in ``pyproject.toml``. The test must not register the backend itself, or that
 declaration would stop being covered.
@@ -45,6 +49,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 import pytest
@@ -79,6 +84,13 @@ GSM8K_MAX_NUM_BATCHED_TOKENS = 16384
 GSM8K_MIN_ACCURACY = 0.60
 # How far the FP4 cache may fall behind the BF16 one. Four questions at N=32.
 GSM8K_MAX_ACCURACY_DROP = 0.125
+# The measured graph arm differs from eager by two answers at N=32. One more
+# question is headroom without calling a four-question swing "very close".
+GSM8K_MAX_GRAPH_ACCURACY_DELTA = 3 / 32
+# A first difference in the first quarter of generation is early. See the
+# graph-divergence gate for the measured BF16 control behind the rate.
+GSM8K_EARLY_DIVERGENCE_TOKENS = GSM8K_MAX_NEW_TOKENS // 4
+GSM8K_MAX_EARLY_DIVERGENCE_RATE = 0.50
 
 
 @dataclass(frozen=True)
@@ -118,6 +130,8 @@ def _run_gsm8k(
     attention_config: dict,
     prompts: list[str],
     kv_cache_dtype: str = "auto",
+    *,
+    enforce_eager: bool = True,
 ) -> list[Completion]:
     import torch
     from vllm import LLM, SamplingParams
@@ -131,7 +145,7 @@ def _run_gsm8k(
         max_num_seqs=GSM8K_MAX_NUM_SEQS,
         max_num_batched_tokens=GSM8K_MAX_NUM_BATCHED_TOKENS,
         gpu_memory_utilization=0.9,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         block_size=PAGE_SIZE,
         # The few-shot prompts share a prefix, and caching it would leave the
         # write path seeing only the per-example delta.
@@ -166,7 +180,23 @@ def _run_gsm8k(
         llm.llm_engine.engine_core.shutdown()
         del llm
         gc.collect()
+        _forget_the_graph_pool()
         torch.cuda.empty_cache()
+
+
+def _forget_the_graph_pool() -> None:
+    """Drop vLLM's memo of the CUDA graph pool a destroyed engine owned.
+
+    vLLM keeps one pool handle on the platform class forever. Destroying a
+    capturing engine releases the pool but not that handle, so a later engine
+    in this process can hand PyTorch a handle to a pool that no longer exists.
+    A served process builds one engine; this test builds five.
+    """
+    from vllm.platforms import current_platform
+
+    for klass in type(current_platform).__mro__:
+        if "_global_graph_pool" in vars(klass):
+            klass._global_graph_pool = None
 
 
 def _load_gsm8k(num_examples: int) -> tuple[list[str], list[str]]:
@@ -250,10 +280,30 @@ def _mismatch_report(score: Score, limit: int = 5) -> str:
 
 
 def _divergence_report(
-    index: int, baseline: Completion, candidate: Completion
+    index: int,
+    baseline: Completion,
+    candidate: Completion,
+    baseline_label: str = "FLASH_ATTN",
+    candidate_label: str = "CUSTOM",
 ) -> str:
     """Report a window around where two completions first differ."""
-    position = next(
+    position = _first_divergence_position(baseline, candidate)
+    start = max(0, position - 8)
+    stop = position + 8
+    return (
+        f"request {index}: first difference at token {position} of "
+        f"{len(baseline.token_ids)}/{len(candidate.token_ids)}\n"
+        f"  {baseline_label}[{start}:{stop}] = "
+        f"{list(baseline.token_ids[start:stop])}\n"
+        f"  {candidate_label}[{start}:{stop}] = "
+        f"{list(candidate.token_ids[start:stop])}"
+    )
+
+
+def _first_divergence_position(
+    baseline: Completion, candidate: Completion
+) -> int:
+    return next(
         (
             i
             for i, (left, right) in enumerate(
@@ -263,16 +313,21 @@ def _divergence_report(
         ),
         min(len(baseline.token_ids), len(candidate.token_ids)),
     )
-    start = max(0, position - 8)
-    stop = position + 8
-    return (
-        f"request {index}: first difference at token {position} of "
-        f"{len(baseline.token_ids)}/{len(candidate.token_ids)}\n"
-        f"  FLASH_ATTN[{start}:{stop}] = "
-        f"{list(baseline.token_ids[start:stop])}\n"
-        f"  CUSTOM    [{start}:{stop}] = "
-        f"{list(candidate.token_ids[start:stop])}"
-    )
+
+
+def _token_divergence(
+    baseline: tuple[Completion, ...], candidate: tuple[Completion, ...]
+) -> tuple[int, int]:
+    different = 0
+    total = 0
+    for left, right in zip(baseline, candidate):
+        different += sum(
+            left_id != right_id
+            for left_id, right_id in zip(left.token_ids, right.token_ids)
+        )
+        different += abs(len(left.token_ids) - len(right.token_ids))
+        total += max(len(left.token_ids), len(right.token_ids))
+    return different, total
 
 
 @dataclass(frozen=True)
@@ -283,10 +338,10 @@ class Arm:
 
 
 @pytest.fixture(scope="module")
-def arms() -> tuple[Arm, Arm, Arm, Arm]:
-    """The four arms, scored once for the tests below.
+def arms() -> tuple[Arm, ...]:
+    """The five arms, scored once for the tests below.
 
-    Four 8B engines is nearly all the cost of this file, and every gate below
+    Five 8B engines is nearly all the cost of this file, and every gate below
     compares two of them, so they are built once rather than once per gate.
     """
     _require_sm100()
@@ -295,14 +350,25 @@ def arms() -> tuple[Arm, Arm, Arm, Arm]:
 
     references, prompts = _load_gsm8k(GSM8K_NUM_EXAMPLES)
     plan = (
-        ("FLASH_ATTN", BF16_ATTENTION_CONFIG, "auto"),
-        ("CUSTOM", CUSTOM_ATTENTION_CONFIG, "auto"),
-        ("CUSTOM/nvfp4", CUSTOM_ATTENTION_CONFIG, "nvfp4"),
-        ("FLASHINFER/nvfp4", FLASHINFER_ATTENTION_CONFIG, "nvfp4"),
+        ("FLASH_ATTN", BF16_ATTENTION_CONFIG, "auto", True),
+        ("CUSTOM", CUSTOM_ATTENTION_CONFIG, "auto", True),
+        ("CUSTOM/nvfp4", CUSTOM_ATTENTION_CONFIG, "nvfp4", True),
+        ("FLASHINFER/nvfp4", FLASHINFER_ATTENTION_CONFIG, "nvfp4", True),
+        (
+            "CUSTOM/nvfp4+graph",
+            CUSTOM_ATTENTION_CONFIG,
+            "nvfp4",
+            False,
+        ),
     )
     scored = []
-    for label, attention_config, kv_cache_dtype in plan:
-        completions = _run_gsm8k(attention_config, prompts, kv_cache_dtype)
+    for label, attention_config, kv_cache_dtype, enforce_eager in plan:
+        completions = _run_gsm8k(
+            attention_config,
+            prompts,
+            kv_cache_dtype,
+            enforce_eager=enforce_eager,
+        )
         scored.append(
             Arm(
                 label=label,
@@ -314,6 +380,22 @@ def arms() -> tuple[Arm, Arm, Arm, Arm]:
         "\nGSM8K "
         + " | ".join(arm.score.summary(arm.label) for arm in scored)
     )
+    eager, captured = scored[2], scored[4]
+    positions = [
+        _first_divergence_position(left, right)
+        for left, right in zip(eager.completions, captured.completions)
+        if left.token_ids != right.token_ids
+    ]
+    different_tokens, total_tokens = _token_divergence(
+        eager.completions, captured.completions
+    )
+    print(
+        "NVFP4 eager/captured divergence: "
+        f"{different_tokens}/{total_tokens} tokens "
+        f"({different_tokens / total_tokens:.4%}), "
+        f"{len(positions)}/{len(eager.completions)} requests; "
+        f"first positions {dict(sorted(Counter(positions).items()))}"
+    )
     return tuple(scored)
 
 
@@ -323,7 +405,7 @@ def arms() -> tuple[Arm, Arm, Arm, Arm]:
 )
 def test_custom_backend_matches_flash_attn(arms):
     """With a BF16 cache the backend changes nothing, so nothing may change."""
-    flash, custom, _, _ = arms
+    flash, custom, _, _, _ = arms
 
     assert flash.score.accuracy >= GSM8K_MIN_ACCURACY, (
         "the BF16 baseline is too weak to gate against: "
@@ -360,7 +442,7 @@ def test_the_fp4_cache_answers_about_as_well_as_the_bf16_one(arms):
     the only place the whole path is asked whether the model still works, on a
     workload that was not written for it.
     """
-    flash, _, nvfp4, _ = arms
+    flash, _, nvfp4, _, _ = arms
     drop = flash.score.accuracy - nvfp4.score.accuracy
 
     assert drop <= GSM8K_MAX_ACCURACY_DROP, (
@@ -381,6 +463,101 @@ def test_the_fp4_cache_answers_about_as_well_as_the_bf16_one(arms):
     not RUN_E2E,
     reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
 )
+def test_captured_nvfp4_answers_about_as_well_as_bf16(arms):
+    """The user-facing gate is unchanged just because decode is replayed."""
+    flash, _, _, _, captured = arms
+    drop = flash.score.accuracy - captured.score.accuracy
+
+    assert drop <= GSM8K_MAX_ACCURACY_DROP, (
+        f"the captured FP4 cache lost {drop:.4f} against BF16, over the "
+        f"{GSM8K_MAX_ACCURACY_DROP} allowed.\n"
+        f"{flash.score.summary(flash.label)} | "
+        f"{captured.score.summary(captured.label)}\n"
+        f"{_mismatch_report(captured.score)}"
+    )
+    assert captured.score.accuracy >= GSM8K_MIN_ACCURACY, (
+        "the captured FP4 arm is below the absolute floor, so a baseline that "
+        f"also fell would have hidden it: "
+        f"{captured.score.summary(captured.label)}\n"
+        f"{_mismatch_report(captured.score)}"
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
+def test_captured_nvfp4_accuracy_stays_close_to_eager(arms):
+    """Capture changes dispatch, not the accuracy expected from the cache."""
+    _, _, eager, _, captured = arms
+    delta = abs(eager.score.accuracy - captured.score.accuracy)
+
+    assert delta <= GSM8K_MAX_GRAPH_ACCURACY_DELTA, (
+        f"capturing changed NVFP4 accuracy by {delta:.4f}, over the "
+        f"{GSM8K_MAX_GRAPH_ACCURACY_DELTA:.4f} allowed.\n"
+        f"{eager.score.summary(eager.label)} | "
+        f"{captured.score.summary(captured.label)}"
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
+def test_captured_nvfp4_does_not_diverge_early_and_commonly(arms):
+    """Separate graph rounding noise from corruption by its shape.
+
+    A replay is padded to a captured width, so its linear layers can see a
+    different M from eager execution. cuBLAS may then choose another tile and
+    reduction order; last-bit logit changes can flip a greedy argmax. Token
+    identity is therefore not a sound gate by itself. Numerical noise can
+    fork a few sequences, but a broken slot table, stale tail, or live padding
+    row changes many requests near the start.
+
+    Measured at N=32, a temporary BF16 graph control diverged on 20 requests
+    and 3,473/8,192 tokens, but only 10 requests first diverged in the first
+    64 tokens. This gate permits 16, six requests of headroom over that graph
+    rounding control. The NVFP4 graph measurement put 21 requests in that
+    early quarter, which this deliberately reports as a graph-path failure.
+    """
+    _, _, eager, _, captured = arms
+    divergent = [
+        (index, left, right, _first_divergence_position(left, right))
+        for index, (left, right) in enumerate(
+            zip(eager.completions, captured.completions)
+        )
+        if left.token_ids != right.token_ids
+    ]
+    early = [
+        item
+        for item in divergent
+        if item[3] < GSM8K_EARLY_DIVERGENCE_TOKENS
+    ]
+    early_rate = len(early) / len(eager.completions)
+
+    assert early_rate <= GSM8K_MAX_EARLY_DIVERGENCE_RATE, (
+        f"{len(early)} of {len(eager.completions)} NVFP4 requests "
+        f"({early_rate:.2%}) first diverged before token "
+        f"{GSM8K_EARLY_DIVERGENCE_TOKENS}; more than "
+        f"{GSM8K_MAX_EARLY_DIVERGENCE_RATE:.0%} reads as early and common, "
+        "not graph rounding noise.\n"
+        + "\n".join(
+            _divergence_report(
+                index,
+                left,
+                right,
+                baseline_label="NVFP4 eager",
+                candidate_label="NVFP4 graph",
+            )
+            for index, left, right, _ in early[:3]
+        )
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_E2E,
+    reason="set NVFP4_RUN_VLLM_E2E=1 to run the vLLM integration test",
+)
 def test_the_fp4_cache_keeps_up_with_the_one_vllm_ships(arms):
     """Our four bits against the only other four bits on this machine.
 
@@ -393,7 +570,7 @@ def test_the_fp4_cache_keeps_up_with_the_one_vllm_ships(arms):
     is worth failing over only when ours is the worse one; an assertion that
     also fired when theirs regressed would be a test of someone else's code.
     """
-    _, _, ours, theirs = arms
+    _, _, ours, theirs, _ = arms
     behind = theirs.score.accuracy - ours.score.accuracy
 
     assert behind <= GSM8K_MAX_ACCURACY_DROP, (
