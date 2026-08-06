@@ -20,6 +20,8 @@ write instead.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from nvfp4_decode_kernel import RESIDUAL_ROW_TILE
 
@@ -27,6 +29,52 @@ from . import layout
 
 
 PAGE_SIZE = 128
+
+# Points at a safetensors file holding one ``key_shift`` tensor of shape
+# ``[num_layers, num_kv_heads, head_dim]``. Unset means no shift, which is the
+# behaviour every existing run has.
+KEY_SHIFT_ENV = "NVFP4_KEY_SHIFT"
+
+
+def load_key_shift(
+    num_layers: int, num_kv_heads: int, head_dim: int, device: torch.device
+) -> torch.Tensor | None:
+    """A constant subtracted from post-RoPE K on its way into the cache.
+
+    Post-RoPE K carries large per-channel offsets, and those offsets are what
+    sets the group maximum that the block scale is derived from. Removing them
+    before quantizing shrinks the scale, so every element in the group gets a
+    finer step.
+
+    Nothing adds the constant back. Attention scores become ``q·k - q·mu``,
+    and ``q·mu`` is the same for every key a given query sees, so softmax is
+    unchanged. That argument only holds if *every* stored key is shifted, which
+    is why the subtraction sits at the single point all three write paths pass
+    through rather than inside the quantizer.
+
+    Kept in float32: the offsets are an order of magnitude larger than what is
+    left after removing them, so rounding ``mu`` to bfloat16 first would spend
+    a few percent of the post-shift range on the rounding error.
+    """
+    path = os.environ.get(KEY_SHIFT_ENV)
+    if not path:
+        return None
+
+    from safetensors.torch import load_file
+
+    tensors = load_file(path)
+    if "key_shift" not in tensors:
+        raise ValueError(
+            f"{path} has no 'key_shift' tensor, found {sorted(tensors)}"
+        )
+    shift = tensors["key_shift"]
+    expected = (num_layers, num_kv_heads, head_dim)
+    if tuple(shift.shape) != expected:
+        raise ValueError(
+            f"{path} holds a key_shift of {tuple(shift.shape)}, this model "
+            f"needs {expected}"
+        )
+    return shift.to(device=device, dtype=torch.float32)
 
 
 class LayerRuntime:
@@ -45,6 +93,19 @@ class LayerRuntime:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.key_shift = load_key_shift(
+            num_layers, num_kv_heads, head_dim, device
+        )
+        # Held separately from the vector so that turning the shift off keeps
+        # what it cost to measure. A/B-ing the two arms in one process is the
+        # reason to want that.
+        self.key_shift_enabled = True
+        # Set only while measuring a shift, which cannot happen at the same
+        # time as applying one: the sum has to be taken over the K the model
+        # actually produces. Each layer accumulates its own row; the token
+        # count is shared, since every layer sees the same tokens.
+        self.key_shift_sum: torch.Tensor | None = None
+        self.key_shift_tokens = 0
 
         # One allocation each, indexed by layer, so promotion can take the
         # layer as a grid dimension instead of looping in Python. Zeroed
@@ -110,6 +171,57 @@ class LayerRuntime:
     @property
     def tail_bytes(self) -> int:
         return 2 * self.tail_key.numel() * self.tail_key.element_size()
+
+    @property
+    def active_key_shift(self) -> torch.Tensor | None:
+        """What the write path should subtract, or None to store K as it is."""
+        return self.key_shift if self.key_shift_enabled else None
+
+    def set_key_shift_enabled(self, enabled: bool) -> None:
+        """Turn the shift on or off between requests.
+
+        Only between them. Keys already in the cache were stored under
+        whichever setting was in force when they were written, so a sequence
+        that spans a flip has two different constants in one softmax. The
+        caller has to know the cache is drained; nothing here can check it.
+        """
+        if enabled and self.key_shift is None:
+            raise ValueError(
+                "no shift has been loaded or measured, so there is nothing "
+                "to enable"
+            )
+        self.key_shift_enabled = enabled
+
+    def begin_key_shift_measurement(self) -> None:
+        """Measure the K mean instead of removing it, until told to stop.
+
+        Any shift in force is dropped first. Measuring against a shifted K
+        would give the residual mean rather than the mean, and the two are not
+        interchangeable: the second measurement would be near zero and would
+        look like there was nothing to remove.
+        """
+        self.key_shift = None
+        self.key_shift_sum = torch.zeros(
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=torch.float64,
+            device=self.tail_key.device,
+        )
+        self.key_shift_tokens = 0
+
+    def finish_key_shift_measurement(self) -> torch.Tensor:
+        """Freeze what was measured and start subtracting it."""
+        if self.key_shift_sum is None or self.key_shift_tokens == 0:
+            raise ValueError(
+                "no tokens were measured, so there is no mean to subtract; "
+                "begin_key_shift_measurement must precede a forward pass"
+            )
+        self.key_shift = (self.key_shift_sum / self.key_shift_tokens).float()
+        self.key_shift_enabled = True
+        self.key_shift_sum = None
+        self.key_shift_tokens = 0
+        return self.key_shift
 
     def views(
         self, layer_index: int, kv_cache: torch.Tensor

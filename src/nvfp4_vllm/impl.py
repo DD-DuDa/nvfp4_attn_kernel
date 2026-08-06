@@ -133,6 +133,22 @@ class NVFP4Impl(FlashAttentionImpl):
                 row_to_slot=metadata.row_to_slot,
             )
 
+        shift = self.runtime.active_key_shift
+        if self.runtime.key_shift_sum is not None:
+            self.runtime.key_shift_sum[self.layer_index] += (
+                key[: metadata.num_actual_tokens].double().sum(dim=0)
+            )
+            # Counted once for the step, by the same layer that speaks for the
+            # model above, because every layer adds the same tokens.
+            if self.layer_index == 0:
+                self.runtime.key_shift_tokens += metadata.num_actual_tokens
+        elif shift is not None:
+            # Out of place, so prefill still attends this pass's unshifted K.
+            # Only what the cache holds is shifted, and it is shifted here
+            # rather than in the quantizer so that the BF16 tail and the pages
+            # promoted out of it agree with the pages written directly.
+            key = torch.sub(key.float(), shift[self.layer_index]).to(key.dtype)
+
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
             self.runtime.views(self.layer_index, kv_cache)
         )

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from flash_attn.cute import flash_attn_func
 from nvfp4_decode_kernel import _quantize
 from nvfp4_decode_kernel import RESIDUAL_ROW_TILE, fp4_decode
+from nvfp4_decode_kernel.reference import nvfp4_round_trip
 
 
 FP4_MIN_COSINE = 0.99
@@ -63,39 +64,15 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     ).item()
 
 
-def _round_e2m1(x: torch.Tensor) -> torch.Tensor:
-    """Round FP32 values to the representable E2M1 values."""
-
-    magnitudes = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        dtype=torch.float32,
-        device=x.device,
-    )
-    absolute = x.abs()
-    indices = (absolute.unsqueeze(-1) - magnitudes).abs().argmin(dim=-1)
-    return torch.sign(x) * magnitudes[indices]
-
-
-def _nvfp4_round_trip(x: torch.Tensor) -> torch.Tensor:
-    """Quantize and dequantize groups of 16 values with NVFP4."""
-    assert x.shape[-1] % 16 == 0
-    groups = x.float().reshape(*x.shape[:-1], -1, 16)
-    scale = groups.abs().amax(dim=-1, keepdim=True) / 6.0
-    scale = scale.to(torch.float8_e4m3fn).float()
-    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    quantized = _round_e2m1(groups / safe_scale) * scale
-    return quantized.reshape_as(x)
-
-
 def _fp4_qkv_pages_round_trip(
     q: torch.Tensor,
     k_pages: torch.Tensor,
     v_pages: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dequantized NVFP4 Q/K/V in their original logical layouts."""
-    q_fp4 = _nvfp4_round_trip(q).to(q.dtype)
-    k_fp4 = _nvfp4_round_trip(k_pages).to(k_pages.dtype)
-    v_fp4 = _nvfp4_round_trip(
+    q_fp4 = nvfp4_round_trip(q).to(q.dtype)
+    k_fp4 = nvfp4_round_trip(k_pages).to(k_pages.dtype)
+    v_fp4 = nvfp4_round_trip(
         v_pages.permute(0, 2, 3, 1).contiguous()
     ).permute(0, 3, 1, 2).to(v_pages.dtype)
     return q_fp4, k_fp4, v_fp4
@@ -260,7 +237,7 @@ def _online_softmax_pv(
         p_block = torch.where(
             residual[..., start : start + page],
             p_exp.to(torch.bfloat16).float(),
-            _nvfp4_round_trip(p_exp),
+            nvfp4_round_trip(p_exp),
         )
         output = output + torch.einsum(
             "bhqk,bkhd->bhqd", p_block, v_fp4[:, start : start + page]
