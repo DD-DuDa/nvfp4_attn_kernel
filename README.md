@@ -18,8 +18,7 @@ vLLM v1 的注意力后端（`src/nvfp4_vllm/`）。
 两个原因，各自都是硬性的：
 
 1. **vLLM 只在那棵树里编译过。** `_C_stable_libtorch.abi3.so` 一整套都在
-   `BitKV_nvfp4/third_party/vllm` 下；本仓库的 `third_party/vllm` submodule 一个
-   `.so` 都没有。
+   `BitKV_nvfp4/third_party/vllm` 下，本仓库不带 vLLM 副本。
 2. **默认环境的 CuTeDSL 没有 `iket`。** 本机 PATH 上的 `python` 指向
    `/opt/conda/envs/torch-base`，它的 `nvidia-cutlass-dsl` 缺 `iket`，于是
    `import nvfp4_decode_kernel` 直接炸：
@@ -52,12 +51,44 @@ vLLM v1 的注意力后端（`src/nvfp4_vllm/`）。
 这也是靠 editable 安装生效的——环境里没装这个包，`attention_config={"backend":
 "CUSTOM"}` 就找不到后端。
 
-> **注意**：`import vllm` 解析到的是 `BitKV_nvfp4/third_party/vllm`，**不是**本仓库的
-> submodule。这么用的前提是两棵树在 nvfp4 相关的五个文件上逐字节相同
-> （`v1/kv_cache_interface.py`、`utils/torch_utils.py`、`v1/attention/backend.py`、
-> `v1/attention/backends/registry.py`、
-> `model_executor/layers/attention/attention.py`）。**将来两棵树在这些文件上分叉，
-> 这个前提立刻失效，必须重新对齐**，否则测的就不是要发布的那份代码。
+> **注意**：`import vllm` 解析到 `BitKV_nvfp4/third_party/vllm`，那是唯一一棵 vLLM，
+> 读源码和跑测试都以它为准。本仓库曾有一个 `third_party/vllm` submodule 作参照，从未
+> 被编译或 import 过，已删除。历史文档里的 `third_party/vllm/<file>:<line>` 引用指的
+> 是那棵已删除的树（pin 在 `d6dbdb9b0`），行号未必对得上 BitKV 那棵（`1ad84fe`）。
+
+## 用法
+
+一行拿到一个跑在这套 NVFP4 缓存上的引擎，K 去均值已经生效：
+
+```python
+from nvfp4_vllm import build_llm
+
+llm = build_llm("/path/to/checkpoint", max_model_len=32768)
+```
+
+`key_shift` 决定那个被减掉的常量从哪来，三选一：
+
+| 值 | 含义 | 代价 |
+| --- | --- | --- |
+| `"auto"`（默认） | 启动时让模型自己测一遍 | 约 7 秒，不需要数据 |
+| 路径 | 加载先前存下的 sidecar | 无 |
+| `None` | 不做 centering，等同于此前所有的跑法 | 无 |
+
+`build_llm` 负责绑定这套缓存必需的引擎参数：`kv_cache_dtype`、后端、页大小、关掉
+prefix caching 与 chunked prefill、把并发压进 32 个 BF16 tail slot（vLLM 默认 1024，
+会被护栏直接拒掉）。少带其中任何一个，引擎照样起得来，但服务的是另一套缓存，所以这些
+参数在这里是绑死的，传相冲突的值会报错而不是被静默覆盖；其余关键字参数原样转给 `LLM`。
+
+同一个引擎可以把两臂都跑一遍，不用重开：
+
+```python
+from nvfp4_vllm import set_key_shift_enabled
+
+set_key_shift_enabled(llm, False)
+```
+
+向量在关掉之后仍然留着。只能在两次 `generate` 之间切——已经进缓存的 key 是按当时的
+设定写的，跨越切换的序列会在同一次 softmax 里见到两个不同的常量。
 
 ## 模型与数据
 

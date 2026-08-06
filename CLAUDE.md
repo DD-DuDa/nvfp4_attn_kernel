@@ -12,13 +12,17 @@ from nvfp4_decode_kernel import fp4_decode
 `nvfp4_vllm` is an out-of-tree vLLM V1 attention backend that owns the paged
 FP4 cache and calls that kernel. vLLM loads it through the
 `vllm.general_plugins` entry point in `pyproject.toml`; a caller selects it
-with `attention_config={"backend": "CUSTOM"}` and `kv_cache_dtype="nvfp4"`.
+with `attention_config={"backend": "CUSTOM"}` and `kv_cache_dtype="nvfp4"`,
+along with the scheduler settings the write path requires.
+`nvfp4_vllm.build_llm` binds all of them and turns on the K shift, and is the
+way in unless a test is deliberately constructing an engine by hand.
 
 **The import prohibition is about provenance, not about the `vllm` package.**
 No source may be copied or vendored in from the original `nvfp4_attn`
-repository, vLLM, or SGLang, and nothing may import from the `third_party/`
-checkout, which is a reference copy rather than the vLLM the tests run
-against. `nvfp4_vllm` necessarily imports the installed `vllm`: it subclasses
+repository, vLLM, or SGLang. This repository vendors no vLLM of its own; the
+one the tests run against lives in `BitKV_nvfp4/third_party/vllm` and is there
+to be read, never to be copied from. `nvfp4_vllm` necessarily imports the
+installed `vllm`: it subclasses
 `FlashAttentionBackend` and is written against vLLM's public extension
 points. `nvfp4_decode_kernel` imports no serving framework at all, and that
 is the line to hold — vLLM appears in it only in comments.
@@ -142,9 +146,8 @@ Tests:
 2. Do not quantize K/V inside `fp4_decode`; serving code owns cache
    quantization, which here means `nvfp4_vllm.write` and `nvfp4_vllm.promote`.
 3. Keep `nvfp4_decode_kernel` free of any serving-framework dependency, and
-   both packages free of code copied from the old repository or from a
-   `third_party/` checkout. `nvfp4_vllm` depends on vLLM by construction; see
-   Purpose.
+   both packages free of code copied from the old repository or from the vLLM
+   tree. `nvfp4_vllm` depends on vLLM by construction; see Purpose.
 4. Preserve kernel-native K/V and scale layouts. Avoid per-call transposes or
    materialized scale copies.
 5. Preserve exact zero-residual semantics and `query_row_indices` behavior.

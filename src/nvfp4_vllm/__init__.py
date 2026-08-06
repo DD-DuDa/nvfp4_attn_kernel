@@ -14,4 +14,34 @@ def register() -> None:
     )
 
 
-__all__ = ["register"]
+# All three are imported lazily so that ``register`` stays free of torch and
+# vLLM, which the plugin entry point is loaded too early to depend on.
+
+
+def build_llm(model, **kwargs):
+    """See ``nvfp4_vllm.engine.build_llm``."""
+    from .engine import build_llm as _build
+
+    return _build(model, **kwargs)
+
+
+def calibrate_key_shift(llm, **kwargs):
+    """See ``nvfp4_vllm.calibrate.calibrate_key_shift``."""
+    from .calibrate import calibrate_key_shift as _calibrate
+
+    return _calibrate(llm, **kwargs)
+
+
+def set_key_shift_enabled(llm, enabled: bool):
+    """See ``nvfp4_vllm.calibrate.set_key_shift_enabled``."""
+    from .calibrate import set_key_shift_enabled as _set
+
+    return _set(llm, enabled)
+
+
+__all__ = [
+    "register",
+    "build_llm",
+    "calibrate_key_shift",
+    "set_key_shift_enabled",
+]
