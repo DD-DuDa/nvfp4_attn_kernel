@@ -147,7 +147,9 @@ class NVFP4Impl(FlashAttentionImpl):
             # Only what the cache holds is shifted, and it is shifted here
             # rather than in the quantizer so that the BF16 tail and the pages
             # promoted out of it agree with the pages written directly.
-            key = torch.sub(key.float(), shift[self.layer_index]).to(key.dtype)
+            # One kernel: the shift already carries K's dtype, so there is no
+            # upcast to undo afterwards.
+            key = torch.sub(key, shift[self.layer_index])
 
         key_pages_fp4, key_scales, value_pages_fp4, value_scales = (
             self.runtime.views(self.layer_index, kv_cache)

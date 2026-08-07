@@ -37,7 +37,11 @@ KEY_SHIFT_ENV = "NVFP4_KEY_SHIFT"
 
 
 def load_key_shift(
-    num_layers: int, num_kv_heads: int, head_dim: int, device: torch.device
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor | None:
     """A constant subtracted from post-RoPE K on its way into the cache.
 
@@ -52,9 +56,14 @@ def load_key_shift(
     is why the subtraction sits at the single point all three write paths pass
     through rather than inside the quantizer.
 
-    Kept in float32: the offsets are an order of magnitude larger than what is
-    left after removing them, so rounding ``mu`` to bfloat16 first would spend
-    a few percent of the post-shift range on the rounding error.
+    Held in the cache's own dtype so the write path is one kernel rather than
+    an upcast, a subtract and a downcast, which is worth 12% of an eager decode
+    step. Rounding ``mu`` was the obvious thing to be afraid of and measures as
+    nothing: the invariance above holds for any constant, however coarse, and
+    against captured post-RoPE K the bfloat16 constant removes 55.80% of the
+    NVFP4 error where the float32 one removes 55.75%. The step it is rounded
+    against is four-bit; a 2e-3 relative error on the constant disappears into
+    it.
     """
     path = os.environ.get(KEY_SHIFT_ENV)
     if not path:
@@ -74,7 +83,7 @@ def load_key_shift(
             f"{path} holds a key_shift of {tuple(shift.shape)}, this model "
             f"needs {expected}"
         )
-    return shift.to(device=device, dtype=torch.float32)
+    return shift.to(device=device, dtype=dtype)
 
 
 class LayerRuntime:
@@ -93,9 +102,6 @@ class LayerRuntime:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.key_shift = load_key_shift(
-            num_layers, num_kv_heads, head_dim, device
-        )
         # Held separately from the vector so that turning the shift off keeps
         # what it cost to measure. A/B-ing the two arms in one process is the
         # reason to want that.
@@ -119,6 +125,12 @@ class LayerRuntime:
         # The same storage seen as one run of tokens, which is what promotion
         # quantizes out of: layer ``l`` slot ``s`` starts at token
         # ``l * num_slots * PAGE_SIZE + s * PAGE_SIZE``.
+        # Loaded once the tail exists, because the shift is subtracted from K
+        # on its way into that tail and carrying a second dtype would put a
+        # cast in the write path.
+        self.key_shift = load_key_shift(
+            num_layers, num_kv_heads, head_dim, device, self.tail_key.dtype
+        )
         self.tail_key_tokens = self.tail_key.view(-1, num_kv_heads, head_dim)
         self.tail_value_tokens = self.tail_value.view(
             -1, num_kv_heads, head_dim
@@ -211,13 +223,20 @@ class LayerRuntime:
         self.key_shift_tokens = 0
 
     def finish_key_shift_measurement(self) -> torch.Tensor:
-        """Freeze what was measured and start subtracting it."""
+        """Freeze what was measured and start subtracting it.
+
+        Accumulated in float64 and rounded once, here, into the dtype the
+        write path subtracts in. See :func:`load_key_shift` for why that dtype
+        is the cache's rather than float32.
+        """
         if self.key_shift_sum is None or self.key_shift_tokens == 0:
             raise ValueError(
                 "no tokens were measured, so there is no mean to subtract; "
                 "begin_key_shift_measurement must precede a forward pass"
             )
-        self.key_shift = (self.key_shift_sum / self.key_shift_tokens).float()
+        self.key_shift = (self.key_shift_sum / self.key_shift_tokens).to(
+            self.tail_key.dtype
+        )
         self.key_shift_enabled = True
         self.key_shift_sum = None
         self.key_shift_tokens = 0

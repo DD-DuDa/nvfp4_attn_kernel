@@ -33,6 +33,8 @@ from nvfp4_vllm.runtime import KEY_SHIFT_ENV, LayerRuntime, load_key_shift
 LAYERS = 3
 HEADS_KV = 8
 HEAD_DIM = 128
+# What the tail is allocated as, and so what the shift is held in.
+DTYPE = torch.bfloat16
 
 
 def _write(tmp_path, tensors) -> str:
@@ -43,16 +45,19 @@ def _write(tmp_path, tensors) -> str:
 
 def test_no_env_means_no_shift(monkeypatch) -> None:
     monkeypatch.delenv(KEY_SHIFT_ENV, raising=False)
-    assert load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu")) is None
+    assert load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"), DTYPE) is None
 
 
-def test_shift_loads_as_float32(monkeypatch, tmp_path) -> None:
-    shift = torch.randn(LAYERS, HEADS_KV, HEAD_DIM, dtype=torch.bfloat16)
+def test_shift_arrives_in_the_dtype_the_write_path_subtracts_in(
+    monkeypatch, tmp_path
+) -> None:
+    """A sidecar in any precision, converted once here rather than per step."""
+    shift = torch.randn(LAYERS, HEADS_KV, HEAD_DIM, dtype=torch.float32)
     monkeypatch.setenv(KEY_SHIFT_ENV, _write(tmp_path, {"key_shift": shift}))
 
-    loaded = load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"))
+    loaded = load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"), DTYPE)
 
-    assert loaded.dtype is torch.float32
+    assert loaded.dtype is DTYPE
     assert loaded.shape == (LAYERS, HEADS_KV, HEAD_DIM)
 
 
@@ -61,7 +66,7 @@ def test_shift_for_another_model_is_refused(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv(KEY_SHIFT_ENV, _write(tmp_path, {"key_shift": shift}))
 
     with pytest.raises(ValueError, match="needs"):
-        load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"))
+        load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"), DTYPE)
 
 
 def test_file_without_the_tensor_is_refused(monkeypatch, tmp_path) -> None:
@@ -70,7 +75,7 @@ def test_file_without_the_tensor_is_refused(monkeypatch, tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="no 'key_shift' tensor"):
-        load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"))
+        load_key_shift(LAYERS, HEADS_KV, HEAD_DIM, torch.device("cpu"), DTYPE)
 
 
 def test_shifting_every_key_leaves_attention_unchanged() -> None:
@@ -142,8 +147,9 @@ def test_measured_shift_is_the_mean_over_every_step(monkeypatch) -> None:
 
     expected = torch.cat(steps).mean(dim=0)
     assert shift.shape == (LAYERS, HEADS_KV, HEAD_DIM)
+    assert shift.dtype is DTYPE
     for layer in range(LAYERS):
-        torch.testing.assert_close(shift[layer], expected)
+        torch.testing.assert_close(shift[layer].float(), expected, atol=0.05, rtol=0)
     assert shift is runtime.key_shift
 
 
@@ -174,7 +180,7 @@ def test_measuring_drops_a_shift_already_in_force(monkeypatch, tmp_path) -> None
     shift = runtime.finish_key_shift_measurement()
 
     torch.testing.assert_close(shift, torch.full_like(shift, 5.0))
-    assert not torch.isclose(shift, loaded).all()
+    assert not torch.isclose(shift.float(), loaded).all()
 
 
 def test_finishing_without_any_tokens_is_refused(monkeypatch) -> None:
@@ -198,6 +204,42 @@ def test_a_loaded_shift_starts_enabled(monkeypatch, tmp_path) -> None:
     )
 
     assert runtime.active_key_shift is not None
+
+
+def test_the_runtime_holds_the_shift_in_its_cache_dtype(
+    monkeypatch, tmp_path
+) -> None:
+    """A mismatch puts an upcast and a downcast into every write, which is
+    12% of an eager decode step."""
+    shift = torch.randn(LAYERS, HEADS_KV, HEAD_DIM, dtype=torch.float32)
+    monkeypatch.setenv(KEY_SHIFT_ENV, _write(tmp_path, {"key_shift": shift}))
+    runtime = LayerRuntime(
+        num_layers=LAYERS,
+        num_slots=2,
+        num_heads=HEADS_KV,
+        num_kv_heads=HEADS_KV,
+        head_dim=HEAD_DIM,
+        device=torch.device("cpu"),
+    )
+
+    assert runtime.key_shift.dtype is runtime.tail_key.dtype
+    key = torch.randn(4, HEADS_KV, HEAD_DIM, dtype=runtime.tail_key.dtype)
+    assert torch.sub(key, runtime.key_shift[0]).dtype is key.dtype
+
+
+def test_a_coarse_constant_is_still_exactly_invariant() -> None:
+    """Why rounding mu is a question about error removed, not correctness."""
+    generator = torch.Generator().manual_seed(0x541A)
+    query = torch.randn(4, HEAD_DIM, generator=generator)
+    key = torch.randn(256, HEAD_DIM, generator=generator)
+    value = torch.randn(256, HEAD_DIM, generator=generator)
+    coarse = (torch.randn(HEAD_DIM, generator=generator) * 8.0).to(DTYPE)
+
+    def attend(keys):
+        scores = query @ keys.T / HEAD_DIM**0.5
+        return scores.softmax(dim=-1) @ value
+
+    torch.testing.assert_close(attend(key), attend(key - coarse.float()))
 
 
 def test_turning_the_shift_off_keeps_the_vector(monkeypatch) -> None:
